@@ -5,8 +5,9 @@ Replaces the WhatsApp / camera-roll chaos with a structured Google Drive archive
 organized by job site.
 
 > The earlier AppSheet + Apps Script approach is archived in
-> `README.appsheet-deprecated.md` and `Code.gs`. The PWA in `pwa/` is the
-> current implementation.
+> `README.appsheet-deprecated.md` and `Code.gs`. The PWA in `docs/` is the
+> current implementation. (`docs/` rather than `pwa/` because GitHub Pages'
+> "deploy from a branch" mode only supports either repo root or `/docs`.)
 
 ## What it does
 
@@ -27,7 +28,7 @@ organized by job site.
 ## Repo layout
 
 ```
-pwa/
+docs/
   index.html
   manifest.json
   service-worker.js
@@ -66,7 +67,7 @@ pwa/
 
 ### 2. Wire the Client ID into the app
 
-Edit `pwa/js/config.js`:
+Edit `docs/js/config.js`:
 
 ```js
 window.CONFIG = {
@@ -90,14 +91,14 @@ credentials — Drive enforces access on every call.
 ```bash
 cd ~/Documents/dancon-site-visit-logger
 git init
-git add pwa README.md
+git add docs README.md
 git commit -m "Initial PWA"
 gh repo create dancon-site-visit-logger --public --source=. --push
 ```
 
 In the repo's **Settings → Pages**:
 - Source: `main` branch
-- Folder: `/pwa`
+- Folder: `/docs`
 
 A few minutes later the app is live at
 `https://<user-or-org>.github.io/dancon-site-visit-logger/`.
@@ -109,7 +110,7 @@ A few minutes later the app is live at
 `getUserMedia` and Service Workers require HTTPS or localhost. Easiest:
 
 ```bash
-cd ~/Documents/dancon-site-visit-logger/pwa
+cd ~/Documents/dancon-site-visit-logger/docs
 python3 -m http.server 8000
 ```
 
@@ -160,7 +161,7 @@ Site Visits/<Project Name>/
 
 The service worker uses **network-first** caching keyed on the
 `CACHE_VERSION` constant. After every deploy, bump `CACHE_VERSION` in
-`pwa/service-worker.js` so installed clients pick up the new code on next
+`docs/service-worker.js` so installed clients pick up the new code on next
 launch (or pull-to-refresh).
 
 ## Permissions reference
