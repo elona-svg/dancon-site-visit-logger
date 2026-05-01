@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Site Visit">
+  <meta name="theme-color" content="#0f172a">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect fill='%230f172a' width='192' height='192'/%3E%3Cg fill='none' stroke='%23fbbf24' stroke-width='8' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='40' y='62' width='112' height='84' rx='10'/%3E%3Cpath d='M70 62 L82 46 H110 L122 62'/%3E%3Ccircle cx='96' cy='106' r='22'/%3E%3C/g%3E%3C/svg%3E">
+  <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect fill='%230f172a' width='192' height='192' rx='40'/%3E%3Cg fill='none' stroke='%23fbbf24' stroke-width='8' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='40' y='62' width='112' height='84' rx='10'/%3E%3Cpath d='M70 62 L82 46 H110 L122 62'/%3E%3Ccircle cx='96' cy='106' r='22'/%3E%3C/g%3E%3C/svg%3E">
+  <title>Dancon Site Visit Logger</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script async defer src="https://accounts.google.com/gsi/client"></script>
+</head>
+<body>
+  <div id="app">
+    <div class="boot">Loading…</div>
+  </div>
+
+  <div id="overlay-root"></div>
+  <div id="toast-root" aria-live="polite"></div>
+
+  <script src="js/config.js"></script>
+  <script src="js/db.js"></script>
+  <script src="js/auth.js"></script>
+  <script src="js/drive.js"></script>
+  <script src="js/capture.js"></script>
+  <script src="js/audio.js"></script>
+  <script src="js/notes.js"></script>
+  <script src="js/annotate.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('service-worker.js').catch((err) => {
+          console.warn('SW register failed', err);
+        });
+      });
+    }
+  </script>
+</body>
+</html>
