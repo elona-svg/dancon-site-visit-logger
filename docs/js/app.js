@@ -113,11 +113,9 @@
       scheduleRender();
       if (state.view === 'home') {
         loadProjects();
-        // Permissions are requested once at app level on first sign-in. On
-        // subsequent boots we just confirm the cached browser state — no
-        // prompt unless the user revoked it.
         ensureMediaPermissions();
       }
+      maybeShowIosInstallHint();
       // Reset items left in 'uploading' from a previous run (e.g. a tab
       // close mid-upload). Without this they'd be invisible to pumpQueue
       // which only picks up 'pending'/'error' rows.
@@ -304,23 +302,37 @@
           `Longitude: ${longitude}\n` +
           `Accuracy (m): ${Math.round(accuracy)}\n` +
           `Maps link: ${link}\n`;
-        try {
-          const recheck = await window.Drive.findFileInFolder(folderId, 'gps.txt');
-          if (!recheck) {
-            await window.Drive.uploadMultipart({
-              folderId,
-              fileName: 'gps.txt',
-              mimeType: 'text/plain',
-              blob: new Blob([text], { type: 'text/plain' })
-            });
-            await appendVisitLog(folderId, 'captured GPS');
-          }
-        } catch (err) {
-          console.warn('GPS save failed:', err.message);
-        }
+
+        // Show the chip locally first — even if upload fails, the tech
+        // can confirm the position was captured.
         state.gps = { lat: latitude, lng: longitude, link };
         state.gpsLoading = false;
         updateGpsChipDOM();
+
+        // Push gps.txt through the regular upload queue so transient
+        // failures (offline, 5xx) get the same retry/backoff machinery
+        // as photos. Existing gps.txt? Skip — first writer wins.
+        try {
+          const recheck = await window.Drive.findFileInFolder(folderId, 'gps.txt');
+          if (recheck) return;
+        } catch (err) {
+          console.warn('[gps] findFile failed, queuing upload anyway:', err.message);
+        }
+        try {
+          await window.DB.queueAdd({
+            projectId: folderId,
+            projectName: state.currentProjectName,
+            fileName: 'gps.txt',
+            mimeType: 'text/plain',
+            blob: new Blob([text], { type: 'text/plain' }),
+            kind: 'gps',
+            status: 'pending',
+            attempts: 0
+          });
+          pumpQueue();
+        } catch (err) {
+          console.warn('[gps] queue add failed:', err.message);
+        }
       },
       (err) => {
         console.warn('GPS denied:', err.message);
@@ -376,6 +388,50 @@
     if (mime.startsWith('audio/webm')) return 'webm';
     if (mime.startsWith('audio/')) return mime.split('/')[1].split(';')[0] || 'aud';
     return mime.split('/')[1]?.split(';')[0] || 'bin';
+  }
+
+  // ---------- iOS Add-to-Home-Screen hint ----------
+  // Shown once on iPhone Safari when the app isn't already installed. We
+  // can't prompt programmatically on iOS — the tech has to do Share → Add
+  // to Home Screen — so we just teach them how. Dismissed flag persists
+  // so they never see it twice on the same device.
+  async function maybeShowIosInstallHint() {
+    try {
+      const dismissed = await window.DB.kvGet('iosInstallHintDismissed');
+      if (dismissed) return;
+      const ua = navigator.userAgent || '';
+      const isIos = /iPad|iPhone|iPod/.test(ua) && !/Macintosh/.test(ua);
+      const isCriOS = /CriOS|FxiOS|EdgiOS/.test(ua); // not Safari
+      const isStandalone =
+        window.navigator.standalone === true ||
+        window.matchMedia('(display-mode: standalone)').matches;
+      if (!isIos || isCriOS || isStandalone) return;
+      // Wait a beat so it doesn't compete with permission card / boot.
+      setTimeout(showIosInstallHint, 1200);
+    } catch (e) { /* ignore */ }
+  }
+
+  function showIosInstallHint() {
+    const root = document.getElementById('toast-root');
+    if (!root) return;
+    if (document.getElementById('ios-install-hint')) return;
+    const el = document.createElement('div');
+    el.id = 'ios-install-hint';
+    el.className = 'install-banner';
+    el.innerHTML = `
+      <span class="install-banner-text">
+        Tap <strong>Share</strong> <span aria-hidden="true">⬆️</span> then
+        <strong>Add to Home Screen</strong> to install this app.
+      </span>
+      <button class="install-banner-x" id="install-banner-x" aria-label="Dismiss">✕</button>
+    `;
+    root.appendChild(el);
+    requestAnimationFrame(() => el.classList.add('show'));
+    document.getElementById('install-banner-x').addEventListener('click', async () => {
+      el.classList.remove('show');
+      setTimeout(() => el.remove(), 250);
+      try { await window.DB.kvSet('iosInstallHintDismissed', true); } catch (e) { /* ignore */ }
+    });
   }
 
   // ---------- Permissions preflight ----------
@@ -793,9 +849,10 @@
           fileId: result?.id || null,
           progress: 1
         });
-        appendVisitLog(item.projectId,
-          `uploaded ${item.kind || 'file'}: ${item.fileName} (${fmtBytes(item.blob.size)})`
-        ).catch(() => {});
+        const logSummary = item.kind === 'gps'
+          ? 'captured GPS'
+          : `uploaded ${item.kind || 'file'}: ${item.fileName} (${fmtBytes(item.blob.size)})`;
+        appendVisitLog(item.projectId, logSummary).catch(() => {});
       } catch (err) {
         console.error('[upload] failed id=', item.id, err);
         const attempts = (item.attempts || 0) + 1;
@@ -973,11 +1030,15 @@
       return;
     }
     if (target.type === 'audio') {
-      // Audio: simple in-page <audio> element overlay isn't built yet, so
-      // fall back to Drive's hosted player or local blob URL.
-      const url = target.objectUrl || target.webViewLink;
-      if (url) window.open(url, '_blank', 'noopener');
-      else toast('Wait for upload to finish', 'warn');
+      let src = target.objectUrl;
+      if (!src && target.fileId) {
+        try {
+          const token = await window.Auth.getAccessToken();
+          src = `https://www.googleapis.com/drive/v3/files/${target.fileId}?alt=media&supportsAllDrives=true&access_token=${encodeURIComponent(token)}`;
+        } catch (e) { /* fall through */ }
+      }
+      if (!src) { toast('Wait for upload to finish', 'warn'); return; }
+      window.VideoPlayer.open({ src, name: target.name, kind: 'audio', onClose: () => {} });
       return;
     }
 

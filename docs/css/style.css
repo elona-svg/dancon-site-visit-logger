@@ -481,6 +481,33 @@ code { background: #eef0f2; padding: 2px 6px; border-radius: 4px; font-size: 13p
 .file-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .file-meta { color: #6b7280; font-size: 12px; }
 
+/* ---------- iOS install hint banner ---------- */
+.install-banner {
+  pointer-events: auto;
+  background: #0f172a;
+  color: #fff;
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 14px;
+  padding: 10px 12px;
+  font-size: 13px;
+  display: flex; align-items: center; gap: 8px;
+  max-width: min(92vw, 460px);
+  box-shadow: 0 14px 28px rgba(0,0,0,0.35);
+  opacity: 0; transform: translateY(8px);
+  transition: opacity 220ms, transform 220ms;
+}
+.install-banner.show { opacity: 1; transform: translateY(0); }
+.install-banner-text { flex: 1; line-height: 1.35; }
+.install-banner strong { font-weight: 700; }
+.install-banner-x {
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.1);
+  color: #fff;
+  flex-shrink: 0;
+  font-size: 13px;
+}
+
 /* ---------- Toasts ---------- */
 #toast-root {
   position: fixed;
@@ -898,6 +925,25 @@ body.camera-fs-open #app { display: none; }
 .vplayer-stage video {
   max-width: 100%; max-height: 100%;
   background: #000;
+}
+.vplayer-overlay.audio { background: #0f172a; }
+.vplayer-audio-card {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 18px;
+  padding: 24px;
+  text-align: center;
+  color: #fff;
+}
+.vplayer-audio-glyph { font-size: 80px; }
+.vplayer-audio-title {
+  font-size: 14px;
+  color: #d4d4d8;
+  max-width: 80vw;
+  word-break: break-all;
+}
+.vplayer-audio-card audio {
+  width: 100%;
+  max-width: 360px;
 }
 .vplayer-name {
   color: #d4d4d8;

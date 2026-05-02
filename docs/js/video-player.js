@@ -16,25 +16,30 @@ window.VideoPlayer = (function () {
 
   function root() { return document.getElementById('overlay-root'); }
 
-  function open({ src, name, onClose }) {
+  function open({ src, name, kind = 'video', onClose }) {
     if (isOpen) close();
     isOpen = true;
     closing = false;
     onCloseCb = onClose || null;
 
     document.body.classList.add('camera-fs-open');
+    const isAudio = kind === 'audio';
+    const mediaTag = isAudio
+      ? `<audio id="vp-video" controls autoplay preload="metadata" src="${escapeHtml(src)}"></audio>`
+      : `<video id="vp-video" controls playsinline autoplay preload="metadata" src="${escapeHtml(src)}"></video>`;
+    const stageInner = isAudio
+      ? `<div class="vplayer-audio-card">
+           <div class="vplayer-audio-glyph">🎙️</div>
+           <div class="vplayer-audio-title">${escapeHtml(name || 'Voice note')}</div>
+           ${mediaTag}
+         </div>`
+      : mediaTag;
+
     root().innerHTML = `
-      <div class="vplayer-overlay" id="vplayer">
+      <div class="vplayer-overlay ${isAudio ? 'audio' : ''}" id="vplayer">
         <button class="cam-fs-icon vplayer-close" id="vp-close" aria-label="Close">✕</button>
         <div class="vplayer-stage" id="vp-stage">
-          <video
-            id="vp-video"
-            controls
-            playsinline
-            autoplay
-            preload="metadata"
-            src="${escapeHtml(src)}"
-          ></video>
+          ${stageInner}
         </div>
         <div class="vplayer-name">${escapeHtml(name || '')}</div>
       </div>
