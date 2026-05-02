@@ -127,13 +127,14 @@ window.AudioNote = (function () {
     if (pendingStopGuard) { clearTimeout(pendingStopGuard); pendingStopGuard = null; }
     const mime = recorder?.mimeType || recMime || 'audio/webm';
     const blob = new Blob(chunks, { type: mime });
+    const durationMs = startTs ? Date.now() - startTs : 0;
     chunks = [];
-    console.log('[voice] blob ready —', blob.size, 'bytes,', mime);
+    console.log('[voice] blob ready —', blob.size, 'bytes,', mime, 'duration', durationMs, 'ms');
     stopStream();
     if (!captureFiredFor && onCaptureCb && blob.size > 0) {
       captureFiredFor = true;
       console.log('[voice] firing onCaptureCb');
-      try { onCaptureCb(blob, mime, 'audio'); }
+      try { onCaptureCb(blob, mime, 'audio', { durationMs }); }
       catch (err) { console.error('[voice] onCaptureCb threw:', err); }
     } else if (blob.size === 0) {
       console.warn('[voice] empty blob — not saving');

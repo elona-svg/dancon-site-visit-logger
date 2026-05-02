@@ -537,14 +537,12 @@
   function startVoiceNote() {
     if (!ensureProject()) return;
     console.log('[voice] startVoiceNote');
-    // The camera fullscreen is the only thing that holds the mic, and it's
-    // not currently open (the project screen has no live preview anymore).
-    // Voice can grab the mic directly.
     if (window.Camera.isOpen()) window.Camera.close();
+    window.Camera.releaseStream();
     window.AudioNote.open({
-      onCapture: (blob, mime) => {
-        console.log('[voice] app.onCapture — blob:', blob?.size, 'mime:', mime);
-        enqueueCapture(blob, mime, 'audio');
+      onCapture: (blob, mime, _kind, opts = {}) => {
+        console.log('[voice] app.onCapture — blob:', blob?.size, 'mime:', mime, 'duration:', opts?.durationMs);
+        enqueueCapture(blob, mime, 'audio', { durationMs: opts?.durationMs });
       },
       onClose: () => {}
     });
@@ -666,6 +664,14 @@
   function findThumbByName(name) {
     if (!name) return null;
     return state.thumbs.find((t) => t.name === name) || null;
+  }
+
+  // state.thumbs is rebuilt every time the tech enters a project, so any
+  // objectUrl in a thumb came from this session and is guaranteed alive.
+  // Drive-loaded thumbs from a past session never have an objectUrl —
+  // they're always played by passing fileId to VideoPlayer.
+  function itemAlive(thumb) {
+    return !!(thumb && thumb.objectUrl);
   }
 
   // -------- Note attachments --------
@@ -793,7 +799,9 @@
       size: blob.size,
       status: 'queued',
       progress: 0,
-      queueId: item.id
+      queueId: item.id,
+      addedAt: Date.now(),
+      durationMs: opts.durationMs || null
     };
     state.thumbs.unshift(thumb);
     updateThumbsDOM();
@@ -908,7 +916,8 @@
         size: Number(f.size || 0),
         status: 'success',
         fileId: f.id,
-        webViewLink: f.webViewLink || ''
+        webViewLink: f.webViewLink || '',
+        addedAt: new Date(f.createdTime || Date.now()).getTime()
       }));
       state.thumbs = [...pendingThumbs, ...driveThumbs];
     } catch (err) {
@@ -1020,30 +1029,28 @@
     const target = state.thumbs[thumbIdx];
     if (!target) return;
 
-    if (target.type === 'video') {
-      // Use the local blob URL while we have it (works even mid-upload);
-      // fall back to a Drive content URL with the access token after upload.
-      let src = target.objectUrl;
-      if (!src && target.fileId) {
-        try {
-          const token = await window.Auth.getAccessToken();
-          src = `https://www.googleapis.com/drive/v3/files/${target.fileId}?alt=media&supportsAllDrives=true&access_token=${encodeURIComponent(token)}`;
-        } catch (e) { /* fall through */ }
+    if (target.type === 'video' || target.type === 'audio') {
+      const kind = target.type;
+      // For files captured in this session we hand over the live blob URL
+      // directly. For everything else we let VideoPlayer fetch from Drive
+      // by fileId — that's the only reliable cross-browser path for
+      // auth'd Drive content.
+      const opts = {
+        kind,
+        name: target.name,
+        onClose: () => {}
+      };
+      if (target.objectUrl && itemAlive(target)) {
+        opts.src = target.objectUrl;
+      } else if (target.fileId) {
+        opts.fileId = target.fileId;
+      } else {
+        toast(target.status === 'failed'
+          ? 'Upload failed — tap retry on the thumbnail'
+          : 'Wait for upload to finish', 'warn');
+        return;
       }
-      if (!src) { toast('Wait for upload to finish', 'warn'); return; }
-      window.VideoPlayer.open({ src, name: target.name, onClose: () => {} });
-      return;
-    }
-    if (target.type === 'audio') {
-      let src = target.objectUrl;
-      if (!src && target.fileId) {
-        try {
-          const token = await window.Auth.getAccessToken();
-          src = `https://www.googleapis.com/drive/v3/files/${target.fileId}?alt=media&supportsAllDrives=true&access_token=${encodeURIComponent(token)}`;
-        } catch (e) { /* fall through */ }
-      }
-      if (!src) { toast('Wait for upload to finish', 'warn'); return; }
-      window.VideoPlayer.open({ src, name: target.name, kind: 'audio', onClose: () => {} });
+      window.VideoPlayer.open(opts);
       return;
     }
 
@@ -1364,7 +1371,7 @@
         <header class="topbar">
           <button class="btn-ghost back-btn" id="back-btn">‹ Sites</button>
           <div class="topbar-title-center" id="proj-title-region"></div>
-          <button class="btn-ghost" id="drive-btn">📁 Drive</button>
+          <button class="btn-ghost drive-btn" id="drive-btn">All Files</button>
         </header>
 
         <main class="capture-main">
@@ -1381,6 +1388,13 @@
           <section class="thumb-section">
             <div class="section-row">
               <h3 class="section-h">Captured</h3>
+              <div class="sort-wrap">
+                <button class="sort-btn" id="sort-btn" type="button" aria-haspopup="true">↕ ${escapeHtml(sortLabel())}</button>
+                <div class="sort-popover" id="sort-popover" hidden>
+                  <button data-sort="date" type="button">Date (newest first)</button>
+                  <button data-sort="type" type="button">Type</button>
+                </div>
+              </div>
             </div>
             <div id="thumb-strip" class="thumb-strip"></div>
           </section>
@@ -1418,6 +1432,13 @@
     document.getElementById('save-note-btn').addEventListener('click', saveNote);
     document.getElementById('cancel-edit-btn').addEventListener('click', cancelEditNote);
     document.getElementById('attach-btn').addEventListener('click', openAttachmentChooser);
+    document.getElementById('sort-btn').addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      toggleSortPopover();
+    });
+    document.querySelectorAll('#sort-popover [data-sort]').forEach((b) => {
+      b.addEventListener('click', () => chooseSort(b.dataset.sort));
+    });
   }
 
   function updateProjectTitleDOM() {
@@ -1484,43 +1505,173 @@
     const lng = state.gps.lng.toFixed(5);
     row.innerHTML = `
       <a class="gps-chip" href="${escapeHtml(state.gps.link)}" target="_blank" rel="noopener">
-        📍 ${escapeHtml(lat)}, ${escapeHtml(lng)} — Open Maps
+        📍 Location: ${escapeHtml(lat)}, ${escapeHtml(lng)} — Open Maps
       </a>`;
   }
 
+  // -------- Sort --------
+  const SORT_KEY = 'thumbsSort';
+  function getSortMode() {
+    return sessionStorage.getItem(SORT_KEY) || 'date';
+  }
+  function setSortMode(mode) {
+    sessionStorage.setItem(SORT_KEY, mode);
+  }
+  function sortedThumbs() {
+    const mode = getSortMode();
+    const list = [...state.thumbs];
+    if (mode === 'type') {
+      const order = { photo: 0, video: 1, audio: 2 };
+      list.sort((a, b) => {
+        const ta = order[a.type] ?? 9;
+        const tb = order[b.type] ?? 9;
+        if (ta !== tb) return ta - tb;
+        return (b.addedAt || 0) - (a.addedAt || 0);
+      });
+    } else {
+      // 'date' — newest first
+      list.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+    }
+    return list;
+  }
+  function sortLabel() {
+    return getSortMode() === 'type' ? 'Type' : 'Date';
+  }
+  function toggleSortPopover() {
+    const pop = document.getElementById('sort-popover');
+    if (!pop) return;
+    pop.hidden = !pop.hidden;
+    if (!pop.hidden) {
+      // close on outside tap
+      setTimeout(() => {
+        document.addEventListener('click', closeSortOnOutside, { once: true });
+      }, 0);
+    }
+  }
+  function closeSortOnOutside(ev) {
+    const pop = document.getElementById('sort-popover');
+    const btn = document.getElementById('sort-btn');
+    if (!pop) return;
+    if (ev.target === btn || btn?.contains(ev.target) || pop.contains(ev.target)) {
+      // re-arm if still inside the sort UI
+      document.addEventListener('click', closeSortOnOutside, { once: true });
+      return;
+    }
+    pop.hidden = true;
+  }
+  function chooseSort(mode) {
+    setSortMode(mode);
+    const pop = document.getElementById('sort-popover');
+    if (pop) pop.hidden = true;
+    const btn = document.getElementById('sort-btn');
+    if (btn) btn.textContent = `↕ ${sortLabel()}`;
+    updateThumbsDOM();
+  }
+
+  // -------- Long-press to reveal trash --------
+  let longPressedId = null;     // queueId or fileId of the currently "selected" thumb
+  let lpTimer = null;
+  let lpSuppressClick = false;
+
+  function clearLongPress() {
+    if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
+  }
+  function setLongPressed(id) {
+    if (longPressedId === id) return;
+    longPressedId = id;
+    document.querySelectorAll('.thumb.show-trash').forEach((el) => el.classList.remove('show-trash'));
+    if (id != null) {
+      const el = document.querySelector(`[data-thumb-key="${CSS.escape(String(id))}"]`);
+      if (el) el.classList.add('show-trash');
+      if (navigator.vibrate) try { navigator.vibrate(20); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function attachThumbInteractions(strip) {
+    strip.querySelectorAll('.thumb').forEach((thumbEl) => {
+      const key = thumbEl.dataset.thumbKey;
+      thumbEl.addEventListener('pointerdown', () => {
+        clearLongPress();
+        lpTimer = setTimeout(() => {
+          lpSuppressClick = true;
+          setLongPressed(key);
+        }, 500);
+      });
+      ['pointerup', 'pointercancel', 'pointerleave'].forEach((evt) => {
+        thumbEl.addEventListener(evt, clearLongPress);
+      });
+    });
+    // Tap outside any thumb dismisses the long-press selection.
+    document.addEventListener('pointerdown', (ev) => {
+      if (longPressedId == null) return;
+      if (ev.target.closest('.thumb')) return;
+      setLongPressed(null);
+    }, { capture: true });
+  }
+
+  function parseTimeFromFilename(name) {
+    const m = name && name.match(/^\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})/);
+    return m ? `${m[1]}:${m[2]}` : '';
+  }
+  function formatDuration(ms) {
+    if (!ms || ms < 0) return '';
+    const s = Math.round(ms / 1000);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  }
+
+  // -------- Thumbs render --------
   function updateThumbsDOM() {
     const strip = document.getElementById('thumb-strip');
     if (!strip) return;
-    const thumbs = state.thumbs;
-    if (state.thumbsLoading && thumbs.length === 0) {
+    const sorted = sortedThumbs();
+    if (state.thumbsLoading && sorted.length === 0) {
       strip.innerHTML = '<div class="thumb-empty">Loading…</div>';
       return;
     }
-    if (thumbs.length === 0) {
+    if (sorted.length === 0) {
       strip.innerHTML = '<div class="thumb-empty">No captures yet — tap the shutter above.</div>';
       return;
     }
-    strip.innerHTML = thumbs.map((t, idx) => thumbHtml(t, idx)).join('');
+    strip.innerHTML = sorted.map((t, sortedIdx) => {
+      const realIdx = state.thumbs.indexOf(t);
+      return thumbHtml(t, realIdx);
+    }).join('');
+
     strip.querySelectorAll('[data-thumb-action]').forEach((el) => {
       const idx = parseInt(el.dataset.thumbIdx, 10);
       const action = el.dataset.thumbAction;
       el.addEventListener('click', (ev) => {
         ev.stopPropagation();
+        if (lpSuppressClick && action === 'open') {
+          lpSuppressClick = false;
+          return;
+        }
+        lpSuppressClick = false;
         if (action === 'open') openViewerForThumb(idx);
         else if (action === 'delete') {
           if (confirm('Delete this file?')) deleteThumb(state.thumbs[idx]);
+          setLongPressed(null);
         }
         else if (action === 'retry') retryThumb(state.thumbs[idx].queueId);
       });
     });
+
+    attachThumbInteractions(strip);
+    // Restore long-press highlight after re-render.
+    if (longPressedId != null) {
+      const el = strip.querySelector(`[data-thumb-key="${CSS.escape(String(longPressedId))}"]`);
+      if (el) el.classList.add('show-trash');
+    }
   }
 
   function thumbHtml(t, idx) {
     const cls = t.status === 'success' ? '' : (t.status === 'failed' ? 'failed' : 'queued');
     const showProgress = t.status === 'uploading' || t.status === 'queued';
     const pct = Math.round((t.progress || 0) * 100);
+    const key = escapeHtml(String(t.queueId ?? t.fileId ?? `thumb-${idx}`));
 
     let bgHtml = '';
+    let metaHtml = '';
     if (t.type === 'photo') {
       bgHtml = t.src
         ? `<img loading="lazy" alt="" src="${escapeHtml(t.src)}" onerror="this.style.display='none'"/>`
@@ -1528,7 +1679,15 @@
     } else if (t.type === 'video') {
       bgHtml = `<div class="thumb-icon">▶</div>`;
     } else if (t.type === 'audio') {
+      const time = parseTimeFromFilename(t.name);
+      const dur = formatDuration(t.durationMs);
       bgHtml = `<div class="thumb-icon">🎙</div>`;
+      const parts = [];
+      if (time) parts.push(time);
+      if (dur) parts.push(dur);
+      if (parts.length) {
+        metaHtml = `<div class="thumb-audio-meta">${parts.map(escapeHtml).join(' · ')}</div>`;
+      }
     }
 
     let stateHtml = '';
@@ -1537,7 +1696,7 @@
     else if (t.status === 'uploading') stateHtml = `<span class="thumb-state">${pct}%</span>`;
 
     return `
-      <div class="thumb ${cls} ${t.type}" data-thumb-action="open" data-thumb-idx="${idx}">
+      <div class="thumb ${cls} ${t.type}" data-thumb-action="open" data-thumb-idx="${idx}" data-thumb-key="${key}">
         ${bgHtml}
         ${stateHtml}
         ${showProgress ? `<div class="thumb-progress"><div class="thumb-progress-bar" style="width:${pct}%"></div></div>` : ''}
@@ -1545,6 +1704,7 @@
         ${t.status === 'failed'
           ? `<button class="thumb-retry" data-thumb-action="retry" data-thumb-idx="${idx}" aria-label="Retry">↻ Retry</button>`
           : ''}
+        ${metaHtml}
       </div>
     `;
   }

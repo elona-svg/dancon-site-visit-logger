@@ -1,11 +1,16 @@
-// In-app video player overlay.
-//   - X close button (top-right)
-//   - Tap outside the video to dismiss
+// In-app media player overlay (video + audio).
+//   - X close button
+//   - Tap outside the media to dismiss
 //   - Swipe down (>80px) to dismiss
-//   - Browser Back closes via history.popstate
-// On close, the video is paused and the underlying MediaSource (if any)
-// is released. Returns control to whatever the caller had open before
-// (typically the project screen with its asset strip).
+//   - Browser Back closes via popstate
+// On close, the media is paused and source detached.
+//
+// For Drive-backed clips (no local objectUrl) we fetch the file as a Blob
+// with progress reporting and then play from a blob URL. That's the only
+// reliable cross-browser path — `<video src=https://...?access_token=...>`
+// is flaky on Safari for cross-origin auth'd content. If anything fails or
+// the browser can't decode the format, we show a "Video could not load"
+// retry overlay instead of leaving the user staring at a black frame.
 window.VideoPlayer = (function () {
   let isOpen = false;
   let closing = false;
@@ -13,35 +18,35 @@ window.VideoPlayer = (function () {
   let popstateListener = null;
   let touchStartY = 0;
   let touchStartT = 0;
+  let activeFetch = null;
+  let blobUrl = null;
 
   function root() { return document.getElementById('overlay-root'); }
 
-  function open({ src, name, kind = 'video', onClose }) {
+  // open({ src?, fileId?, name, kind = 'video', onClose })
+  // If `src` is provided we play it directly (e.g. current-session blob URL).
+  // If `fileId` is provided we fetch the bytes from Drive ourselves.
+  function open(opts) {
     if (isOpen) close();
     isOpen = true;
     closing = false;
-    onCloseCb = onClose || null;
+    onCloseCb = opts.onClose || null;
 
+    const isAudio = opts.kind === 'audio';
     document.body.classList.add('camera-fs-open');
-    const isAudio = kind === 'audio';
-    const mediaTag = isAudio
-      ? `<audio id="vp-video" controls autoplay preload="metadata" src="${escapeHtml(src)}"></audio>`
-      : `<video id="vp-video" controls playsinline autoplay preload="metadata" src="${escapeHtml(src)}"></video>`;
-    const stageInner = isAudio
-      ? `<div class="vplayer-audio-card">
-           <div class="vplayer-audio-glyph">🎙️</div>
-           <div class="vplayer-audio-title">${escapeHtml(name || 'Voice note')}</div>
-           ${mediaTag}
-         </div>`
-      : mediaTag;
-
     root().innerHTML = `
       <div class="vplayer-overlay ${isAudio ? 'audio' : ''}" id="vplayer">
         <button class="cam-fs-icon vplayer-close" id="vp-close" aria-label="Close">✕</button>
         <div class="vplayer-stage" id="vp-stage">
-          ${stageInner}
+          <div class="vplayer-loading" id="vp-loading">Loading…</div>
+          <div class="vplayer-error" id="vp-error" hidden>
+            <h3 id="vp-error-title">Video could not load</h3>
+            <p class="muted small" id="vp-error-detail">Try again in a few minutes.</p>
+            <button class="btn-primary" id="vp-retry">Retry</button>
+          </div>
+          <div class="vplayer-media-wrap" id="vp-media-wrap" hidden></div>
         </div>
-        <div class="vplayer-name">${escapeHtml(name || '')}</div>
+        <div class="vplayer-name">${escapeHtml(opts.name || '')}</div>
       </div>
     `;
 
@@ -50,18 +55,123 @@ window.VideoPlayer = (function () {
     window.addEventListener('popstate', popstateListener);
 
     document.getElementById('vp-close').addEventListener('click', () => close());
+    document.getElementById('vp-retry').addEventListener('click', () => loadAndPlay(opts));
     const overlay = document.getElementById('vplayer');
-    overlay.addEventListener('click', onBackdropClick);
+    overlay.addEventListener('click', (ev) => {
+      if (ev.target.id === 'vplayer' || ev.target.id === 'vp-stage') close();
+    });
     const stage = document.getElementById('vp-stage');
     stage.addEventListener('touchstart', onTouchStart, { passive: true });
     stage.addEventListener('touchend', onTouchEnd, { passive: true });
+
+    loadAndPlay(opts);
   }
 
-  function onBackdropClick(ev) {
-    // Tap outside the <video> dismisses; tap on the video itself does not.
-    if (ev.target.id === 'vplayer' || ev.target.id === 'vp-stage') {
-      close();
+  async function loadAndPlay(opts) {
+    const isAudio = opts.kind === 'audio';
+    const loading = document.getElementById('vp-loading');
+    const errorBox = document.getElementById('vp-error');
+    const wrap = document.getElementById('vp-media-wrap');
+
+    if (!loading || !errorBox || !wrap) return;
+    errorBox.hidden = true;
+    wrap.hidden = true;
+    wrap.innerHTML = '';
+    loading.style.display = '';
+    loading.textContent = isAudio ? 'Loading…' : 'Loading video…';
+
+    let src = opts.src;
+
+    // For Drive content (no current-session blob) we fetch ourselves so
+    // we get progress reporting and avoid Safari's CORS-with-auth flakiness.
+    if (!src && opts.fileId) {
+      try {
+        revokeBlob();
+        const token = await window.Auth.getAccessToken();
+        const ctrl = new AbortController();
+        activeFetch = ctrl;
+        const res = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${opts.fileId}?alt=media&supportsAllDrives=true`,
+          { headers: { Authorization: `Bearer ${token}` }, signal: ctrl.signal }
+        );
+        activeFetch = null;
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const total = Number(res.headers.get('content-length') || 0);
+        const reader = res.body && res.body.getReader ? res.body.getReader() : null;
+        if (reader && total > 0) {
+          const chunks = [];
+          let received = 0;
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (value) {
+              chunks.push(value);
+              received += value.byteLength;
+              const pct = Math.floor((received / total) * 100);
+              if (loading) loading.textContent = `Loading video… ${pct}%`;
+            }
+          }
+          const blob = new Blob(chunks, { type: res.headers.get('content-type') || (isAudio ? 'audio/webm' : 'video/mp4') });
+          blobUrl = URL.createObjectURL(blob);
+        } else {
+          // No streaming reader — fall back to .blob()
+          const blob = await res.blob();
+          blobUrl = URL.createObjectURL(blob);
+        }
+        src = blobUrl;
+      } catch (err) {
+        activeFetch = null;
+        if (err.name === 'AbortError') return;
+        console.error('[vplayer] fetch failed:', err);
+        return showError(
+          isAudio ? 'Audio could not load' : 'Video could not load',
+          err.message ? `Network error: ${err.message}` : 'Try again in a few minutes.'
+        );
+      }
     }
+
+    if (!src) {
+      return showError('Could not play', 'No source available for this file.');
+    }
+
+    // Mount the actual media element.
+    const tag = isAudio ? 'audio' : 'video';
+    const attrs = isAudio
+      ? 'controls autoplay preload="metadata"'
+      : 'controls playsinline autoplay preload="metadata"';
+    const media = isAudio
+      ? `<div class="vplayer-audio-card">
+           <div class="vplayer-audio-glyph">🎙️</div>
+           <div class="vplayer-audio-title">${escapeHtml(opts.name || 'Voice note')}</div>
+           <audio id="vp-media" ${attrs} src="${escapeHtml(src)}"></audio>
+         </div>`
+      : `<video id="vp-media" ${attrs} src="${escapeHtml(src)}"></video>`;
+
+    wrap.innerHTML = media;
+    wrap.hidden = false;
+    if (loading) loading.style.display = 'none';
+
+    const el = document.getElementById('vp-media');
+    el.addEventListener('error', () => {
+      const code = el.error?.code;
+      let detail = 'Try again in a few minutes.';
+      if (code === 4) detail = "Your browser can't decode this format. The original file is safe in Drive.";
+      else if (code === 2) detail = 'Network error.';
+      showError(isAudio ? 'Audio could not play' : 'Video could not play', detail);
+    });
+  }
+
+  function showError(title, detail) {
+    const loading = document.getElementById('vp-loading');
+    const errorBox = document.getElementById('vp-error');
+    const wrap = document.getElementById('vp-media-wrap');
+    if (loading) loading.style.display = 'none';
+    if (wrap) { wrap.hidden = true; wrap.innerHTML = ''; }
+    if (!errorBox) return;
+    document.getElementById('vp-error-title').textContent = title;
+    document.getElementById('vp-error-detail').textContent = detail;
+    errorBox.hidden = false;
   }
 
   function onTouchStart(ev) {
@@ -77,21 +187,27 @@ window.VideoPlayer = (function () {
     if (dy > 80) close();
   }
 
+  function revokeBlob() {
+    if (blobUrl) { try { URL.revokeObjectURL(blobUrl); } catch (e) {} blobUrl = null; }
+  }
+
   function close(opts = {}) {
     if (!isOpen || closing) return;
     closing = true;
 
-    const video = document.getElementById('vp-video');
-    if (video) {
-      try { video.pause(); video.removeAttribute('src'); video.load(); } catch (e) { /* ignore */ }
+    const el = document.getElementById('vp-media');
+    if (el) {
+      try { el.pause(); el.removeAttribute('src'); el.load(); } catch (e) {}
     }
+    if (activeFetch) { try { activeFetch.abort(); } catch (e) {} activeFetch = null; }
+    revokeBlob();
+
     if (popstateListener) {
       window.removeEventListener('popstate', popstateListener);
       popstateListener = null;
     }
-    if (!opts.fromPop) {
-      try { history.back(); } catch (e) { /* ignore */ }
-    }
+    if (!opts.fromPop) { try { history.back(); } catch (e) {} }
+
     root().innerHTML = '';
     document.body.classList.remove('camera-fs-open');
     isOpen = false;
@@ -99,7 +215,7 @@ window.VideoPlayer = (function () {
 
     const cb = onCloseCb;
     onCloseCb = null;
-    if (cb) { try { cb(); } catch (err) { console.error('[vplayer] onClose threw:', err); } }
+    if (cb) { try { cb(); } catch (e) { console.error('[vplayer] onClose threw:', e); } }
   }
 
   function escapeHtml(s) {
