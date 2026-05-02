@@ -1233,19 +1233,11 @@
     app.innerHTML = `
       <div class="screen login-screen">
         <div class="brand">
-          <svg width="72" height="72" viewBox="0 0 192 192" aria-hidden="true">
-            <rect fill="#0f172a" width="192" height="192" rx="36"/>
-            <g fill="none" stroke="#fbbf24" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="40" y="62" width="112" height="84" rx="10"/>
-              <path d="M70 62 L82 46 H110 L122 62"/>
-              <circle cx="96" cy="106" r="22"/>
-            </g>
-          </svg>
-          <h1>Site Visit Logger</h1>
-          <p>Dancon Services — field documentation</p>
+          <img class="brand-logo" src="icons/icon-512.png" alt="Dancon Construction Services" />
+          <p class="brand-tag">Site Visit Logger</p>
         </div>
-        <button id="signin-btn" class="btn-primary big">Sign in with Google</button>
-        <p class="muted small">Only @${escapeHtml(window.CONFIG.HOSTED_DOMAIN)} accounts are allowed.</p>
+        <button id="signin-btn" class="btn-signin">Sign in with Google</button>
+        <p class="login-fineprint">Only @${escapeHtml(window.CONFIG.HOSTED_DOMAIN)} accounts can sign in.</p>
       </div>
     `;
     document.getElementById('signin-btn').addEventListener('click', onSignInClick);
