@@ -35,17 +35,28 @@ window.Camera = (function () {
 
   function root() { return document.getElementById('overlay-root'); }
 
+  // Prefer MP4 (H264 + AAC). Drive treats MP4 with H264 as native and serves
+  // it back for streaming within seconds; WebM forces a slow transcode that
+  // can take many minutes. Plain 'video/mp4' is checked first because some
+  // Safari builds reject codec-specific strings while accepting the generic
+  // form. WebM is only the absolute fallback (Chrome desktop / Android).
   function pickVideoMime() {
     const candidates = [
-      'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
       'video/mp4',
+      'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+      'video/mp4;codecs=h264,aac',
+      'video/mp4;codecs=h264',
       'video/webm;codecs=vp9,opus',
       'video/webm;codecs=vp8,opus',
       'video/webm'
     ];
     for (const m of candidates) {
-      if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) {
+        console.log('[camera] selected video mime:', m);
+        return m;
+      }
     }
+    console.warn('[camera] no preferred video mime supported — falling back to MediaRecorder default');
     return '';
   }
 

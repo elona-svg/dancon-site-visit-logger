@@ -891,6 +891,16 @@
   }
 
   // ---------- Project media (thumbs + notes) ----------
+  // Drive's `thumbnailLink` is a small (~220 px) image — when we render it
+  // inside a thumb cell that's typically 110-160 px wide on phones, it
+  // looks blurry/small compared to the original blob preview. Bumping the
+  // size suffix to s1024 gives a much sharper rendering at the same
+  // physical cell size, with no layout change.
+  function upscaleDriveThumb(url) {
+    if (!url) return url;
+    return url.replace(/=s\d+(-[a-z])?$/, '=s1024$1');
+  }
+
   async function refreshProjectMedia() {
     if (!state.currentProjectId) return;
     state.thumbsLoading = true;
@@ -905,20 +915,43 @@
         )
         .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
 
-      // Preserve in-flight items not yet on Drive.
-      const pendingThumbs = state.thumbs.filter((t) => t.status !== 'success' || !t.fileId);
-      const driveThumbs = media.map((f) => ({
-        type: f.mimeType.startsWith('image/') ? 'photo'
-            : f.mimeType.startsWith('video/') ? 'video' : 'audio',
-        src: f.thumbnailLink || '',
-        name: f.name,
-        mime: f.mimeType,
-        size: Number(f.size || 0),
-        status: 'success',
-        fileId: f.id,
-        webViewLink: f.webViewLink || '',
-        addedAt: new Date(f.createdTime || Date.now()).getTime()
-      }));
+      // Index existing thumbs so we can preserve blob URLs / queueIds /
+      // duration metadata across the refresh. This is what keeps a
+      // freshly-captured photo at full quality even after its upload
+      // completes — we don't downgrade to Drive's 220 px thumbnailLink
+      // when we already have the sharp local blob.
+      const byFileId = new Map();
+      const byName = new Map();
+      state.thumbs.forEach((t) => {
+        if (t.fileId) byFileId.set(t.fileId, t);
+        if (t.name) byName.set(t.name, t);
+      });
+
+      const driveThumbs = media.map((f) => {
+        const existing = byFileId.get(f.id) || byName.get(f.name);
+        const driveSrc = upscaleDriveThumb(f.thumbnailLink || '');
+        return {
+          type: f.mimeType.startsWith('image/') ? 'photo'
+              : f.mimeType.startsWith('video/') ? 'video' : 'audio',
+          // Prefer the live blob URL so the image stays sharp + identical
+          // size before/after upload. Fall back to a high-res Drive thumb
+          // for files from previous sessions.
+          src: existing?.objectUrl || driveSrc,
+          objectUrl: existing?.objectUrl || null,
+          name: f.name,
+          mime: f.mimeType,
+          size: Number(f.size || 0),
+          status: 'success',
+          fileId: f.id,
+          webViewLink: f.webViewLink || '',
+          addedAt: existing?.addedAt || new Date(f.createdTime || Date.now()).getTime(),
+          durationMs: existing?.durationMs || null
+        };
+      });
+
+      // Anything still pending (queued / uploading / failed) — i.e. not
+      // yet on Drive — gets carried over verbatim.
+      const pendingThumbs = state.thumbs.filter((t) => !t.fileId);
       state.thumbs = [...pendingThumbs, ...driveThumbs];
     } catch (err) {
       console.warn('Could not refresh media:', err.message);
@@ -1907,7 +1940,7 @@
         <div class="thumb-grid">
           ${images.map((f) => `
             <button class="thumb" data-file-id="${escapeHtml(f.id)}" data-file-name="${escapeHtml(f.name)}">
-              ${f.thumbnailLink ? `<img loading="lazy" alt="" src="${escapeHtml(f.thumbnailLink)}" onerror="this.style.display='none'"/>` : ''}
+              ${f.thumbnailLink ? `<img loading="lazy" alt="" src="${escapeHtml(upscaleDriveThumb(f.thumbnailLink))}" onerror="this.style.display='none'"/>` : ''}
               <span class="thumb-label">${escapeHtml(f.name)}</span>
             </button>
           `).join('')}
