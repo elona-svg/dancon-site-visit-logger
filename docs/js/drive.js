@@ -235,6 +235,27 @@ window.Drive = (function () {
     return big ? uploadResumable(opts) : uploadMultipart(opts);
   }
 
+  // -------- Rename --------
+  async function renameFile(fileId, newName) {
+    const name = sanitizeFolderName(newName);
+    if (!name) throw new Error('Empty name');
+    return withRetry(async () => {
+      const res = await authedFetch(
+        `${API}/files/${fileId}?supportsAllDrives=true&fields=id,name,modifiedTime`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        }
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Rename failed (${res.status}): ${text || res.statusText}`);
+      }
+      return res.json();
+    });
+  }
+
   // -------- Delete --------
   async function deleteFile(fileId) {
     return withRetry(async () => {
@@ -328,6 +349,7 @@ window.Drive = (function () {
     uploadMultipart,
     uploadResumable,
     deleteFile,
+    renameFile,
     downloadFileText,
     updateFileContent,
     appendToTextFile,

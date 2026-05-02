@@ -13,6 +13,8 @@ window.Viewer = (function () {
   let touchStartX = 0;
   let touchStartY = 0;
   let touchStartT = 0;
+  let popstateListener = null;
+  let closing = false;
 
   function root() { return document.getElementById('overlay-root'); }
 
@@ -22,20 +24,35 @@ window.Viewer = (function () {
     onAnnotateCb = opts.onAnnotate || null;
     onDeleteCb = opts.onDelete || null;
     onCloseCb = opts.onClose || null;
+    closing = false;
     if (items.length === 0) return;
 
     document.body.classList.add('camera-open');
     render();
     window.addEventListener('keydown', onKey);
+
+    history.pushState({ overlay: 'viewer' }, '');
+    popstateListener = () => close({ fromPop: true });
+    window.addEventListener('popstate', popstateListener);
   }
 
-  function close() {
+  function close(opts = {}) {
+    if (closing) return;
+    closing = true;
     window.removeEventListener('keydown', onKey);
+    if (popstateListener) {
+      window.removeEventListener('popstate', popstateListener);
+      popstateListener = null;
+    }
+    if (!opts.fromPop) {
+      try { history.back(); } catch (e) { /* ignore */ }
+    }
     root().innerHTML = '';
     document.body.classList.remove('camera-open');
     items = [];
     const cb = onCloseCb;
     onAnnotateCb = onDeleteCb = onCloseCb = null;
+    closing = false;
     if (cb) cb();
   }
 

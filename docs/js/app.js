@@ -9,7 +9,7 @@
   let UI;
   try {
     UI = window.UI;
-    if (!UI || !window.DB || !window.Auth || !window.Drive || !window.Camera || !window.AudioNote || !window.Annotate || !window.Viewer) {
+    if (!UI || !window.DB || !window.Auth || !window.Drive || !window.Camera || !window.AudioNote || !window.Annotate || !window.Viewer || !window.VideoPlayer) {
       throw new Error('A required module failed to load. Reload the page.');
     }
   } catch (err) {
@@ -37,20 +37,17 @@
     projectsLoading: false,
     projectFilter: '',
 
-    cam: null,
-    camError: null,
-    camAttaching: false,
-    camCounter: 0,
-    camRecording: false,
-    recStartTs: 0,
-    recTimerHandle: null,
-
     thumbs: [],
     thumbsLoading: false,
 
     notesEntries: [],
     notesFileId: null,
     notesLoading: false,
+    editingNoteIdx: null,    // index in notesEntries currently being edited
+    draftAttachment: null,   // { name, queueId?, fileId? } pending attachment
+
+    isRenaming: false,
+    renameSaving: false,
 
     gps: null,            // { lat, lng, link } once known for current folder
     gpsLoading: false,
@@ -149,17 +146,15 @@
     toast('Offline — captures will queue', 'warn');
     updateOnlineBadges();
   });
-  // Stop the camera the moment the page goes background — iOS keeps the
-  // green/orange privacy indicator on otherwise.
+  // If the camera or voice overlay is open and the page is backgrounded,
+  // close it so iOS releases the camera/mic indicator.
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden' && state.view === 'capture') {
-      detachCamera({ silent: true });
-    } else if (document.visibilityState === 'visible' && state.view === 'capture' && !state.cam) {
-      attachCamera();
+    if (document.visibilityState === 'hidden') {
+      if (window.Camera.isOpen()) window.Camera.close();
     }
   });
   window.addEventListener('pagehide', () => {
-    detachCamera({ silent: true });
+    if (window.Camera.isOpen()) window.Camera.close();
   });
 
   // ---------- Auth handlers ----------
@@ -176,7 +171,7 @@
     }
   }
   async function onSignOutClick() {
-    detachCamera({ silent: true });
+    if (window.Camera.isOpen()) window.Camera.close();
     await window.Auth.signOut();
     state.user = null;
     state.currentProjectId = null;
@@ -225,7 +220,9 @@
     state.notesLoading = true;
     state.gps = null;
     state.gpsLoading = true;
-    state.camCounter = 0;
+    state.editingNoteIdx = null;
+    state.draftAttachment = null;
+    state.isRenaming = false;
     state.projectFilter = '';
     scheduleRender();
     if (created) toast(`Created "${name}"`, 'info');
@@ -241,13 +238,16 @@
   }
 
   function leaveProject() {
-    detachCamera({ silent: true });
+    if (window.Camera.isOpen()) window.Camera.close();
     state.currentProjectId = null;
     state.currentProjectName = null;
     state.thumbs.forEach(revokeThumbBlob);
     state.thumbs = [];
     state.notesEntries = [];
     state.gps = null;
+    state.editingNoteIdx = null;
+    state.draftAttachment = null;
+    state.isRenaming = false;
     state.view = 'home';
     scheduleRender();
     loadProjects();
@@ -371,134 +371,51 @@
     return mime.split('/')[1]?.split(';')[0] || 'bin';
   }
 
-  // ---------- Camera ----------
-  async function attachCamera() {
-    const videoEl = document.getElementById('cam-video');
-    if (!videoEl) return;
-    if (state.cam || state.camAttaching) return;
-    state.camAttaching = true;
-    state.camError = null;
-    updateCamErrorDOM();
-    try {
-      state.cam = await window.Camera.attach(videoEl, { withAudio: true });
-    } catch (err) {
-      console.warn('Camera attach failed:', err);
-      state.camError = err.message || String(err);
-      state.cam = null;
-    } finally {
-      state.camAttaching = false;
-      updateCamErrorDOM();
-    }
+  // ---------- Camera (fullscreen) ----------
+  function openCamera({ mode = 'multi' } = {}) {
+    if (!ensureProject()) return;
+    window.Camera.open({
+      mode,
+      onCapture: (blob, mime, kind) => {
+        console.log('[camera] onCapture', kind, blob?.size);
+        enqueueCapture(blob, mime, kind);
+      },
+      onClose: () => { /* overlay closes itself; nothing to do */ }
+    });
   }
 
-  function detachCamera({ silent = false } = {}) {
-    if (state.cam) {
-      try { state.cam.stop(); } catch (e) { /* ignore */ }
-      state.cam = null;
-    }
-    if (state.recTimerHandle) { clearInterval(state.recTimerHandle); state.recTimerHandle = null; }
-    state.camRecording = false;
-    if (!silent) state.camCounter = 0;
-    const recBar = document.getElementById('rec-bar');
-    if (recBar) recBar.hidden = true;
-    document.getElementById('rec-btn')?.classList.remove('recording');
-  }
-
-  async function onShutterClick() {
-    if (!state.cam) {
-      attachCamera();
-      return;
-    }
-    if (state.camRecording) return;
-    let blob;
-    try { blob = await state.cam.takePhoto(); }
-    catch (err) {
-      toast(`Photo failed: ${err.message}`, 'error');
-      return;
-    }
-    flashStage();
-    state.camCounter += 1;
-    updateCamCounterDOM();
-    enqueueCapture(blob, blob.type || 'image/jpeg', 'photo');
-  }
-
-  async function onRecordClick() {
-    if (!state.cam) { attachCamera(); return; }
-    if (state.camRecording) {
-      const btn = document.getElementById('rec-btn');
-      btn?.classList.remove('recording');
-      const recBar = document.getElementById('rec-bar');
-      if (recBar) recBar.hidden = true;
-      if (state.recTimerHandle) { clearInterval(state.recTimerHandle); state.recTimerHandle = null; }
-      state.camRecording = false;
-      try {
-        const { blob, mime } = await state.cam.stopVideo();
-        state.camCounter += 1;
-        updateCamCounterDOM();
-        enqueueCapture(blob, mime, 'video');
-      } catch (err) {
-        toast(`Video failed: ${err.message}`, 'error');
+  async function openCameraForAttachment() {
+    if (!ensureProject()) return;
+    // single-shot photo; capture promotes to draftAttachment then closes camera.
+    let attachedThisOpen = false;
+    window.Camera.open({
+      mode: 'single',
+      onCapture: async (blob, mime) => {
+        if (attachedThisOpen) return;
+        attachedThisOpen = true;
+        await enqueueCapture(blob, mime, 'photo', { setDraftAttachment: true });
+      },
+      onClose: () => {
+        // After camera closes, focus the textarea so the user can keep typing.
+        setTimeout(() => document.getElementById('notes-textarea')?.focus(), 100);
       }
-      return;
-    }
-    try {
-      state.cam.startVideo();
-      state.camRecording = true;
-      state.recStartTs = Date.now();
-      const btn = document.getElementById('rec-btn');
-      btn?.classList.add('recording');
-      const recBar = document.getElementById('rec-bar');
-      if (recBar) {
-        recBar.hidden = false;
-        recBar.querySelector('.rec-time').textContent = '0:00';
-      }
-      if (state.recTimerHandle) clearInterval(state.recTimerHandle);
-      state.recTimerHandle = setInterval(() => {
-        const s = Math.floor((Date.now() - state.recStartTs) / 1000);
-        const mm = Math.floor(s / 60);
-        const ss = String(s % 60).padStart(2, '0');
-        const el = document.querySelector('#rec-bar .rec-time');
-        if (el) el.textContent = `${mm}:${ss}`;
-      }, 250);
-    } catch (err) {
-      toast(`Could not start recording: ${err.message}`, 'error');
-    }
-  }
-
-  function flashStage() {
-    const stage = document.getElementById('cam-stage');
-    if (!stage) return;
-    stage.classList.add('flash');
-    setTimeout(() => stage.classList.remove('flash'), 220);
+    });
   }
 
   // ---------- Voice & notes ----------
   function startVoiceNote() {
     if (!ensureProject()) return;
     console.log('[voice] startVoiceNote');
-    // iOS Safari only allows one mic capture at a time. The camera stream
-    // already holds it (audio:true so video records audio), so we MUST
-    // release the camera before opening the voice modal — otherwise
-    // getUserMedia either rejects or returns a stream whose recorder
-    // never fires onstop. We re-attach the camera on close.
-    const wasCamAttached = !!state.cam;
-    if (wasCamAttached) {
-      console.log('[voice] detaching camera so iOS releases the mic');
-      detachCamera({ silent: true });
-    }
+    // The camera fullscreen is the only thing that holds the mic, and it's
+    // not currently open (the project screen has no live preview anymore).
+    // Voice can grab the mic directly.
+    if (window.Camera.isOpen()) window.Camera.close();
     window.AudioNote.open({
       onCapture: (blob, mime) => {
         console.log('[voice] app.onCapture — blob:', blob?.size, 'mime:', mime);
         enqueueCapture(blob, mime, 'audio');
       },
-      onClose: () => {
-        console.log('[voice] AudioNote closed; reattach camera?', wasCamAttached, 'view:', state.view);
-        if (wasCamAttached && state.view === 'capture') {
-          // Small delay lets iOS fully release the audio track before we
-          // re-acquire it through the camera stream.
-          setTimeout(() => attachCamera(), 250);
-        }
-      }
+      onClose: () => {}
     });
   }
 
@@ -510,29 +427,189 @@
     const folderId = state.currentProjectId;
     const stamp = fmtDateTime();
     const tech = state.user?.name || 'unknown';
-    const block = `\n--- ${stamp} — ${tech} ---\n${text}\n`;
+
+    const attachLine = state.draftAttachment ? `\n[photo: ${state.draftAttachment.name}]` : '';
     const saveBtn = document.getElementById('save-note-btn');
     if (saveBtn) saveBtn.disabled = true;
+
     try {
-      const result = await window.Drive.appendToTextFile({
-        folderId,
-        fileName: 'notes.txt',
-        lineOrText: block,
-        cachedFileId: state.notesFileId
-      });
-      state.notesFileId = result.id;
-      await window.DB.kvSet(`notesFileId:${folderId}`, result.id);
-      ta.value = '';
-      // Optimistic: prepend the new note to history before refresh fires.
-      state.notesEntries.unshift({ ts: stamp, tech, body: text });
-      updateNotesHistoryDOM();
-      toast('Note saved', 'success');
-      appendVisitLog(folderId, 'added text note').catch(() => {});
+      if (state.editingNoteIdx != null) {
+        // EDIT path: replace existing entry in notes.txt
+        const original = state.notesEntries[state.editingNoteIdx];
+        if (!original) throw new Error('Original note not found');
+        if (!state.notesFileId) throw new Error('Notes file not loaded yet');
+
+        const editedBody = `${text}${attachLine}\n_(edited ${stamp})_`;
+        const updatedEntry = { ts: original.ts, tech: original.tech, body: editedBody };
+
+        const fileText = await window.Drive.downloadFileText(state.notesFileId);
+        const fresh = parseNotes(fileText);
+        const matchIdx = fresh.findIndex(
+          (e) => e.ts === original.ts && e.tech === original.tech && e.body === original.body
+        );
+        if (matchIdx >= 0) fresh[matchIdx] = updatedEntry;
+        else fresh.unshift(updatedEntry); // safety: prepend if not found
+
+        const newText = serializeNotes(fresh);
+        const blob = new Blob([newText], { type: 'text/plain' });
+        await window.Drive.updateFileContent(state.notesFileId, blob, 'text/plain');
+
+        state.notesEntries[state.editingNoteIdx] = updatedEntry;
+        state.editingNoteIdx = null;
+        state.draftAttachment = null;
+        ta.value = '';
+        updateNotesHistoryDOM();
+        updateNotesEditUIDOM();
+        updateAttachmentChipDOM();
+        toast('Note updated', 'success');
+        appendVisitLog(folderId, 'edited text note').catch(() => {});
+      } else {
+        // APPEND path: new note
+        const block = `\n--- ${stamp} — ${tech} ---\n${text}${attachLine}\n`;
+        const result = await window.Drive.appendToTextFile({
+          folderId,
+          fileName: 'notes.txt',
+          lineOrText: block,
+          cachedFileId: state.notesFileId
+        });
+        state.notesFileId = result.id;
+        await window.DB.kvSet(`notesFileId:${folderId}`, result.id);
+        ta.value = '';
+        state.notesEntries.unshift({ ts: stamp, tech, body: `${text}${attachLine}` });
+        state.draftAttachment = null;
+        updateNotesHistoryDOM();
+        updateAttachmentChipDOM();
+        toast('Note saved', 'success');
+        appendVisitLog(folderId, 'added text note').catch(() => {});
+      }
     } catch (err) {
       toast(`Note save failed: ${err.message}`, 'error', 6000);
     } finally {
       if (saveBtn) saveBtn.disabled = false;
     }
+  }
+
+  function startEditNote(idx) {
+    const note = state.notesEntries[idx];
+    if (!note) return;
+    state.editingNoteIdx = idx;
+    const parsed = parseNoteBody(note.body);
+    // Strip prior "(edited)" footer when loading into the editor — fresh save
+    // will re-add an updated one.
+    const cleanBody = parsed.body.replace(/\n?_\(edited [^)]+\)_\s*$/, '');
+    state.draftAttachment = parsed.attachment ? { name: parsed.attachment } : null;
+    const ta = document.getElementById('notes-textarea');
+    if (ta) {
+      ta.value = cleanBody;
+      ta.focus();
+      ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    updateNotesEditUIDOM();
+    updateAttachmentChipDOM();
+  }
+
+  function cancelEditNote() {
+    state.editingNoteIdx = null;
+    state.draftAttachment = null;
+    const ta = document.getElementById('notes-textarea');
+    if (ta) ta.value = '';
+    updateNotesEditUIDOM();
+    updateAttachmentChipDOM();
+  }
+
+  // Note body may end with "[photo: filename.jpg]". Extract that out so we
+  // can render the attachment as a thumbnail.
+  function parseNoteBody(body) {
+    const m = body.match(/\n?\[photo:\s*([^\]\n]+)\]\s*$/m);
+    if (m) {
+      return { body: body.replace(m[0], '').trimEnd(), attachment: m[1].trim() };
+    }
+    // Also catch inline (in case of edited text where attachment isn't last)
+    const inline = body.match(/\[photo:\s*([^\]\n]+)\]/);
+    if (inline) {
+      return { body: body.replace(inline[0], '').trim(), attachment: inline[1].trim() };
+    }
+    return { body, attachment: null };
+  }
+
+  function findThumbByName(name) {
+    if (!name) return null;
+    return state.thumbs.find((t) => t.name === name) || null;
+  }
+
+  // -------- Note attachments --------
+  function openAttachmentChooser() {
+    if (!ensureProject()) return;
+    const root = document.getElementById('overlay-root');
+    root.innerHTML = `
+      <div class="modal-backdrop">
+        <div class="attach-sheet">
+          <div class="modal-header">
+            <h3>Attach photo</h3>
+            <button class="modal-x" id="attach-x" aria-label="Close">✕</button>
+          </div>
+          <button class="attach-option" id="attach-take">📷 Take new photo</button>
+          <button class="attach-option" id="attach-pick">🖼️ Choose from gallery</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('attach-x').addEventListener('click', closeAttachmentChooser);
+    document.getElementById('attach-take').addEventListener('click', () => {
+      closeAttachmentChooser();
+      openCameraForAttachment();
+    });
+    document.getElementById('attach-pick').addEventListener('click', () => {
+      closeAttachmentChooser();
+      openAttachmentPicker();
+    });
+  }
+  function closeAttachmentChooser() {
+    const root = document.getElementById('overlay-root');
+    if (root) root.innerHTML = '';
+  }
+
+  function openAttachmentPicker() {
+    const photos = state.thumbs.filter((t) => t.type === 'photo');
+    const root = document.getElementById('overlay-root');
+    if (photos.length === 0) {
+      toast('No photos in this project yet', 'warn');
+      return;
+    }
+    root.innerHTML = `
+      <div class="modal-backdrop">
+        <div class="attach-picker-sheet">
+          <div class="modal-header">
+            <h3>Pick a photo to attach</h3>
+            <button class="modal-x" id="pick-x" aria-label="Close">✕</button>
+          </div>
+          <div class="attach-grid">
+            ${photos.map((t, idx) => `
+              <button class="attach-thumb" data-pick-idx="${idx}">
+                ${t.src ? `<img src="${escapeHtml(t.src)}" alt=""/>` : ''}
+              </button>
+            `).join('')}
+          </div>
+        </div>
+      </div>
+    `;
+    document.getElementById('pick-x').addEventListener('click', () => {
+      root.innerHTML = '';
+    });
+    root.querySelectorAll('[data-pick-idx]').forEach((b) => {
+      b.addEventListener('click', () => {
+        const idx = parseInt(b.dataset.pickIdx, 10);
+        const t = photos[idx];
+        state.draftAttachment = { name: t.name, fileId: t.fileId || null };
+        root.innerHTML = '';
+        updateAttachmentChipDOM();
+        toast('Photo attached to note', 'success', 1500);
+      });
+    });
+  }
+
+  function clearDraftAttachment() {
+    state.draftAttachment = null;
+    updateAttachmentChipDOM();
   }
 
   function ensureProject() {
@@ -544,7 +621,7 @@
   }
 
   // ---------- Capture queue ----------
-  async function enqueueCapture(blob, mime, kind) {
+  async function enqueueCapture(blob, mime, kind, opts = {}) {
     console.log('[capture] enqueueCapture kind=', kind, 'mime=', mime, 'size=', blob?.size, 'project=', state.currentProjectId);
     const folderId = state.currentProjectId;
     const folderName = state.currentProjectName;
@@ -590,6 +667,11 @@
     state.thumbs.unshift(thumb);
     updateThumbsDOM();
     pumpQueue();
+
+    if (opts.setDraftAttachment && kind === 'photo') {
+      state.draftAttachment = { name: fileName, queueId: item.id };
+      updateAttachmentChipDOM();
+    }
   }
 
   function patchThumbByQueueId(queueId, patch) {
@@ -801,19 +883,31 @@
   }
 
   // ---------- Viewer + delete + annotate ----------
-  function openViewerForThumb(thumbIdx) {
+  async function openViewerForThumb(thumbIdx) {
     const photoThumbs = state.thumbs.filter((t) => t.type === 'photo');
     const target = state.thumbs[thumbIdx];
     if (!target) return;
 
-    if (target.type === 'video' || target.type === 'audio') {
-      if (target.webViewLink) {
-        window.open(target.webViewLink, '_blank', 'noopener');
-      } else if (target.objectUrl) {
-        window.open(target.objectUrl, '_blank', 'noopener');
-      } else {
-        toast('Wait for upload to finish before opening', 'warn');
+    if (target.type === 'video') {
+      // Use the local blob URL while we have it (works even mid-upload);
+      // fall back to a Drive content URL with the access token after upload.
+      let src = target.objectUrl;
+      if (!src && target.fileId) {
+        try {
+          const token = await window.Auth.getAccessToken();
+          src = `https://www.googleapis.com/drive/v3/files/${target.fileId}?alt=media&supportsAllDrives=true&access_token=${encodeURIComponent(token)}`;
+        } catch (e) { /* fall through */ }
       }
+      if (!src) { toast('Wait for upload to finish', 'warn'); return; }
+      window.VideoPlayer.open({ src, name: target.name, onClose: () => {} });
+      return;
+    }
+    if (target.type === 'audio') {
+      // Audio: simple in-page <audio> element overlay isn't built yet, so
+      // fall back to Drive's hosted player or local blob URL.
+      const url = target.objectUrl || target.webViewLink;
+      if (url) window.open(url, '_blank', 'noopener');
+      else toast('Wait for upload to finish', 'warn');
       return;
     }
 
@@ -936,7 +1030,7 @@
   // ---------- Drive (gallery) view ----------
   async function openGallery() {
     if (!ensureProject()) return;
-    detachCamera({ silent: true });
+    if (window.Camera.isOpen()) window.Camera.close();
     state.view = 'gallery';
     state.galleryLoading = true;
     state.galleryFiles = [];
@@ -1133,32 +1227,17 @@
       <div class="screen capture-screen">
         <header class="topbar">
           <button class="btn-ghost back-btn" id="back-btn">‹ Sites</button>
-          <div class="topbar-title-center">
-            <div class="topbar-title">${escapeHtml(state.currentProjectName)}</div>
-            <div id="cap-offline" class="cap-offline"></div>
-          </div>
+          <div class="topbar-title-center" id="proj-title-region"></div>
           <button class="btn-ghost" id="drive-btn">📁 Drive</button>
         </header>
 
         <main class="capture-main">
-          <div class="cam-stage" id="cam-stage">
-            <video id="cam-video" playsinline autoplay muted></video>
-            <div id="cam-error-box" class="cam-error" hidden></div>
-            <div id="rec-bar" class="cam-rec-bar" hidden>
-              <span class="rec-dot"></span>
-              <span class="rec-time">0:00</span>
-            </div>
-          </div>
-
-          <div class="cam-controls">
-            <span class="cam-counter" id="cam-counter">0 captured</span>
-            <div class="cam-buttons">
-              <button class="cam-shutter" id="shutter-btn" aria-label="Take photo"></button>
-              <button class="cam-rec-btn" id="rec-btn" aria-label="Record video"></button>
-            </div>
-          </div>
-
           <div class="gps-row" id="gps-row"></div>
+
+          <button class="open-camera-btn" id="open-cam-btn">
+            <span class="open-camera-icon">📷</span>
+            <span>Open Camera</span>
+          </button>
 
           <section class="thumb-section">
             <div class="section-row">
@@ -1172,7 +1251,10 @@
               <h3 class="section-h">Notes</h3>
             </div>
             <textarea id="notes-textarea" placeholder="Type a note…"></textarea>
+            <div class="attach-chip" id="attach-chip" hidden></div>
             <div class="notes-actions">
+              <button class="btn-secondary small" id="attach-btn">📎 Attach photo</button>
+              <button class="btn-secondary small" id="cancel-edit-btn" hidden>Cancel</button>
               <button class="btn-primary" id="save-note-btn">Save note</button>
             </div>
             <div id="notes-history" class="notes-history"></div>
@@ -1187,20 +1269,50 @@
 
     document.getElementById('back-btn').addEventListener('click', leaveProject);
     document.getElementById('drive-btn').addEventListener('click', openGallery);
-    document.getElementById('shutter-btn').addEventListener('click', onShutterClick);
-    document.getElementById('rec-btn').addEventListener('click', onRecordClick);
+    document.getElementById('open-cam-btn').addEventListener('click', () => openCamera({ mode: 'multi' }));
     document.getElementById('voice-btn').addEventListener('click', startVoiceNote);
     document.getElementById('save-note-btn').addEventListener('click', saveNote);
+    document.getElementById('cancel-edit-btn').addEventListener('click', cancelEditNote);
+    document.getElementById('attach-btn').addEventListener('click', openAttachmentChooser);
+  }
 
-    attachCamera();
+  function updateProjectTitleDOM() {
+    const region = document.getElementById('proj-title-region');
+    if (!region) return;
+    if (state.isRenaming) {
+      region.innerHTML = `
+        <form class="rename-form" id="rename-form">
+          <input type="text" id="rename-input" value="${escapeHtml(state.currentProjectName || '')}" autocomplete="off" autocapitalize="words" />
+          <button type="submit" class="rename-ok" aria-label="Save">${state.renameSaving ? '…' : '✓'}</button>
+          <button type="button" class="rename-cancel" id="rename-cancel" aria-label="Cancel">✕</button>
+        </form>
+      `;
+      const form = document.getElementById('rename-form');
+      const input = document.getElementById('rename-input');
+      form.addEventListener('submit', (ev) => { ev.preventDefault(); commitRename(); });
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') { ev.preventDefault(); cancelRename(); }
+      });
+      document.getElementById('rename-cancel').addEventListener('click', cancelRename);
+    } else {
+      region.innerHTML = `
+        <button class="proj-title-btn" id="proj-title-btn" aria-label="Rename project">
+          <span class="topbar-title">${escapeHtml(state.currentProjectName || '')}</span>
+          <span class="proj-title-pencil">✎</span>
+        </button>
+        <div id="cap-offline" class="cap-offline"></div>
+      `;
+      document.getElementById('proj-title-btn').addEventListener('click', startRename);
+      updateCaptureTopbar();
+    }
   }
 
   function updateCaptureDOM() {
-    updateCaptureTopbar();
-    updateCamCounterDOM();
-    updateCamErrorDOM();
+    updateProjectTitleDOM();
     updateThumbsDOM();
     updateNotesHistoryDOM();
+    updateNotesEditUIDOM();
+    updateAttachmentChipDOM();
     updateGpsChipDOM();
   }
   function updateCaptureTopbar() {
@@ -1211,24 +1323,6 @@
   function updateOnlineBadges() {
     if (renderedFlag === 'home') updateHomeTopbar();
     else if (renderedFlag === 'capture') updateCaptureTopbar();
-  }
-  function updateCamCounterDOM() {
-    const el = document.getElementById('cam-counter');
-    if (el) el.textContent = `${state.camCounter} captured`;
-  }
-  function updateCamErrorDOM() {
-    const box = document.getElementById('cam-error-box');
-    if (!box) return;
-    if (state.camError) {
-      box.hidden = false;
-      box.innerHTML = `${escapeHtml(state.camError)}<br><br><button class="btn-secondary small" id="cam-retry">Retry camera</button>`;
-      box.querySelector('#cam-retry')?.addEventListener('click', () => {
-        state.camError = null;
-        attachCamera();
-      });
-    } else {
-      box.hidden = true;
-    }
   }
 
   function updateGpsChipDOM() {
@@ -1322,21 +1416,148 @@
       root.innerHTML = '';
       return;
     }
-    root.innerHTML = state.notesEntries.map((n, idx) => `
-      <div class="note-item">
-        <div class="note-meta">
-          <span>${escapeHtml(n.ts)} · ${escapeHtml(n.tech)}</span>
-          <button class="note-trash" data-note-idx="${idx}" aria-label="Delete note" title="Delete note">🗑</button>
+    root.innerHTML = state.notesEntries.map((n, idx) => {
+      const parsed = parseNoteBody(n.body);
+      const editingCls = state.editingNoteIdx === idx ? ' editing' : '';
+      let attachHtml = '';
+      if (parsed.attachment) {
+        const t = findThumbByName(parsed.attachment);
+        if (t) {
+          attachHtml = `
+            <button class="note-attach" data-note-attach="${idx}" aria-label="Open attached photo">
+              ${t.src ? `<img src="${escapeHtml(t.src)}" alt=""/>` : ''}
+            </button>`;
+        } else {
+          attachHtml = `<div class="note-attach-missing muted small">📎 ${escapeHtml(parsed.attachment)}</div>`;
+        }
+      }
+      return `
+        <div class="note-item${editingCls}">
+          <div class="note-meta">
+            <span>${escapeHtml(n.ts)} · ${escapeHtml(n.tech)}</span>
+            <span class="note-actions">
+              <button class="note-edit" data-note-edit="${idx}" aria-label="Edit note" title="Edit note">✎</button>
+              <button class="note-trash" data-note-idx="${idx}" aria-label="Delete note" title="Delete note">🗑</button>
+            </span>
+          </div>
+          <div class="note-body">${escapeHtml(parsed.body)}</div>
+          ${attachHtml}
         </div>
-        <div class="note-body">${escapeHtml(n.body)}</div>
-      </div>
-    `).join('');
+      `;
+    }).join('');
     root.querySelectorAll('[data-note-idx]').forEach((b) => {
       b.addEventListener('click', (ev) => {
         ev.stopPropagation();
         deleteNoteAt(parseInt(b.dataset.noteIdx, 10));
       });
     });
+    root.querySelectorAll('[data-note-edit]').forEach((b) => {
+      b.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        startEditNote(parseInt(b.dataset.noteEdit, 10));
+      });
+    });
+    root.querySelectorAll('[data-note-attach]').forEach((b) => {
+      b.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const idx = parseInt(b.dataset.noteAttach, 10);
+        const parsed = parseNoteBody(state.notesEntries[idx].body);
+        const t = findThumbByName(parsed.attachment);
+        if (!t) return;
+        const tIdx = state.thumbs.indexOf(t);
+        if (tIdx >= 0) openViewerForThumb(tIdx);
+      });
+    });
+  }
+
+  function updateNotesEditUIDOM() {
+    const saveBtn = document.getElementById('save-note-btn');
+    const cancelBtn = document.getElementById('cancel-edit-btn');
+    const editing = state.editingNoteIdx != null;
+    if (saveBtn) saveBtn.textContent = editing ? 'Update note' : 'Save note';
+    if (cancelBtn) cancelBtn.hidden = !editing;
+  }
+
+  function updateAttachmentChipDOM() {
+    const chip = document.getElementById('attach-chip');
+    if (!chip) return;
+    if (!state.draftAttachment) {
+      chip.hidden = true;
+      chip.innerHTML = '';
+      return;
+    }
+    chip.hidden = false;
+    const t = findThumbByName(state.draftAttachment.name);
+    chip.innerHTML = `
+      <span class="attach-chip-thumb">
+        ${t && t.src ? `<img src="${escapeHtml(t.src)}" alt=""/>` : '📎'}
+      </span>
+      <span class="attach-chip-name">${escapeHtml(state.draftAttachment.name)}</span>
+      <button class="attach-chip-x" id="attach-chip-clear" aria-label="Remove attachment">✕</button>
+    `;
+    document.getElementById('attach-chip-clear')?.addEventListener('click', clearDraftAttachment);
+  }
+
+  // ---------- Project rename ----------
+  function startRename() {
+    state.isRenaming = true;
+    updateProjectTitleDOM();
+    setTimeout(() => {
+      const input = document.getElementById('rename-input');
+      input?.focus();
+      input?.select();
+    }, 50);
+  }
+  function cancelRename() {
+    state.isRenaming = false;
+    updateProjectTitleDOM();
+  }
+  async function commitRename() {
+    if (state.renameSaving) return;
+    const input = document.getElementById('rename-input');
+    if (!input) return;
+    const raw = input.value;
+    const sanitized = window.Drive.sanitizeFolderName(raw);
+    if (!sanitized || sanitized === state.currentProjectName) {
+      cancelRename();
+      return;
+    }
+
+    // Conflict check — warn if another folder under Site Visits already has
+    // this name (case-insensitive match).
+    try {
+      const existing = await window.Drive.listProjectFolders({ pageSize: 200 });
+      const conflict = existing.find(
+        (p) => p.id !== state.currentProjectId &&
+               p.name.toLowerCase() === sanitized.toLowerCase()
+      );
+      if (conflict) {
+        const ok = confirm(
+          `A project named "${conflict.name}" already exists. Continue and create a duplicate name?`
+        );
+        if (!ok) return;
+      }
+    } catch (err) {
+      console.warn('[rename] could not list folders for conflict check:', err);
+    }
+
+    state.renameSaving = true;
+    updateProjectTitleDOM();
+    try {
+      const updated = await window.Drive.renameFile(state.currentProjectId, sanitized);
+      state.currentProjectName = updated.name || sanitized;
+      // Update local projects cache so the home list reflects immediately.
+      const cached = state.projects.find((p) => p.id === state.currentProjectId);
+      if (cached) cached.name = state.currentProjectName;
+      state.isRenaming = false;
+      toast('Project renamed', 'success');
+      appendVisitLog(state.currentProjectId, `renamed project to "${state.currentProjectName}"`).catch(() => {});
+    } catch (err) {
+      toast(`Rename failed: ${err.message}`, 'error', 6000);
+    } finally {
+      state.renameSaving = false;
+      updateProjectTitleDOM();
+    }
   }
 
   // ---------- GALLERY ----------
