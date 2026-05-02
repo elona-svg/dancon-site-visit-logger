@@ -103,11 +103,11 @@
         }
       });
       state.user = window.Auth.getUser();
-      if (state.user && !window.Auth.isSignedIn()) {
-        try { await window.Auth.getAccessToken(); }
-        catch (e) { /* user must click Sign in */ }
-      }
-      state.view = state.user && window.Auth.isSignedIn() ? 'home' : 'login';
+      // Trust the cached profile as proof of past sign-in. Token refresh
+      // is lazy — the first Drive call that hits a 401 will trigger it.
+      // Only when that refresh fails do we route back to the login screen
+      // (auth.js clears the user via notifyChange in that case).
+      state.view = state.user ? 'home' : 'login';
       state.booting = false;
       scheduleRender();
       if (state.view === 'home') {

@@ -1,17 +1,32 @@
 // Google Identity Services OAuth2 token client.
 //
-// Persistence: GIS implicit-flow access tokens last ~1 hour. We cache the
-// access token and its expiry in IndexedDB so a page refresh within that
-// hour stays signed in. After expiry, requestAccessToken({prompt:''})
-// silently refreshes from the user's Google session. The user only sees
-// the Sign-in button if a) they tap Sign out, or b) silent refresh is
-// blocked by Safari ITP / no Google session.
+// Persistence model
+// -----------------
+// GIS implicit-flow access tokens last ~1 hour. We cache the access token,
+// its expiry, and the user profile in BOTH IndexedDB and localStorage so a
+// torn-down storage (rare iOS Safari ITP case) doesn't lose the session.
+//
+// "Signed in" rule
+// ----------------
+// `isSignedIn()` returns true as long as we have a cached `user` profile.
+// We DO NOT gate that on the access token's expiry — the token is just
+// short-lived plumbing for Drive calls, not a proxy for "is the tech
+// signed in". This is what makes the app stay logged in indefinitely:
+//   - Boot: cached user → home screen, no prompt.
+//   - First Drive call: uses cached token. If the token is expired Drive
+//     returns 401, authedFetch calls getAccessToken(true), GIS attempts
+//     a silent refresh (no UI on most browsers; popup if Safari ITP
+//     blocked the silent path).
+//   - Refresh succeeds → we keep going, totally invisible.
+//   - Refresh fails (Google session truly gone) → we clear the cached
+//     user so the app routes back to the Sign-in screen.
 window.Auth = (function () {
   let tokenClient = null;
   let accessToken = null;
   let tokenExpiresAt = 0;
-  let user = null; // { email, name, firstName, picture }
+  let user = null;
   let onChangeListeners = [];
+  let pendingRefresh = null; // de-dupes concurrent refresh attempts
 
   function notifyChange() {
     onChangeListeners.forEach((fn) => {
@@ -35,6 +50,47 @@ window.Auth = (function () {
     });
   }
 
+  // ---- Persistence helpers ---------------------------------------------
+  // We write to IDB and localStorage in parallel. Either store can be used
+  // to restore on launch — whichever responds first wins.
+  function lsGet(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  }
+  function lsSet(key, val) {
+    try { localStorage.setItem(key, val); } catch (e) { /* private mode etc */ }
+  }
+  function lsDelete(key) {
+    try { localStorage.removeItem(key); } catch (e) { /* ignore */ }
+  }
+
+  async function persistToken() {
+    try {
+      if (accessToken) {
+        await window.DB.kvSet('auth.token', accessToken);
+        await window.DB.kvSet('auth.expiresAt', tokenExpiresAt);
+        lsSet('auth.token', accessToken);
+        lsSet('auth.expiresAt', String(tokenExpiresAt));
+      } else {
+        await window.DB.kvDelete('auth.token');
+        await window.DB.kvDelete('auth.expiresAt');
+        lsDelete('auth.token');
+        lsDelete('auth.expiresAt');
+      }
+    } catch (e) { /* best effort */ }
+  }
+
+  async function persistUser() {
+    try {
+      if (user) {
+        await window.DB.kvSet('user', user);
+        lsSet('user', JSON.stringify(user));
+      } else {
+        await window.DB.kvDelete('user');
+        lsDelete('user');
+      }
+    } catch (e) { /* best effort */ }
+  }
+
   async function init() {
     await gisReady();
 
@@ -50,39 +106,39 @@ window.Auth = (function () {
       callback: () => { /* set per-request below */ }
     });
 
-    // Restore cached identity + token.
+    // Restore from IDB first; fall back to localStorage if IDB is empty
+    // for any of the values (e.g. iOS standalone PWA wiping IDB while
+    // keeping LS, or vice versa).
     try {
-      const cachedUser = await window.DB.kvGet('user');
+      let cachedUser = await window.DB.kvGet('user');
+      if (!cachedUser) {
+        const raw = lsGet('user');
+        if (raw) try { cachedUser = JSON.parse(raw); } catch (e) { /* ignore */ }
+      }
       if (cachedUser) user = cachedUser;
-      const cachedToken = await window.DB.kvGet('auth.token');
-      const cachedExp = await window.DB.kvGet('auth.expiresAt');
-      if (cachedToken && cachedExp && Date.now() < Number(cachedExp)) {
+
+      let cachedToken = await window.DB.kvGet('auth.token');
+      let cachedExp = await window.DB.kvGet('auth.expiresAt');
+      if (!cachedToken) {
+        cachedToken = lsGet('auth.token');
+        cachedExp = lsGet('auth.expiresAt');
+      }
+      if (cachedToken) {
         accessToken = cachedToken;
-        tokenExpiresAt = Number(cachedExp);
+        tokenExpiresAt = Number(cachedExp || 0);
       }
-    } catch (e) { /* ignore — fresh start */ }
+      console.log('[auth] init restored user?', !!user, 'token?', !!accessToken,
+        'expiresIn(s)=', accessToken ? Math.round((tokenExpiresAt - Date.now()) / 1000) : 'n/a');
+    } catch (e) {
+      console.warn('[auth] init restore failed:', e);
+    }
   }
 
-  async function persistToken() {
-    try {
-      if (accessToken) {
-        await window.DB.kvSet('auth.token', accessToken);
-        await window.DB.kvSet('auth.expiresAt', tokenExpiresAt);
-      } else {
-        await window.DB.kvDelete('auth.token');
-        await window.DB.kvDelete('auth.expiresAt');
-      }
-    } catch (e) { /* best effort */ }
-  }
-
+  // ---- Token request -----------------------------------------------------
   function requestToken() {
     return new Promise((resolve, reject) => {
       if (!tokenClient) return reject(new Error('Auth not initialized'));
-
-      // Fail-safe: GIS sometimes never invokes the callback if a popup is
-      // blocked or the iframe is sandboxed. After 30s, give up.
       const safety = setTimeout(() => reject(new Error('Token request timed out')), 30000);
-
       tokenClient.callback = async (resp) => {
         clearTimeout(safety);
         if (resp.error) return reject(new Error(resp.error_description || resp.error));
@@ -101,7 +157,6 @@ window.Auth = (function () {
           reject(err);
         }
       };
-
       tokenClient.requestAccessToken({ prompt: '' });
     });
   }
@@ -123,18 +178,39 @@ window.Auth = (function () {
       firstName: (info.given_name || (info.name || '').split(' ')[0] || 'Tech').trim(),
       picture: info.picture || ''
     };
-    await window.DB.kvSet('user', user);
+    await persistUser();
   }
 
-  // Returns a valid access token, refreshing silently if needed. Pass
-  // forceRefresh=true after a 401 to bypass the in-memory timer.
+  // Returns a valid access token. With forceRefresh=false we trust whatever
+  // is cached if it's not nominally expired. With forceRefresh=true we
+  // discard the cache and ask GIS for a new one (silent if possible).
+  // Concurrent callers share the same in-flight refresh.
   async function getAccessToken(forceRefresh = false) {
     if (!forceRefresh && accessToken && Date.now() < tokenExpiresAt) return accessToken;
-    accessToken = null;
-    tokenExpiresAt = 0;
-    await persistToken();
-    const { accessToken: t } = await requestToken();
-    return t;
+    if (pendingRefresh) return pendingRefresh;
+
+    pendingRefresh = (async () => {
+      accessToken = null;
+      tokenExpiresAt = 0;
+      await persistToken();
+      try {
+        const { accessToken: t } = await requestToken();
+        return t;
+      } catch (err) {
+        // We had a session and the refresh failed. Treat as fully signed
+        // out so the app routes back to the Sign-in screen.
+        if (user) {
+          console.warn('[auth] silent refresh failed — clearing session:', err.message);
+          user = null;
+          await persistUser();
+          notifyChange();
+        }
+        throw err;
+      } finally {
+        pendingRefresh = null;
+      }
+    })();
+    return pendingRefresh;
   }
 
   async function signIn() {
@@ -149,15 +225,17 @@ window.Auth = (function () {
     tokenExpiresAt = 0;
     user = null;
     try {
-      await window.DB.kvDelete('user');
-      await window.DB.kvDelete('auth.token');
-      await window.DB.kvDelete('auth.expiresAt');
+      await persistToken();
+      await persistUser();
     } catch (e) { /* ignore */ }
     notifyChange();
   }
 
   function getUser() { return user; }
-  function isSignedIn() { return !!accessToken && Date.now() < tokenExpiresAt; }
+
+  // We're "signed in" as long as a user profile is cached. The token may
+  // be nominally expired — getAccessToken handles refresh on demand.
+  function isSignedIn() { return !!user; }
 
   return { init, signIn, signOut, getAccessToken, getUser, isSignedIn, onChange };
 })();
