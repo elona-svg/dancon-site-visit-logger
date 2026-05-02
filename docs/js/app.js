@@ -150,15 +150,18 @@
     toast('Offline — captures will queue', 'warn');
     updateOnlineBadges();
   });
-  // If the camera or voice overlay is open and the page is backgrounded,
-  // close it so iOS releases the camera/mic indicator.
+  // If the camera overlay is open and the page is backgrounded, close it
+  // and force-release the cached stream so iOS turns off the camera/mic
+  // indicator immediately rather than waiting for the cache TTL.
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
       if (window.Camera.isOpen()) window.Camera.close();
+      window.Camera.releaseStream();
     }
   });
   window.addEventListener('pagehide', () => {
     if (window.Camera.isOpen()) window.Camera.close();
+    window.Camera.releaseStream();
   });
 
   // ---------- Auth handlers ----------
@@ -177,6 +180,7 @@
   }
   async function onSignOutClick() {
     if (window.Camera.isOpen()) window.Camera.close();
+    window.Camera.releaseStream();
     await window.Auth.signOut();
     state.user = null;
     state.currentProjectId = null;
@@ -244,6 +248,7 @@
 
   function leaveProject() {
     if (window.Camera.isOpen()) window.Camera.close();
+    window.Camera.releaseStream();
     state.currentProjectId = null;
     state.currentProjectName = null;
     state.thumbs.forEach(revokeThumbBlob);
@@ -664,73 +669,73 @@
   }
 
   // -------- Note attachments --------
+  // Single combined sheet: a primary "Take new photo" CTA at the top and
+  // a grid of project photos below. Empty gallery shows a friendly empty
+  // state instead of toasting and dead-ending.
   function openAttachmentChooser() {
+    console.log('[attach] open chooser; project=', state.currentProjectId);
     if (!ensureProject()) return;
+    const photos = state.thumbs.filter((t) => t.type === 'photo');
+    console.log('[attach] gallery photo count:', photos.length);
+
     const root = document.getElementById('overlay-root');
     root.innerHTML = `
-      <div class="modal-backdrop">
+      <div class="modal-backdrop attach-backdrop">
         <div class="attach-sheet">
           <div class="modal-header">
-            <h3>Attach photo</h3>
+            <h3>Attach photo to note</h3>
             <button class="modal-x" id="attach-x" aria-label="Close">✕</button>
           </div>
-          <button class="attach-option" id="attach-take">📷 Take new photo</button>
-          <button class="attach-option" id="attach-pick">🖼️ Choose from gallery</button>
+
+          <button class="attach-action primary" id="attach-take" type="button">
+            <span class="attach-action-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 8.5C3 7.67 3.67 7 4.5 7H7l1.4-1.87A1.5 1.5 0 0 1 9.6 4.5h4.8c.47 0 .91.22 1.2.6L17 7h2.5c.83 0 1.5.67 1.5 1.5V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8.5z"/>
+                <circle cx="12" cy="13" r="4"/>
+              </svg>
+            </span>
+            <span class="attach-action-text">
+              <strong>Take new photo</strong>
+              <small>Opens the in-app camera</small>
+            </span>
+          </button>
+
+          <div class="attach-divider"><span>Or pick from this project</span></div>
+
+          ${photos.length === 0
+            ? '<div class="attach-empty">No photos in this project yet. Use Take new photo above.</div>'
+            : `<div class="attach-grid">${photos.map((t, idx) => `
+                <button class="attach-thumb" data-pick-idx="${idx}" type="button">
+                  ${t.src ? `<img src="${escapeHtml(t.src)}" alt=""/>` : ''}
+                </button>
+              `).join('')}</div>`
+          }
         </div>
       </div>
     `;
+
     document.getElementById('attach-x').addEventListener('click', closeAttachmentChooser);
     document.getElementById('attach-take').addEventListener('click', () => {
+      console.log('[attach] take new tapped');
       closeAttachmentChooser();
       openCameraForAttachment();
-    });
-    document.getElementById('attach-pick').addEventListener('click', () => {
-      closeAttachmentChooser();
-      openAttachmentPicker();
-    });
-  }
-  function closeAttachmentChooser() {
-    const root = document.getElementById('overlay-root');
-    if (root) root.innerHTML = '';
-  }
-
-  function openAttachmentPicker() {
-    const photos = state.thumbs.filter((t) => t.type === 'photo');
-    const root = document.getElementById('overlay-root');
-    if (photos.length === 0) {
-      toast('No photos in this project yet', 'warn');
-      return;
-    }
-    root.innerHTML = `
-      <div class="modal-backdrop">
-        <div class="attach-picker-sheet">
-          <div class="modal-header">
-            <h3>Pick a photo to attach</h3>
-            <button class="modal-x" id="pick-x" aria-label="Close">✕</button>
-          </div>
-          <div class="attach-grid">
-            ${photos.map((t, idx) => `
-              <button class="attach-thumb" data-pick-idx="${idx}">
-                ${t.src ? `<img src="${escapeHtml(t.src)}" alt=""/>` : ''}
-              </button>
-            `).join('')}
-          </div>
-        </div>
-      </div>
-    `;
-    document.getElementById('pick-x').addEventListener('click', () => {
-      root.innerHTML = '';
     });
     root.querySelectorAll('[data-pick-idx]').forEach((b) => {
       b.addEventListener('click', () => {
         const idx = parseInt(b.dataset.pickIdx, 10);
         const t = photos[idx];
+        if (!t) return;
+        console.log('[attach] picked from gallery:', t.name);
         state.draftAttachment = { name: t.name, fileId: t.fileId || null };
-        root.innerHTML = '';
+        closeAttachmentChooser();
         updateAttachmentChipDOM();
         toast('Photo attached to note', 'success', 1500);
       });
     });
+  }
+  function closeAttachmentChooser() {
+    const root = document.getElementById('overlay-root');
+    if (root) root.innerHTML = '';
   }
 
   function clearDraftAttachment() {
@@ -1387,7 +1392,12 @@
             <textarea id="notes-textarea" placeholder="Type a note…"></textarea>
             <div class="attach-chip" id="attach-chip" hidden></div>
             <div class="notes-actions">
-              <button class="btn-secondary small" id="attach-btn">📎 Attach photo</button>
+              <button class="btn-attach" id="attach-btn" type="button">
+                <svg class="attach-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                </svg>
+                <span>Attach photo</span>
+              </button>
               <button class="btn-secondary small" id="cancel-edit-btn" hidden>Cancel</button>
               <button class="btn-primary" id="save-note-btn">Save note</button>
             </div>
