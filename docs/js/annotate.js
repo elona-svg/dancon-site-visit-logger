@@ -63,7 +63,9 @@ window.Annotate = (function () {
                 ${t === 'pen' ? '✎' : t === 'arrow' ? '→' : '○'}
               </button>
             `).join('')}
-            <button class="tool-btn" id="ann-undo" aria-label="Undo">↶</button>
+            <span class="tool-divider"></span>
+            <button class="tool-btn" id="ann-undo" aria-label="Undo last stroke" title="Undo">↶</button>
+            <button class="tool-btn" id="ann-clear" aria-label="Clear all" title="Clear all">⌫</button>
           </div>
           <button class="btn-primary" id="ann-save">Save</button>
         </div>
@@ -92,6 +94,7 @@ window.Annotate = (function () {
     document.getElementById('ann-close').addEventListener('click', close);
     document.getElementById('ann-save').addEventListener('click', save);
     document.getElementById('ann-undo').addEventListener('click', undo);
+    document.getElementById('ann-clear').addEventListener('click', clearAll);
 
     root().querySelectorAll('[data-tool]').forEach((b) => {
       b.addEventListener('click', () => { tool = b.dataset.tool; render(); });
@@ -214,6 +217,13 @@ window.Annotate = (function () {
 
   function undo() {
     strokes.pop();
+    redraw();
+  }
+
+  function clearAll() {
+    if (strokes.length === 0) return;
+    if (!confirm('Clear all annotations? This cannot be undone.')) return;
+    strokes = [];
     redraw();
   }
 

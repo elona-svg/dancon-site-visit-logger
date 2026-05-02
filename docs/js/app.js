@@ -1,13 +1,15 @@
-// Top-level app: state, screens, upload queue runner, glue between modules.
+// Top-level app: state, screens, queue runner, glue between modules.
 //
-// Defensive boot: a top-level try-catch around module wiring + a hard
-// timeout in boot() so we never get stuck on the white "Loading…" screen
-// even if Google Identity Services fails to load or IndexedDB hangs.
+// Render strategy: render() only replaces the screen shell on view change.
+// Same-view state updates run targeted DOM mutations instead of clobbering
+// the whole tree — this is what keeps the home input from losing focus on
+// every keystroke (and what keeps the inline <video> mounted across notes
+// saves, online/offline events, and token refreshes).
 (function () {
   let UI;
   try {
     UI = window.UI;
-    if (!UI || !window.DB || !window.Auth || !window.Drive || !window.Camera || !window.AudioNote || !window.Notes || !window.Annotate) {
+    if (!UI || !window.DB || !window.Auth || !window.Drive || !window.Camera || !window.AudioNote || !window.Annotate || !window.Viewer) {
       throw new Error('A required module failed to load. Reload the page.');
     }
   } catch (err) {
@@ -20,44 +22,49 @@
 
   const { escapeHtml, fmtTimestampForFilename, fmtDateTime, fmtBytes, fmtRelative, toast } = UI;
 
+  const MAX_CONCURRENT_UPLOADS = 3;
+
   const state = {
     user: null,
     isOnline: navigator.onLine,
     booting: true,
     initError: null,
 
-    // Project context
     currentProjectId: null,
     currentProjectName: null,
 
-    // Home / projects list
     projects: [],
     projectsLoading: false,
     projectFilter: '',
 
-    // Project (capture) screen
-    cam: null,                  // Camera controller while attached
+    cam: null,
     camError: null,
+    camAttaching: false,
     camCounter: 0,
     camRecording: false,
     recStartTs: 0,
     recTimerHandle: null,
 
-    thumbs: [],                 // unified list of photos this project (queued + uploaded)
+    thumbs: [],
     thumbsLoading: false,
+
     notesEntries: [],
     notesFileId: null,
     notesLoading: false,
 
-    // Drive (gallery) view
+    gps: null,            // { lat, lng, link } once known for current folder
+    gpsLoading: false,
+
     galleryFiles: [],
     galleryLoading: false,
 
-    view: 'login'               // 'login' | 'home' | 'capture' | 'gallery'
+    view: 'login'
   };
 
-  let queueRunnerActive = false;
+  const inflight = new Map();
+  let queuePumpScheduled = false;
   let _renderHandle = null;
+  let renderedFlag = '';
 
   function scheduleRender() {
     if (_renderHandle) return;
@@ -67,7 +74,7 @@
     });
   }
 
-  // ---------- Initialization ----------
+  // ---------- Boot ----------
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);
   } else {
@@ -75,12 +82,9 @@
   }
 
   async function boot() {
-    // Hard floor: if boot hasn't progressed in 8s, force the login screen so
-    // the user is never stuck on white. Real auth happens on click anyway.
     const safety = setTimeout(() => {
       if (state.booting) {
         state.booting = false;
-        if (!state.initError) state.initError = null;
         if (!state.user) state.view = 'login';
         scheduleRender();
         console.warn('Boot safety timeout fired');
@@ -91,8 +95,16 @@
       await window.DB.open();
       await window.Auth.init();
       window.Auth.onChange(({ user }) => {
+        const wasUser = !!state.user;
         state.user = user;
-        scheduleRender();
+        if (!user && state.view !== 'login') {
+          state.view = 'login';
+          scheduleRender();
+        } else if (state.view === 'home') {
+          updateHomeTopbar();
+        } else if (state.view === 'capture') {
+          updateCaptureTopbar();
+        }
       });
       state.user = window.Auth.getUser();
       if (state.user && !window.Auth.isSignedIn()) {
@@ -102,8 +114,19 @@
       state.view = state.user && window.Auth.isSignedIn() ? 'home' : 'login';
       state.booting = false;
       scheduleRender();
-      if (state.view === 'home') loadProjects(); // background
-      runQueue();
+      if (state.view === 'home') loadProjects();
+      // Reset items left in 'uploading' from a previous run (e.g. a tab
+      // close mid-upload). Without this they'd be invisible to pumpQueue
+      // which only picks up 'pending'/'error' rows.
+      try {
+        const all = await window.DB.queueAll();
+        for (const item of all) {
+          if (item.status === 'uploading') {
+            await window.DB.queueUpdate(item.id, { status: 'pending' });
+          }
+        }
+      } catch (e) { /* ignore */ }
+      pumpQueue();
     } catch (err) {
       console.error('Boot failed:', err);
       state.booting = false;
@@ -114,19 +137,32 @@
     }
   }
 
+  // Network / lifecycle
   window.addEventListener('online', () => {
     state.isOnline = true;
     toast('Back online — resuming uploads', 'info');
-    runQueue();
-    scheduleRender();
+    pumpQueue();
+    updateOnlineBadges();
   });
   window.addEventListener('offline', () => {
     state.isOnline = false;
     toast('Offline — captures will queue', 'warn');
-    scheduleRender();
+    updateOnlineBadges();
+  });
+  // Stop the camera the moment the page goes background — iOS keeps the
+  // green/orange privacy indicator on otherwise.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && state.view === 'capture') {
+      detachCamera({ silent: true });
+    } else if (document.visibilityState === 'visible' && state.view === 'capture' && !state.cam) {
+      attachCamera();
+    }
+  });
+  window.addEventListener('pagehide', () => {
+    detachCamera({ silent: true });
   });
 
-  // ---------- Auth ----------
+  // ---------- Auth handlers ----------
   async function onSignInClick() {
     try {
       await window.Auth.signIn();
@@ -134,13 +170,13 @@
       state.view = 'home';
       scheduleRender();
       loadProjects();
-      runQueue();
+      pumpQueue();
     } catch (err) {
       toast(err.message || 'Sign in failed', 'error', 6000);
     }
   }
   async function onSignOutClick() {
-    detachCamera();
+    detachCamera({ silent: true });
     await window.Auth.signOut();
     state.user = null;
     state.currentProjectId = null;
@@ -150,7 +186,7 @@
     scheduleRender();
   }
 
-  // ---------- Projects (home) ----------
+  // ---------- Projects ----------
   async function loadProjects() {
     state.projectsLoading = true;
     updateRecentList();
@@ -187,39 +223,67 @@
     state.notesEntries = [];
     state.notesFileId = null;
     state.notesLoading = true;
+    state.gps = null;
+    state.gpsLoading = true;
     state.camCounter = 0;
+    state.projectFilter = '';
     scheduleRender();
     if (created) toast(`Created "${name}"`, 'info');
-    // Restore notes-fileId cache.
+
     try {
       const cached = await window.DB.kvGet(`notesFileId:${id}`);
       if (cached) state.notesFileId = cached;
     } catch { /* ignore */ }
-    // Kick off background loads.
+
     refreshProjectMedia();
     refreshProjectNotes();
-    maybeCaptureGPS(id, name);
+    loadOrCaptureGPS(id, name);
   }
 
   function leaveProject() {
-    detachCamera();
+    detachCamera({ silent: true });
     state.currentProjectId = null;
     state.currentProjectName = null;
+    state.thumbs.forEach(revokeThumbBlob);
     state.thumbs = [];
     state.notesEntries = [];
+    state.gps = null;
     state.view = 'home';
     scheduleRender();
     loadProjects();
   }
 
-  // ---------- GPS (once per folder) ----------
-  async function maybeCaptureGPS(folderId, folderName) {
-    if (!('geolocation' in navigator)) return;
-    try {
-      const existing = await window.Drive.findFileInFolder(folderId, 'gps.txt');
-      if (existing) return;
-    } catch (err) {
-      console.warn('GPS check failed:', err.message);
+  // ---------- GPS ----------
+  async function loadOrCaptureGPS(folderId) {
+    state.gps = null;
+    state.gpsLoading = true;
+    updateGpsChipDOM();
+
+    let existing = null;
+    try { existing = await window.Drive.findFileInFolder(folderId, 'gps.txt'); }
+    catch (err) { console.warn('GPS check failed:', err.message); }
+
+    if (existing) {
+      try {
+        const text = await window.Drive.downloadFileText(existing.id);
+        const lat = (text.match(/Latitude:\s*([-\d.]+)/) || [])[1];
+        const lng = (text.match(/Longitude:\s*([-\d.]+)/) || [])[1];
+        if (lat && lng) {
+          state.gps = {
+            lat: parseFloat(lat),
+            lng: parseFloat(lng),
+            link: `https://maps.google.com/?q=${lat},${lng}`
+          };
+        }
+      } catch (e) { /* ignore */ }
+      state.gpsLoading = false;
+      updateGpsChipDOM();
+      return;
+    }
+
+    if (!('geolocation' in navigator)) {
+      state.gpsLoading = false;
+      updateGpsChipDOM();
       return;
     }
     navigator.geolocation.getCurrentPosition(
@@ -235,19 +299,27 @@
           `Maps link: ${link}\n`;
         try {
           const recheck = await window.Drive.findFileInFolder(folderId, 'gps.txt');
-          if (recheck) return;
-          await window.Drive.uploadMultipart({
-            folderId,
-            fileName: 'gps.txt',
-            mimeType: 'text/plain',
-            blob: new Blob([text], { type: 'text/plain' })
-          });
-          await appendVisitLog(folderId, 'captured GPS');
+          if (!recheck) {
+            await window.Drive.uploadMultipart({
+              folderId,
+              fileName: 'gps.txt',
+              mimeType: 'text/plain',
+              blob: new Blob([text], { type: 'text/plain' })
+            });
+            await appendVisitLog(folderId, 'captured GPS');
+          }
         } catch (err) {
           console.warn('GPS save failed:', err.message);
         }
+        state.gps = { lat: latitude, lng: longitude, link };
+        state.gpsLoading = false;
+        updateGpsChipDOM();
       },
-      (err) => { console.warn('GPS denied:', err.message); },
+      (err) => {
+        console.warn('GPS denied:', err.message);
+        state.gpsLoading = false;
+        updateGpsChipDOM();
+      },
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
     );
   }
@@ -273,7 +345,6 @@
   }
 
   function pad2(n) { return String(n).padStart(2, '0'); }
-
   async function nextFileName(folderId, ext) {
     const today = new Date();
     const dayKey = `${today.getFullYear()}-${pad2(today.getMonth() + 1)}-${pad2(today.getDate())}`;
@@ -281,7 +352,6 @@
     const current = (await window.DB.kvGet(counterKey)) || 0;
     const next = current + 1;
     await window.DB.kvSet(counterKey, next);
-
     const stamp = fmtTimestampForFilename(today);
     const first = (state.user?.firstName || 'Tech').replace(/[^A-Za-z0-9]/g, '');
     const seq = String(next).padStart(3, '0');
@@ -301,40 +371,42 @@
     return mime.split('/')[1]?.split(';')[0] || 'bin';
   }
 
-  // ---------- Camera (inline) ----------
+  // ---------- Camera ----------
   async function attachCamera() {
     const videoEl = document.getElementById('cam-video');
     if (!videoEl) return;
-    if (state.cam) return;
+    if (state.cam || state.camAttaching) return;
+    state.camAttaching = true;
     state.camError = null;
+    updateCamErrorDOM();
     try {
       state.cam = await window.Camera.attach(videoEl, { withAudio: true });
-      state.camError = null;
-      updateCamErrorDOM();
     } catch (err) {
       console.warn('Camera attach failed:', err);
       state.camError = err.message || String(err);
       state.cam = null;
+    } finally {
+      state.camAttaching = false;
       updateCamErrorDOM();
     }
   }
 
-  function detachCamera() {
+  function detachCamera({ silent = false } = {}) {
     if (state.cam) {
       try { state.cam.stop(); } catch (e) { /* ignore */ }
       state.cam = null;
     }
-    if (state.recTimerHandle) {
-      clearInterval(state.recTimerHandle);
-      state.recTimerHandle = null;
-    }
+    if (state.recTimerHandle) { clearInterval(state.recTimerHandle); state.recTimerHandle = null; }
     state.camRecording = false;
-    state.camCounter = 0;
+    if (!silent) state.camCounter = 0;
+    const recBar = document.getElementById('rec-bar');
+    if (recBar) recBar.hidden = true;
+    document.getElementById('rec-btn')?.classList.remove('recording');
   }
 
   async function onShutterClick() {
     if (!state.cam) {
-      attachCamera(); // user gesture — retry
+      attachCamera();
       return;
     }
     if (state.camRecording) return;
@@ -351,12 +423,8 @@
   }
 
   async function onRecordClick() {
-    if (!state.cam) {
-      attachCamera();
-      return;
-    }
+    if (!state.cam) { attachCamera(); return; }
     if (state.camRecording) {
-      // stop
       const btn = document.getElementById('rec-btn');
       btn?.classList.remove('recording');
       const recBar = document.getElementById('rec-bar');
@@ -373,7 +441,6 @@
       }
       return;
     }
-    // start
     try {
       state.cam.startVideo();
       state.camRecording = true;
@@ -410,9 +477,7 @@
     if (!ensureProject()) return;
     window.AudioNote.open({
       onCapture: (blob, mime) => enqueueCapture(blob, mime, 'audio'),
-      // No re-render on close — the modal overlays the project screen, so
-      // the underlying live <video> must stay mounted with its srcObject.
-      onClose: () => { /* no-op */ }
+      onClose: () => { /* overlay only — no re-render */ }
     });
   }
 
@@ -425,6 +490,8 @@
     const stamp = fmtDateTime();
     const tech = state.user?.name || 'unknown';
     const block = `\n--- ${stamp} — ${tech} ---\n${text}\n`;
+    const saveBtn = document.getElementById('save-note-btn');
+    if (saveBtn) saveBtn.disabled = true;
     try {
       const result = await window.Drive.appendToTextFile({
         folderId,
@@ -435,12 +502,15 @@
       state.notesFileId = result.id;
       await window.DB.kvSet(`notesFileId:${folderId}`, result.id);
       ta.value = '';
+      // Optimistic: prepend the new note to history before refresh fires.
+      state.notesEntries.unshift({ ts: stamp, tech, body: text });
+      updateNotesHistoryDOM();
       toast('Note saved', 'success');
-      await appendVisitLog(folderId, 'added text note');
-      // Refresh notes inline.
-      refreshProjectNotes();
+      appendVisitLog(folderId, 'added text note').catch(() => {});
     } catch (err) {
       toast(`Note save failed: ${err.message}`, 'error', 6000);
+    } finally {
+      if (saveBtn) saveBtn.disabled = false;
     }
   }
 
@@ -473,80 +543,98 @@
       attempts: 0
     });
 
-    if (kind === 'photo') {
-      const previewUrl = URL.createObjectURL(blob);
-      state.thumbs.unshift({
-        type: 'photo',
-        src: previewUrl,
-        name: fileName,
-        status: 'queued',
-        queueId: item.id,
-        objectUrl: previewUrl
-      });
-      updateThumbsDOM();
-    }
-    runQueue();
+    // Always add a thumb so the tech can see (and tap) the asset right away.
+    const previewUrl = (kind === 'photo' || kind === 'video' || kind === 'audio')
+      ? URL.createObjectURL(blob)
+      : null;
+    const thumb = {
+      type: kind,
+      src: previewUrl,
+      objectUrl: previewUrl,
+      name: fileName,
+      mime,
+      size: blob.size,
+      status: 'queued',
+      progress: 0,
+      queueId: item.id
+    };
+    state.thumbs.unshift(thumb);
+    updateThumbsDOM();
+    pumpQueue();
   }
 
-  async function runQueue() {
-    if (queueRunnerActive) return;
-    if (!state.isOnline) return;
-    if (!window.Auth.isSignedIn()) {
-      try { await window.Auth.getAccessToken(); }
-      catch (e) { return; }
-    }
+  function patchThumbByQueueId(queueId, patch) {
+    const t = state.thumbs.find((x) => x.queueId === queueId);
+    if (!t) return;
+    Object.assign(t, patch);
+    updateThumbsDOM();
+  }
 
-    queueRunnerActive = true;
-    try {
-      while (true) {
-        const pending = await window.DB.queuePending();
-        if (pending.length === 0) break;
-        pending.sort((a, b) => (a.attempts - b.attempts) || (a.createdAt - b.createdAt));
-        const item = pending[0];
-
-        await window.DB.queueUpdate(item.id, { status: 'uploading' });
-
-        try {
-          const result = await window.Drive.uploadFile({
-            folderId: item.projectId,
-            fileName: item.fileName,
-            mimeType: item.mimeType,
-            blob: item.blob
-          });
-          await appendVisitLog(item.projectId,
-            `uploaded ${item.kind || 'file'}: ${item.fileName} (${fmtBytes(item.blob.size)})`);
-          await window.DB.queueUpdate(item.id, { status: 'success' });
-          await window.DB.queueDelete(item.id);
-
-          // Patch thumb to success state.
-          if (state.currentProjectId === item.projectId) {
-            const t = state.thumbs.find((x) => x.queueId === item.id);
-            if (t) {
-              t.status = 'success';
-              t.fileId = result?.id || null;
-              updateThumbsDOM();
-            }
-          }
-        } catch (err) {
-          console.error('Upload failed', err);
-          const attempts = (item.attempts || 0) + 1;
-          await window.DB.queueUpdate(item.id, {
-            status: 'error',
-            attempts,
-            lastError: err.message || String(err)
-          });
-          if (state.currentProjectId === item.projectId) {
-            const t = state.thumbs.find((x) => x.queueId === item.id);
-            if (t) { t.status = 'failed'; updateThumbsDOM(); }
-          }
-          const delay = Math.min(60000, 2000 * Math.pow(2, attempts - 1));
-          await new Promise((r) => setTimeout(r, delay));
-          if (attempts >= 6) break;
-        }
+  async function pumpQueue() {
+    if (queuePumpScheduled) return;
+    queuePumpScheduled = true;
+    queueMicrotask(async () => {
+      queuePumpScheduled = false;
+      if (!state.isOnline) return;
+      if (!window.Auth.isSignedIn()) {
+        try { await window.Auth.getAccessToken(); }
+        catch (e) { return; }
       }
-    } finally {
-      queueRunnerActive = false;
-    }
+      const pending = await window.DB.queuePending();
+      const candidates = pending
+        .filter((p) => !inflight.has(p.id))
+        .sort((a, b) => (a.attempts - b.attempts) || (a.createdAt - b.createdAt));
+      while (inflight.size < MAX_CONCURRENT_UPLOADS && candidates.length) {
+        const item = candidates.shift();
+        startUpload(item);
+      }
+    });
+  }
+
+  function startUpload(item) {
+    const promise = (async () => {
+      await window.DB.queueUpdate(item.id, { status: 'uploading' });
+      patchThumbByQueueId(item.id, { status: 'uploading', progress: 0 });
+
+      try {
+        const result = await window.Drive.uploadFile({
+          folderId: item.projectId,
+          fileName: item.fileName,
+          mimeType: item.mimeType,
+          blob: item.blob,
+          onProgress: (p) => patchThumbByQueueId(item.id, { progress: p })
+        });
+        await window.DB.queueDelete(item.id);
+        patchThumbByQueueId(item.id, {
+          status: 'success',
+          fileId: result?.id || null,
+          progress: 1
+        });
+        appendVisitLog(item.projectId,
+          `uploaded ${item.kind || 'file'}: ${item.fileName} (${fmtBytes(item.blob.size)})`
+        ).catch(() => {});
+      } catch (err) {
+        console.error('Upload failed', err);
+        const attempts = (item.attempts || 0) + 1;
+        await window.DB.queueUpdate(item.id, {
+          status: 'error',
+          attempts,
+          lastError: err.message || String(err)
+        });
+        patchThumbByQueueId(item.id, { status: 'failed', error: err.message || String(err) });
+      }
+    })().finally(() => {
+      inflight.delete(item.id);
+      pumpQueue();
+    });
+    inflight.set(item.id, promise);
+  }
+
+  async function retryThumb(queueId) {
+    if (inflight.has(queueId)) return;
+    await window.DB.queueUpdate(queueId, { status: 'pending', attempts: 0, lastError: null });
+    patchThumbByQueueId(queueId, { status: 'queued', progress: 0, error: null });
+    pumpQueue();
   }
 
   // ---------- Project media (thumbs + notes) ----------
@@ -556,18 +644,26 @@
     updateThumbsDOM();
     try {
       const files = await window.Drive.listFolderFiles(state.currentProjectId);
-      const photos = files
-        .filter((f) => (f.mimeType || '').startsWith('image/'))
+      const media = files
+        .filter((f) =>
+          (f.mimeType || '').startsWith('image/') ||
+          (f.mimeType || '').startsWith('video/') ||
+          (f.mimeType || '').startsWith('audio/')
+        )
         .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
 
-      // Preserve in-flight queued/failed items not yet in Drive.
-      const pendingThumbs = state.thumbs.filter((t) => t.status !== 'success');
-      const driveThumbs = photos.map((f) => ({
-        type: 'photo',
+      // Preserve in-flight items not yet on Drive.
+      const pendingThumbs = state.thumbs.filter((t) => t.status !== 'success' || !t.fileId);
+      const driveThumbs = media.map((f) => ({
+        type: f.mimeType.startsWith('image/') ? 'photo'
+            : f.mimeType.startsWith('video/') ? 'video' : 'audio',
         src: f.thumbnailLink || '',
         name: f.name,
+        mime: f.mimeType,
+        size: Number(f.size || 0),
         status: 'success',
-        fileId: f.id
+        fileId: f.id,
+        webViewLink: f.webViewLink || ''
       }));
       state.thumbs = [...pendingThumbs, ...driveThumbs];
     } catch (err) {
@@ -583,7 +679,6 @@
     state.notesLoading = true;
     updateNotesHistoryDOM();
     try {
-      // Find the notes file. Prefer cached id, fall back to search.
       let notesFile = null;
       if (state.notesFileId) {
         notesFile = { id: state.notesFileId };
@@ -598,16 +693,18 @@
         state.notesEntries = [];
         return;
       }
-      const text = await window.Drive.downloadFileText(notesFile.id);
-      state.notesEntries = parseNotes(text);
-    } catch (err) {
-      // If cached id is stale (file gone), clear it and try once more by search.
-      if (state.notesFileId) {
-        state.notesFileId = null;
-        await window.DB.kvDelete(`notesFileId:${state.currentProjectId}`);
+      try {
+        const text = await window.Drive.downloadFileText(notesFile.id);
+        state.notesEntries = parseNotes(text);
+      } catch (err) {
+        // 404 = stale cache. Other errors = transient — keep cached id.
+        if (window.Drive.isNotFound(err)) {
+          state.notesFileId = null;
+          await window.DB.kvDelete(`notesFileId:${state.currentProjectId}`);
+        } else {
+          console.warn('Notes load failed (transient):', err.message);
+        }
       }
-      state.notesEntries = [];
-      console.warn('Notes load failed:', err.message);
     } finally {
       state.notesLoading = false;
       updateNotesHistoryDOM();
@@ -616,7 +713,6 @@
 
   function parseNotes(text) {
     if (!text) return [];
-    // Split on the divider header lines: "--- 2026-05-01 14:32 — Tech ---"
     const re = /^---\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+—\s+(.+?)\s+---$/gm;
     const matches = [];
     let m;
@@ -631,37 +727,54 @@
       const body = text.slice(start, stop).replace(/^\s+|\s+$/g, '');
       out.push({ ts: matches[i].ts, tech: matches[i].tech, body });
     }
-    return out.reverse(); // newest first
+    return out.reverse();
   }
 
-  // ---------- Drive (gallery) view ----------
-  async function openGallery() {
-    if (!ensureProject()) return;
-    // Stop the camera before unmounting the project screen — a stale
-    // controller would keep the camera light on after navigation.
-    detachCamera();
-    state.view = 'gallery';
-    state.galleryLoading = true;
-    state.galleryFiles = [];
-    scheduleRender();
-    try {
-      const files = await window.Drive.listFolderFiles(state.currentProjectId);
-      state.galleryFiles = files;
-    } catch (err) {
-      toast(`Could not load Drive: ${err.message}`, 'error');
-    } finally {
-      state.galleryLoading = false;
-      scheduleRender();
+  // ---------- Viewer + delete + annotate ----------
+  function openViewerForThumb(thumbIdx) {
+    const photoThumbs = state.thumbs.filter((t) => t.type === 'photo');
+    const target = state.thumbs[thumbIdx];
+    if (!target) return;
+
+    if (target.type === 'video' || target.type === 'audio') {
+      if (target.webViewLink) {
+        window.open(target.webViewLink, '_blank', 'noopener');
+      } else if (target.objectUrl) {
+        window.open(target.objectUrl, '_blank', 'noopener');
+      } else {
+        toast('Wait for upload to finish before opening', 'warn');
+      }
+      return;
     }
+
+    const startIndex = photoThumbs.findIndex((t) => t === target);
+    const items = photoThumbs.map((t) => ({
+      src: t.src || t.objectUrl || '',
+      name: t.name,
+      fileId: t.fileId || null,
+      status: t.status,
+      thumbRef: t
+    }));
+
+    window.Viewer.open({
+      items,
+      startIndex: startIndex < 0 ? 0 : startIndex,
+      onAnnotate: (item) => {
+        if (item.fileId) {
+          annotateFromDrive(item.fileId);
+        } else if (item.thumbRef?.objectUrl) {
+          annotateFromBlobUrl(item.thumbRef.objectUrl);
+        } else {
+          toast('Wait for upload to finish before annotating', 'warn');
+        }
+      },
+      onDelete: async (item, _idx) => {
+        await deleteThumb(item.thumbRef);
+      }
+    });
   }
 
-  function closeGallery() {
-    state.view = 'capture';
-    scheduleRender();
-  }
-
-  async function annotateThumb(fileId) {
-    if (!fileId) return;
+  async function annotateFromDrive(fileId) {
     let blob;
     try {
       const token = await window.Auth.getAccessToken();
@@ -675,13 +788,27 @@
       toast(`Could not load image: ${err.message}`, 'error');
       return;
     }
+    openAnnotateForBlob(blob);
+  }
+
+  async function annotateFromBlobUrl(url) {
+    try {
+      const res = await fetch(url);
+      const blob = await res.blob();
+      openAnnotateForBlob(blob);
+    } catch (err) {
+      toast(`Could not load image: ${err.message}`, 'error');
+    }
+  }
+
+  function openAnnotateForBlob(blob) {
     window.Annotate.openWithBlob({
       blob,
       onSave: async (annotated) => {
         const folderId = state.currentProjectId;
         const fileName = await nextFileName(folderId, 'jpg');
         const annotatedName = fileName.replace(/_(\d+)\.jpg$/, '_annotated_$1.jpg');
-        await window.DB.queueAdd({
+        const item = await window.DB.queueAdd({
           projectId: folderId,
           projectName: state.currentProjectName,
           fileName: annotatedName,
@@ -690,39 +817,125 @@
           kind: 'annotation',
           status: 'pending'
         });
+        const previewUrl = URL.createObjectURL(annotated);
+        state.thumbs.unshift({
+          type: 'photo',
+          src: previewUrl,
+          objectUrl: previewUrl,
+          name: annotatedName,
+          mime: 'image/jpeg',
+          size: annotated.size,
+          status: 'queued',
+          progress: 0,
+          queueId: item.id
+        });
+        updateThumbsDOM();
         toast('Annotation queued', 'success');
-        runQueue();
-        setTimeout(refreshProjectMedia, 1500);
+        pumpQueue();
       },
-      // Skip re-render on close — annotate is an overlay; the project
-      // screen's <video> must keep its stream attached.
-      onClose: () => { /* no-op */ }
+      onClose: () => { /* overlay only */ }
     });
+  }
+
+  async function deleteThumb(thumb) {
+    if (!thumb) return;
+    if (thumb.fileId) {
+      try {
+        await window.Drive.deleteFile(thumb.fileId);
+      } catch (err) {
+        toast(`Delete failed: ${err.message}`, 'error');
+        return;
+      }
+    } else if (thumb.queueId) {
+      // Local-only — drop from queue.
+      try { await window.DB.queueDelete(thumb.queueId); } catch (e) { /* ignore */ }
+    }
+    const idx = state.thumbs.indexOf(thumb);
+    if (idx >= 0) state.thumbs.splice(idx, 1);
+    revokeThumbBlob(thumb);
+    updateThumbsDOM();
+    toast('Deleted', 'success');
+  }
+
+  function revokeThumbBlob(t) {
+    if (t && t.objectUrl) {
+      try { URL.revokeObjectURL(t.objectUrl); } catch (e) { /* ignore */ }
+    }
+  }
+
+  // ---------- Drive (gallery) view ----------
+  async function openGallery() {
+    if (!ensureProject()) return;
+    detachCamera({ silent: true });
+    state.view = 'gallery';
+    state.galleryLoading = true;
+    state.galleryFiles = [];
+    scheduleRender();
+    try {
+      const files = await window.Drive.listFolderFiles(state.currentProjectId);
+      state.galleryFiles = files;
+    } catch (err) {
+      toast(`Could not load Drive: ${err.message}`, 'error');
+    } finally {
+      state.galleryLoading = false;
+      updateGalleryListDOM();
+    }
+  }
+
+  function closeGallery() {
+    state.view = 'capture';
+    scheduleRender();
   }
 
   // ---------- Render ----------
   function render() {
     const app = document.getElementById('app');
-    if (state.booting) {
-      app.innerHTML = '<div class="boot">Loading…</div>';
-      return;
+
+    let target;
+    if (state.booting) target = '_boot';
+    else if (state.initError) target = '_error';
+    else target = state.view;
+
+    if (target !== renderedFlag) {
+      // Preserve focus across full re-renders as a safety net.
+      const focusedId = document.activeElement?.id;
+      const focusedSel = document.activeElement instanceof HTMLInputElement
+        ? [document.activeElement.selectionStart, document.activeElement.selectionEnd]
+        : null;
+
+      if (target === '_boot') app.innerHTML = '<div class="boot">Loading…</div>';
+      else if (target === '_error') {
+        app.innerHTML = `
+          <div class="error-screen">
+            <h2>Setup needed</h2>
+            <p class="muted">${escapeHtml(state.initError || '')}</p>
+            <p class="muted small">Edit <code>js/config.js</code> and set <code>CLIENT_ID</code>. See README.md.</p>
+            <button class="btn-secondary" id="retry-btn">Retry</button>
+          </div>`;
+        document.getElementById('retry-btn')?.addEventListener('click', () => location.reload());
+      }
+      else if (target === 'login') renderLogin(app);
+      else if (target === 'home') renderHome(app);
+      else if (target === 'capture') renderCapture(app);
+      else if (target === 'gallery') renderGallery(app);
+
+      renderedFlag = target;
+
+      if (focusedId) {
+        const el = document.getElementById(focusedId);
+        if (el) {
+          el.focus();
+          if (focusedSel && el.setSelectionRange) {
+            try { el.setSelectionRange(focusedSel[0], focusedSel[1]); } catch (e) { /* ignore */ }
+          }
+        }
+      }
     }
-    if (state.initError) {
-      app.innerHTML = `
-        <div class="error-screen">
-          <h2>Setup needed</h2>
-          <p class="muted">${escapeHtml(state.initError)}</p>
-          <p class="muted small">Edit <code>js/config.js</code> and set <code>CLIENT_ID</code>. See README.md.</p>
-          <button class="btn-secondary" id="retry-btn">Retry</button>
-        </div>
-      `;
-      document.getElementById('retry-btn')?.addEventListener('click', () => location.reload());
-      return;
-    }
-    if (state.view === 'login') return renderLogin(app);
-    if (state.view === 'home')  return renderHome(app);
-    if (state.view === 'gallery') return renderGallery(app);
-    return renderCapture(app);
+
+    // Targeted updates
+    if (target === 'home') updateHomeDOM();
+    else if (target === 'capture') updateCaptureDOM();
+    else if (target === 'gallery') updateGalleryDOM();
   }
 
   function renderLogin(app) {
@@ -748,16 +961,12 @@
   }
 
   function renderHome(app) {
-    // Render the shell once. The input element keeps focus across filter
-    // updates because we never replace it — only the recent list region.
     app.innerHTML = `
       <div class="screen home-screen">
         <header class="topbar">
           <div>
             <div class="topbar-title">Site Visits</div>
-            <div class="topbar-sub">${escapeHtml(state.user?.name || '')}${
-              state.isOnline ? '' : ' <span class="badge offline">offline</span>'
-            }</div>
+            <div class="topbar-sub" id="home-topbar-sub"></div>
           </div>
           <button class="btn-ghost" id="signout-btn">Sign out</button>
         </header>
@@ -802,10 +1011,20 @@
     document.getElementById('start-visit-btn').addEventListener('click',
       () => openOrCreateProject(state.projectFilter));
     document.getElementById('signout-btn').addEventListener('click', onSignOutClick);
-
-    updateRecentList();
   }
 
+  // ---------- Targeted updates: HOME ----------
+  function updateHomeDOM() {
+    updateHomeTopbar();
+    updateRecentList();
+  }
+  function updateHomeTopbar() {
+    const sub = document.getElementById('home-topbar-sub');
+    if (!sub) return;
+    sub.innerHTML = `${escapeHtml(state.user?.name || '')}${
+      state.isOnline ? '' : ' <span class="badge offline">offline</span>'
+    }`;
+  }
   function updateRecentList() {
     const list = document.getElementById('recent-list');
     if (!list) return;
@@ -813,7 +1032,6 @@
     const filtered = filter
       ? state.projects.filter((p) => p.name.toLowerCase().includes(filter))
       : state.projects;
-
     if (state.projectsLoading && state.projects.length === 0) {
       list.innerHTML = '<div class="muted">Loading…</div>';
       return;
@@ -834,12 +1052,12 @@
       </button>
     `).join('');
     list.querySelectorAll('.list-row').forEach((row) => {
-      row.addEventListener('click', () => {
-        enterProject(row.dataset.projectId, row.dataset.projectName);
-      });
+      row.addEventListener('click', () =>
+        enterProject(row.dataset.projectId, row.dataset.projectName));
     });
   }
 
+  // ---------- CAPTURE shell ----------
   function renderCapture(app) {
     app.innerHTML = `
       <div class="screen capture-screen">
@@ -847,7 +1065,7 @@
           <button class="btn-ghost back-btn" id="back-btn">‹ Sites</button>
           <div class="topbar-title-center">
             <div class="topbar-title">${escapeHtml(state.currentProjectName)}</div>
-            ${state.isOnline ? '' : '<div class="badge offline">offline</div>'}
+            <div id="cap-offline" class="cap-offline"></div>
           </div>
           <button class="btn-ghost" id="drive-btn">📁 Drive</button>
         </header>
@@ -863,14 +1081,16 @@
           </div>
 
           <div class="cam-controls">
-            <span class="cam-counter" id="cam-counter">${state.camCounter} captured</span>
+            <span class="cam-counter" id="cam-counter">0 captured</span>
             <button class="cam-shutter" id="shutter-btn" aria-label="Take photo"></button>
             <button class="cam-rec-btn" id="rec-btn" aria-label="Record video"></button>
           </div>
 
+          <div class="gps-row" id="gps-row"></div>
+
           <section class="thumb-section">
             <div class="section-row">
-              <h3 class="section-h">Photos</h3>
+              <h3 class="section-h">Captured</h3>
             </div>
             <div id="thumb-strip" class="thumb-strip"></div>
           </section>
@@ -900,12 +1120,64 @@
     document.getElementById('voice-btn').addEventListener('click', startVoiceNote);
     document.getElementById('save-note-btn').addEventListener('click', saveNote);
 
-    updateThumbsDOM();
-    updateNotesHistoryDOM();
-    attachCamera(); // async
+    attachCamera();
   }
 
-  // Section-only updates so we don't tear down the live <video> element.
+  function updateCaptureDOM() {
+    updateCaptureTopbar();
+    updateCamCounterDOM();
+    updateCamErrorDOM();
+    updateThumbsDOM();
+    updateNotesHistoryDOM();
+    updateGpsChipDOM();
+  }
+  function updateCaptureTopbar() {
+    const off = document.getElementById('cap-offline');
+    if (!off) return;
+    off.innerHTML = state.isOnline ? '' : '<span class="badge offline">offline</span>';
+  }
+  function updateOnlineBadges() {
+    if (renderedFlag === 'home') updateHomeTopbar();
+    else if (renderedFlag === 'capture') updateCaptureTopbar();
+  }
+  function updateCamCounterDOM() {
+    const el = document.getElementById('cam-counter');
+    if (el) el.textContent = `${state.camCounter} captured`;
+  }
+  function updateCamErrorDOM() {
+    const box = document.getElementById('cam-error-box');
+    if (!box) return;
+    if (state.camError) {
+      box.hidden = false;
+      box.innerHTML = `${escapeHtml(state.camError)}<br><br><button class="btn-secondary small" id="cam-retry">Retry camera</button>`;
+      box.querySelector('#cam-retry')?.addEventListener('click', () => {
+        state.camError = null;
+        attachCamera();
+      });
+    } else {
+      box.hidden = true;
+    }
+  }
+
+  function updateGpsChipDOM() {
+    const row = document.getElementById('gps-row');
+    if (!row) return;
+    if (state.gpsLoading && !state.gps) {
+      row.innerHTML = '<span class="gps-chip muted">📍 Capturing GPS…</span>';
+      return;
+    }
+    if (!state.gps) {
+      row.innerHTML = '<span class="gps-chip muted">📍 GPS unavailable</span>';
+      return;
+    }
+    const lat = state.gps.lat.toFixed(5);
+    const lng = state.gps.lng.toFixed(5);
+    row.innerHTML = `
+      <a class="gps-chip" href="${escapeHtml(state.gps.link)}" target="_blank" rel="noopener">
+        📍 ${escapeHtml(lat)}, ${escapeHtml(lng)} — Open Maps
+      </a>`;
+  }
+
   function updateThumbsDOM() {
     const strip = document.getElementById('thumb-strip');
     if (!strip) return;
@@ -915,28 +1187,56 @@
       return;
     }
     if (thumbs.length === 0) {
-      strip.innerHTML = '<div class="thumb-empty">No photos yet — tap the shutter above.</div>';
+      strip.innerHTML = '<div class="thumb-empty">No captures yet — tap the shutter above.</div>';
       return;
     }
-    strip.innerHTML = thumbs.map((t, idx) => {
-      const cls = t.status === 'success' ? '' : (t.status === 'failed' ? 'failed' : 'queued');
-      const stateLabel = t.status === 'queued' ? 'Uploading…' : (t.status === 'failed' ? 'Failed' : '');
-      const img = t.src
-        ? `<img loading="lazy" alt="" src="${escapeHtml(t.src)}" onerror="this.style.display='none'"/>`
-        : '';
-      return `
-        <button class="thumb ${cls}" data-thumb-idx="${idx}" data-file-id="${escapeHtml(t.fileId || '')}">
-          ${img}
-          ${stateLabel ? `<span class="thumb-state">${escapeHtml(stateLabel)}</span>` : ''}
-        </button>
-      `;
-    }).join('');
-    strip.querySelectorAll('.thumb').forEach((b) => {
-      b.addEventListener('click', () => {
-        const fileId = b.dataset.fileId;
-        if (fileId) annotateThumb(fileId);
+    strip.innerHTML = thumbs.map((t, idx) => thumbHtml(t, idx)).join('');
+    strip.querySelectorAll('[data-thumb-action]').forEach((el) => {
+      const idx = parseInt(el.dataset.thumbIdx, 10);
+      const action = el.dataset.thumbAction;
+      el.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (action === 'open') openViewerForThumb(idx);
+        else if (action === 'delete') {
+          if (confirm('Delete this file?')) deleteThumb(state.thumbs[idx]);
+        }
+        else if (action === 'retry') retryThumb(state.thumbs[idx].queueId);
       });
     });
+  }
+
+  function thumbHtml(t, idx) {
+    const cls = t.status === 'success' ? '' : (t.status === 'failed' ? 'failed' : 'queued');
+    const showProgress = t.status === 'uploading' || t.status === 'queued';
+    const pct = Math.round((t.progress || 0) * 100);
+
+    let bgHtml = '';
+    if (t.type === 'photo') {
+      bgHtml = t.src
+        ? `<img loading="lazy" alt="" src="${escapeHtml(t.src)}" onerror="this.style.display='none'"/>`
+        : '';
+    } else if (t.type === 'video') {
+      bgHtml = `<div class="thumb-icon">▶</div>`;
+    } else if (t.type === 'audio') {
+      bgHtml = `<div class="thumb-icon">🎙</div>`;
+    }
+
+    let stateHtml = '';
+    if (t.status === 'failed') stateHtml = '<span class="thumb-state">Failed</span>';
+    else if (t.status === 'queued') stateHtml = '<span class="thumb-state">Queued</span>';
+    else if (t.status === 'uploading') stateHtml = `<span class="thumb-state">${pct}%</span>`;
+
+    return `
+      <div class="thumb ${cls} ${t.type}" data-thumb-action="open" data-thumb-idx="${idx}">
+        ${bgHtml}
+        ${stateHtml}
+        ${showProgress ? `<div class="thumb-progress"><div class="thumb-progress-bar" style="width:${pct}%"></div></div>` : ''}
+        <button class="thumb-trash" data-thumb-action="delete" data-thumb-idx="${idx}" aria-label="Delete">🗑</button>
+        ${t.status === 'failed'
+          ? `<button class="thumb-retry" data-thumb-action="retry" data-thumb-idx="${idx}" aria-label="Retry">↻ Retry</button>`
+          : ''}
+      </div>
+    `;
   }
 
   function updateNotesHistoryDOM() {
@@ -958,109 +1258,96 @@
     `).join('');
   }
 
-  function updateCamCounterDOM() {
-    const el = document.getElementById('cam-counter');
-    if (el) el.textContent = `${state.camCounter} captured`;
-  }
-
-  function updateCamErrorDOM() {
-    const box = document.getElementById('cam-error-box');
-    if (!box) return;
-    if (state.camError) {
-      box.hidden = false;
-      box.innerHTML = `${escapeHtml(state.camError)}<br><br><button class="btn-secondary small" id="cam-retry">Retry camera</button>`;
-      box.querySelector('#cam-retry')?.addEventListener('click', () => {
-        state.camError = null;
-        attachCamera();
-      });
-    } else {
-      box.hidden = true;
-    }
-  }
-
+  // ---------- GALLERY ----------
   function renderGallery(app) {
-    const files = state.galleryFiles || [];
-    const images = files.filter((f) => (f.mimeType || '').startsWith('image/'));
-    const videos = files.filter((f) => (f.mimeType || '').startsWith('video/'));
-    const audios = files.filter((f) => (f.mimeType || '').startsWith('audio/'));
-    const docs = files.filter((f) => /\.txt$/i.test(f.name));
-
     app.innerHTML = `
       <div class="screen gallery-screen">
         <header class="topbar">
           <button class="btn-ghost back-btn" id="g-back">‹ Capture</button>
           <div class="topbar-title-center">
             <div class="topbar-title">${escapeHtml(state.currentProjectName)}</div>
-            <div class="topbar-sub">${files.length} files</div>
+            <div class="topbar-sub" id="gallery-count"></div>
           </div>
           <button class="btn-ghost" id="g-refresh">↻</button>
         </header>
-        <main class="gallery-main">
-          ${state.galleryLoading ? '<div class="muted">Loading…</div>' : ''}
-
-          ${images.length ? `
-            <h3 class="section-h">Photos (${images.length})</h3>
-            <div class="thumb-grid">
-              ${images.map((f) => `
-                <button class="thumb" data-file-id="${escapeHtml(f.id)}">
-                  ${f.thumbnailLink
-                    ? `<img loading="lazy" alt="" src="${escapeHtml(f.thumbnailLink)}" onerror="this.style.display='none'"/>`
-                    : ''}
-                  <span class="thumb-label">${escapeHtml(f.name)}</span>
-                </button>
-              `).join('')}
-            </div>
-          ` : ''}
-
-          ${videos.length ? `
-            <h3 class="section-h">Videos (${videos.length})</h3>
-            <div class="file-list">
-              ${videos.map((f) => `
-                <a class="file-row" href="${escapeHtml(f.webViewLink || '#')}" target="_blank" rel="noopener">
-                  <span class="file-glyph">🎥</span>
-                  <span class="file-name">${escapeHtml(f.name)}</span>
-                  <span class="file-meta">${escapeHtml(fmtBytes(Number(f.size || 0)))}</span>
-                </a>
-              `).join('')}
-            </div>
-          ` : ''}
-
-          ${audios.length ? `
-            <h3 class="section-h">Voice notes (${audios.length})</h3>
-            <div class="file-list">
-              ${audios.map((f) => `
-                <a class="file-row" href="${escapeHtml(f.webViewLink || '#')}" target="_blank" rel="noopener">
-                  <span class="file-glyph">🎙️</span>
-                  <span class="file-name">${escapeHtml(f.name)}</span>
-                  <span class="file-meta">${escapeHtml(fmtBytes(Number(f.size || 0)))}</span>
-                </a>
-              `).join('')}
-            </div>
-          ` : ''}
-
-          ${docs.length ? `
-            <h3 class="section-h">Notes & log</h3>
-            <div class="file-list">
-              ${docs.map((f) => `
-                <a class="file-row" href="${escapeHtml(f.webViewLink || '#')}" target="_blank" rel="noopener">
-                  <span class="file-glyph">📄</span>
-                  <span class="file-name">${escapeHtml(f.name)}</span>
-                </a>
-              `).join('')}
-            </div>
-          ` : ''}
-
-          ${!state.galleryLoading && files.length === 0
-            ? '<div class="muted">No files yet — start capturing.</div>'
-            : ''}
-        </main>
+        <main class="gallery-main" id="gallery-main"></main>
       </div>
     `;
-
     document.getElementById('g-back').addEventListener('click', closeGallery);
     document.getElementById('g-refresh').addEventListener('click', openGallery);
-    app.querySelectorAll('.thumb').forEach((b) => {
-      b.addEventListener('click', () => annotateThumb(b.dataset.fileId));
+  }
+
+  function updateGalleryDOM() {
+    updateGalleryListDOM();
+  }
+  function updateGalleryListDOM() {
+    const root = document.getElementById('gallery-main');
+    if (!root) return;
+    const files = state.galleryFiles || [];
+    document.getElementById('gallery-count').textContent = `${files.length} files`;
+    if (state.galleryLoading) { root.innerHTML = '<div class="muted">Loading…</div>'; return; }
+    if (files.length === 0) {
+      root.innerHTML = '<div class="muted">No files yet — start capturing.</div>';
+      return;
+    }
+    const images = files.filter((f) => (f.mimeType || '').startsWith('image/'));
+    const videos = files.filter((f) => (f.mimeType || '').startsWith('video/'));
+    const audios = files.filter((f) => (f.mimeType || '').startsWith('audio/'));
+    const docs = files.filter((f) => /\.txt$/i.test(f.name));
+
+    root.innerHTML = `
+      ${images.length ? `
+        <h3 class="section-h">Photos (${images.length})</h3>
+        <div class="thumb-grid">
+          ${images.map((f) => `
+            <button class="thumb" data-file-id="${escapeHtml(f.id)}" data-file-name="${escapeHtml(f.name)}">
+              ${f.thumbnailLink ? `<img loading="lazy" alt="" src="${escapeHtml(f.thumbnailLink)}" onerror="this.style.display='none'"/>` : ''}
+              <span class="thumb-label">${escapeHtml(f.name)}</span>
+            </button>
+          `).join('')}
+        </div>` : ''}
+      ${videos.length ? `
+        <h3 class="section-h">Videos (${videos.length})</h3>
+        <div class="file-list">
+          ${videos.map((f) => `
+            <a class="file-row" href="${escapeHtml(f.webViewLink || '#')}" target="_blank" rel="noopener">
+              <span class="file-glyph">🎥</span>
+              <span class="file-name">${escapeHtml(f.name)}</span>
+              <span class="file-meta">${escapeHtml(fmtBytes(Number(f.size || 0)))}</span>
+            </a>
+          `).join('')}
+        </div>` : ''}
+      ${audios.length ? `
+        <h3 class="section-h">Voice notes (${audios.length})</h3>
+        <div class="file-list">
+          ${audios.map((f) => `
+            <a class="file-row" href="${escapeHtml(f.webViewLink || '#')}" target="_blank" rel="noopener">
+              <span class="file-glyph">🎙️</span>
+              <span class="file-name">${escapeHtml(f.name)}</span>
+              <span class="file-meta">${escapeHtml(fmtBytes(Number(f.size || 0)))}</span>
+            </a>
+          `).join('')}
+        </div>` : ''}
+      ${docs.length ? `
+        <h3 class="section-h">Notes &amp; log</h3>
+        <div class="file-list">
+          ${docs.map((f) => `
+            <a class="file-row" href="${escapeHtml(f.webViewLink || '#')}" target="_blank" rel="noopener">
+              <span class="file-glyph">📄</span>
+              <span class="file-name">${escapeHtml(f.name)}</span>
+            </a>
+          `).join('')}
+        </div>` : ''}
+    `;
+
+    root.querySelectorAll('.thumb-grid .thumb').forEach((el) => {
+      el.addEventListener('click', () => {
+        const fileId = el.dataset.fileId;
+        const fileName = el.dataset.fileName;
+        // Open in viewer using Drive content URL via authed fetch.
+        const item = images.find((f) => f.id === fileId);
+        annotateFromDrive(fileId);
+      });
     });
   }
 })();

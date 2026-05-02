@@ -1,6 +1,11 @@
 // Google Identity Services OAuth2 token client.
-// Returns access tokens for the Drive scope. Expires after ~1 hour, refreshed
-// silently via prompt='' (uses the existing Google session — no UI flicker).
+//
+// Persistence: GIS implicit-flow access tokens last ~1 hour. We cache the
+// access token and its expiry in IndexedDB so a page refresh within that
+// hour stays signed in. After expiry, requestAccessToken({prompt:''})
+// silently refreshes from the user's Google session. The user only sees
+// the Sign-in button if a) they tap Sign out, or b) silent refresh is
+// blocked by Safari ITP / no Google session.
 window.Auth = (function () {
   let tokenClient = null;
   let accessToken = null;
@@ -24,7 +29,7 @@ window.Auth = (function () {
       const start = Date.now();
       (function check() {
         if (window.google?.accounts?.oauth2) return resolve();
-        if (Date.now() - start > 10000) return reject(new Error('Google Identity Services failed to load'));
+        if (Date.now() - start > 8000) return reject(new Error('Google Identity Services failed to load'));
         setTimeout(check, 100);
       })();
     });
@@ -34,48 +39,69 @@ window.Auth = (function () {
     await gisReady();
 
     if (window.CONFIG.CLIENT_ID.startsWith('__REPLACE')) {
-      throw new Error(
-        'OAuth not configured: edit js/config.js and set CLIENT_ID. See README.'
-      );
+      throw new Error('OAuth not configured: edit js/config.js and set CLIENT_ID. See README.');
     }
 
     tokenClient = window.google.accounts.oauth2.initTokenClient({
       client_id: window.CONFIG.CLIENT_ID,
       scope: window.CONFIG.SCOPES,
-      hd: window.CONFIG.HOSTED_DOMAIN, // restricts the chooser to the workspace domain
+      hd: window.CONFIG.HOSTED_DOMAIN,
       prompt: '',
       callback: () => { /* set per-request below */ }
     });
 
-    // Restore cached user (token must be re-acquired after a reload).
-    const cachedUser = await window.DB.kvGet('user');
-    if (cachedUser) user = cachedUser;
+    // Restore cached identity + token.
+    try {
+      const cachedUser = await window.DB.kvGet('user');
+      if (cachedUser) user = cachedUser;
+      const cachedToken = await window.DB.kvGet('auth.token');
+      const cachedExp = await window.DB.kvGet('auth.expiresAt');
+      if (cachedToken && cachedExp && Date.now() < Number(cachedExp)) {
+        accessToken = cachedToken;
+        tokenExpiresAt = Number(cachedExp);
+      }
+    } catch (e) { /* ignore — fresh start */ }
   }
 
-  // Request an access token. opts: { interactive: bool }
-  function requestToken(opts = {}) {
+  async function persistToken() {
+    try {
+      if (accessToken) {
+        await window.DB.kvSet('auth.token', accessToken);
+        await window.DB.kvSet('auth.expiresAt', tokenExpiresAt);
+      } else {
+        await window.DB.kvDelete('auth.token');
+        await window.DB.kvDelete('auth.expiresAt');
+      }
+    } catch (e) { /* best effort */ }
+  }
+
+  function requestToken() {
     return new Promise((resolve, reject) => {
       if (!tokenClient) return reject(new Error('Auth not initialized'));
 
+      // Fail-safe: GIS sometimes never invokes the callback if a popup is
+      // blocked or the iframe is sandboxed. After 30s, give up.
+      const safety = setTimeout(() => reject(new Error('Token request timed out')), 30000);
+
       tokenClient.callback = async (resp) => {
+        clearTimeout(safety);
         if (resp.error) return reject(new Error(resp.error_description || resp.error));
         accessToken = resp.access_token;
-        // expires_in is seconds; subtract 60s buffer.
         tokenExpiresAt = Date.now() + (resp.expires_in - 60) * 1000;
         try {
           await fetchAndVerifyUser();
+          await persistToken();
           notifyChange();
           resolve({ accessToken, user });
         } catch (err) {
           accessToken = null;
+          tokenExpiresAt = 0;
+          await persistToken();
           notifyChange();
           reject(err);
         }
       };
 
-      // Empty prompt lets Google decide: silent if scopes are already granted,
-      // popup on first auth. We never force 'consent' — that re-prompts on
-      // every sign-in for no benefit.
       tokenClient.requestAccessToken({ prompt: '' });
     });
   }
@@ -101,18 +127,18 @@ window.Auth = (function () {
   }
 
   // Returns a valid access token, refreshing silently if needed. Pass
-  // forceRefresh=true after a 401 to bypass the in-memory timer (the token
-  // may have been revoked even though our expiry clock thinks it's fresh).
+  // forceRefresh=true after a 401 to bypass the in-memory timer.
   async function getAccessToken(forceRefresh = false) {
     if (!forceRefresh && accessToken && Date.now() < tokenExpiresAt) return accessToken;
     accessToken = null;
     tokenExpiresAt = 0;
-    const { accessToken: t } = await requestToken({ interactive: false });
+    await persistToken();
+    const { accessToken: t } = await requestToken();
     return t;
   }
 
   async function signIn() {
-    return requestToken({ interactive: true });
+    return requestToken();
   }
 
   async function signOut() {
@@ -122,20 +148,16 @@ window.Auth = (function () {
     accessToken = null;
     tokenExpiresAt = 0;
     user = null;
-    await window.DB.kvDelete('user');
+    try {
+      await window.DB.kvDelete('user');
+      await window.DB.kvDelete('auth.token');
+      await window.DB.kvDelete('auth.expiresAt');
+    } catch (e) { /* ignore */ }
     notifyChange();
   }
 
   function getUser() { return user; }
   function isSignedIn() { return !!accessToken && Date.now() < tokenExpiresAt; }
 
-  return {
-    init,
-    signIn,
-    signOut,
-    getAccessToken,
-    getUser,
-    isSignedIn,
-    onChange
-  };
+  return { init, signIn, signOut, getAccessToken, getUser, isSignedIn, onChange };
 })();

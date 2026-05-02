@@ -2,13 +2,11 @@
 // chrome (shutter, record button, indicators); this module just manages the
 // MediaStream + MediaRecorder lifecycle and produces Blobs.
 //
-// Usage:
-//   const cam = await Camera.attach(videoEl, { withAudio: true });
-//   const photo = await cam.takePhoto();
-//   await cam.startVideo();
-//   const video = await cam.stopVideo();
-//   cam.stop();
+// Recording bitrate is capped at ~2.5 Mbps (videoBitsPerSecond) so a typical
+// minute of 1080p video lands around 18MB instead of 50-80MB.
 window.Camera = (function () {
+  const VIDEO_BITS_PER_SECOND = 2_500_000;
+  const AUDIO_BITS_PER_SECOND = 96_000;
 
   function pickVideoMime() {
     const candidates = [
@@ -42,7 +40,6 @@ window.Camera = (function () {
       stream = await navigator.mediaDevices.getUserMedia(constraints);
     } catch (err) {
       if (withAudio) {
-        // Fall back to video-only if mic permission is the blocker.
         stream = await navigator.mediaDevices.getUserMedia({ video: constraints.video, audio: false });
       } else {
         throw err;
@@ -90,9 +87,21 @@ window.Camera = (function () {
     function startVideo() {
       if (isRecording()) return;
       recMime = pickVideoMime();
-      recorder = recMime
-        ? new MediaRecorder(stream, { mimeType: recMime })
-        : new MediaRecorder(stream);
+      const recOpts = recMime
+        ? {
+            mimeType: recMime,
+            videoBitsPerSecond: VIDEO_BITS_PER_SECOND,
+            audioBitsPerSecond: AUDIO_BITS_PER_SECOND
+          }
+        : { videoBitsPerSecond: VIDEO_BITS_PER_SECOND };
+      try {
+        recorder = new MediaRecorder(stream, recOpts);
+      } catch (err) {
+        // Some Safari builds reject the bitrate hint — retry without it.
+        recorder = recMime
+          ? new MediaRecorder(stream, { mimeType: recMime })
+          : new MediaRecorder(stream);
+      }
       chunks = [];
       recorder.ondataavailable = (ev) => {
         if (ev.data && ev.data.size) chunks.push(ev.data);
@@ -124,7 +133,9 @@ window.Camera = (function () {
       try { if (recorder && recorder.state !== 'inactive') recorder.stop(); }
       catch (e) { /* ignore */ }
       recorder = null;
-      stream.getTracks().forEach((t) => t.stop());
+      stream.getTracks().forEach((t) => {
+        try { t.stop(); } catch (e) { /* ignore */ }
+      });
       videoEl.srcObject = null;
     }
 

@@ -1,5 +1,7 @@
 // Google Drive v3 helpers.
-// All calls go through authedFetch which lazily refreshes the access token.
+// Multipart upload uses XHR so we can report progress per file. Resumable
+// upload also uses XHR with progress for >5MB files. All upload paths and
+// the text-file PATCH are wrapped in withRetry for transient errors.
 window.Drive = (function () {
   const API = 'https://www.googleapis.com/drive/v3';
   const UPLOAD = 'https://www.googleapis.com/upload/drive/v3';
@@ -10,35 +12,35 @@ window.Drive = (function () {
     headers.set('Authorization', `Bearer ${token}`);
     const res = await fetch(input, { ...init, headers });
     if (res.status === 401 && retry) {
-      // Token went stale mid-request (clock drift, revoke). Force a silent
-      // refresh once; if that fails, the error propagates and the queue
-      // runner will mark the upload as errored without a popup loop.
       await window.Auth.getAccessToken(true);
       return authedFetch(input, init, false);
     }
     return res;
   }
 
-  // Wrap any async operation with exponential backoff for transient errors.
-  // Retriable: network errors, 5xx, 429, 408. Auth (401) is handled inside
-  // authedFetch already; permanent 4xx pass through immediately.
+  function statusFromError(err) {
+    const msg = String(err && err.message || err);
+    const m = msg.match(/\((\d{3})\)/) || msg.match(/(\d{3})/);
+    return m ? parseInt(m[1], 10) : 0;
+  }
+  function isTransient(err) {
+    const status = statusFromError(err);
+    if (!status) return true; // network error → retry
+    return status === 408 || status === 429 || (status >= 500 && status < 600);
+  }
+  function isNotFound(err) {
+    return statusFromError(err) === 404;
+  }
+
   async function withRetry(fn, { retries = 4, baseMs = 1000 } = {}) {
     let attempt = 0;
     let lastErr;
     while (attempt <= retries) {
-      try {
-        return await fn(attempt);
-      } catch (err) {
+      try { return await fn(attempt); }
+      catch (err) {
         lastErr = err;
-        const msg = String(err && err.message || err);
-        const m = msg.match(/(\d{3})/); // pull a status code if we embedded one
-        const status = m ? parseInt(m[1], 10) : 0;
-        const transient =
-          !status ||
-          status === 408 || status === 429 ||
-          (status >= 500 && status < 600);
-        if (!transient || attempt === retries) throw err;
-        const delay = Math.min(30000, baseMs * Math.pow(2, attempt)) + Math.floor(Math.random() * 250);
+        if (!isTransient(err) || attempt === retries) throw err;
+        const delay = Math.min(20000, baseMs * Math.pow(2, attempt)) + Math.floor(Math.random() * 250);
         await new Promise((r) => setTimeout(r, delay));
         attempt += 1;
       }
@@ -46,19 +48,48 @@ window.Drive = (function () {
     throw lastErr;
   }
 
-  function escapeQ(s) {
-    return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-  }
-
+  function escapeQ(s) { return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
   function sanitizeFolderName(name) {
     return name.replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  // ---- Authed XHR helper for upload progress ----
+  // 401 → force-refresh token and retry once. Any other non-2xx → reject so
+  // the outer withRetry can decide whether the status is transient.
+  async function authedXhr(opts) { return _authedXhr(opts, false); }
+  async function _authedXhr(opts, retriedOn401) {
+    const token = await window.Auth.getAccessToken(retriedOn401);
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open(opts.method, opts.url, true);
+      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+      Object.entries(opts.headers || {}).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+      if (opts.onProgress && xhr.upload) {
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable) opts.onProgress(ev.loaded / ev.total);
+        };
+      }
+      xhr.onload = async () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { resolve({ status: xhr.status, data: xhr.responseText ? JSON.parse(xhr.responseText) : null, raw: xhr }); }
+          catch { resolve({ status: xhr.status, data: null, raw: xhr }); }
+        } else if (xhr.status === 401 && !retriedOn401) {
+          try { resolve(await _authedXhr(opts, true)); }
+          catch (e) { reject(e); }
+        } else {
+          reject(new Error(`(${xhr.status}) ${xhr.statusText || ''} ${xhr.responseText || ''}`));
+        }
+      };
+      xhr.onerror = () => reject(new Error('Network error'));
+      xhr.ontimeout = () => reject(new Error('Request timed out'));
+      xhr.send(opts.body);
+    });
   }
 
   // -------- Folders --------
   async function ensureProjectFolder(rawName) {
     const name = sanitizeFolderName(rawName);
     if (!name) throw new Error('Empty project name');
-
     const q = encodeURIComponent(
       `name='${escapeQ(name)}' and ` +
       `'${window.CONFIG.SITE_VISITS_FOLDER_ID}' in parents and ` +
@@ -72,7 +103,6 @@ window.Drive = (function () {
     if (data.files && data.files.length > 0) {
       return { id: data.files[0].id, name: data.files[0].name, created: false };
     }
-
     const createRes = await authedFetch(`${API}/files?supportsAllDrives=true`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -118,15 +148,19 @@ window.Drive = (function () {
       `'${folderId}' in parents and name='${escapeQ(fileName)}' and trashed=false`
     );
     const res = await authedFetch(
-      `${API}/files?q=${q}&fields=files(id,name,mimeType)&pageSize=1&supportsAllDrives=true&includeItemsFromAllDrives=true`
+      `${API}/files?q=${q}&fields=files(id,name,mimeType,modifiedTime)&pageSize=10&supportsAllDrives=true&includeItemsFromAllDrives=true`
     );
     if (!res.ok) throw new Error(`Drive findFile failed: ${res.status}`);
     const data = await res.json();
-    return (data.files && data.files[0]) || null;
+    if (!data.files || data.files.length === 0) return null;
+    // If duplicates exist, prefer the most recently modified one — newer
+    // tends to be the file the team is actually editing.
+    data.files.sort((a, b) => new Date(b.modifiedTime) - new Date(a.modifiedTime));
+    return data.files[0];
   }
 
   // -------- Uploads --------
-  async function uploadMultipart({ folderId, fileName, mimeType, blob }) {
+  async function uploadMultipart({ folderId, fileName, mimeType, blob, onProgress }) {
     const metadata = { name: fileName, parents: [folderId] };
     const boundary = 'dancon_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
     const head =
@@ -136,23 +170,17 @@ window.Drive = (function () {
       `\r\n--${boundary}\r\n` +
       `Content-Type: ${mimeType || 'application/octet-stream'}\r\n\r\n`;
     const tail = `\r\n--${boundary}--`;
-
     const body = new Blob([head, blob, tail], { type: `multipart/related; boundary=${boundary}` });
 
     return withRetry(async () => {
-      const res = await authedFetch(
-        `${UPLOAD}/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,size`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
-          body
-        }
-      );
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`Upload failed (${res.status}): ${text || res.statusText}`);
-      }
-      return res.json();
+      const { data } = await authedXhr({
+        method: 'POST',
+        url: `${UPLOAD}/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,size`,
+        headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+        body,
+        onProgress
+      });
+      return data;
     });
   }
 
@@ -194,7 +222,7 @@ window.Drive = (function () {
           try { resolve(JSON.parse(xhr.responseText)); }
           catch { resolve({}); }
         } else {
-          reject(new Error(`Upload PUT failed (${xhr.status}): ${xhr.responseText || ''}`));
+          reject(new Error(`(${xhr.status}) Upload PUT failed: ${xhr.responseText || ''}`));
         }
       };
       xhr.onerror = () => reject(new Error('Network error during upload'));
@@ -207,40 +235,52 @@ window.Drive = (function () {
     return big ? uploadResumable(opts) : uploadMultipart(opts);
   }
 
+  // -------- Delete --------
+  async function deleteFile(fileId) {
+    return withRetry(async () => {
+      const res = await authedFetch(`${API}/files/${fileId}?supportsAllDrives=true`, {
+        method: 'DELETE'
+      });
+      if (!res.ok && res.status !== 404) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Delete failed (${res.status}): ${text || res.statusText}`);
+      }
+      return true;
+    });
+  }
+
   // -------- Text-file append --------
   async function downloadFileText(fileId) {
-    const res = await authedFetch(
-      `${API}/files/${fileId}?alt=media&supportsAllDrives=true`
-    );
-    if (!res.ok) throw new Error(`Download failed (${res.status})`);
-    return res.text();
+    return withRetry(async () => {
+      const res = await authedFetch(`${API}/files/${fileId}?alt=media&supportsAllDrives=true`);
+      if (!res.ok) throw new Error(`(${res.status}) Download failed`);
+      return res.text();
+    });
   }
 
   async function updateFileContent(fileId, blob, mimeType) {
     return withRetry(async () => {
-      const res = await authedFetch(
-        `${UPLOAD}/files/${fileId}?uploadType=media&supportsAllDrives=true&fields=id,name,size`,
-        {
-          method: 'PATCH',
-          headers: { 'Content-Type': mimeType },
-          body: blob
-        }
-      );
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`Update failed (${res.status}): ${text || res.statusText}`);
-      }
-      return res.json();
+      const { data } = await authedXhr({
+        method: 'PATCH',
+        url: `${UPLOAD}/files/${fileId}?uploadType=media&supportsAllDrives=true&fields=id,name,size`,
+        headers: { 'Content-Type': mimeType },
+        body: blob
+      });
+      return data;
     });
   }
 
-  // Append text to a file inside a folder. If `cachedFileId` is supplied
-  // (e.g. from a previous successful append), we PATCH directly without a
-  // search query — this avoids the "duplicate file" bug caused by Drive's
-  // eventually-consistent search index. On a cache miss, we search; if no
-  // file exists, we create one. Returns the file id (caller should cache it).
+  // Append text to a file inside a folder. Critical correctness rules:
+  //   1. If we have a cachedFileId, USE IT. Only treat 404 as "file gone".
+  //      Network/5xx errors propagate to the caller — they MUST NOT cause
+  //      a silent fallback to creation, which would create duplicates.
+  //   2. On cache miss (no id supplied), search 3x with backoff to handle
+  //      Drive's eventually-consistent index after a recent create.
+  //   3. Only as a last resort, create a new file.
+  //
+  // After creating, callers should write the returned id to their cache
+  // immediately to short-circuit subsequent calls.
   async function appendToTextFile({ folderId, fileName, lineOrText, cachedFileId }) {
-    // Path 1: we know the id — fast path, no search.
     if (cachedFileId) {
       try {
         const current = await downloadFileText(cachedFileId);
@@ -251,24 +291,29 @@ window.Drive = (function () {
         const updated = await updateFileContent(cachedFileId, blob, 'text/plain');
         return { id: updated.id || cachedFileId, created: false };
       } catch (err) {
-        // Cache miss-path: file might have been deleted. Fall through to search.
-        console.warn('cached fileId failed, falling back to search:', err.message);
+        if (!isNotFound(err)) throw err; // transient → propagate, do NOT create dup
+        // 404: cached id is dead — fall through to search/create.
       }
     }
 
-    // Path 2: search for an existing file in the folder.
-    const existing = await findFileInFolder(folderId, fileName);
-    if (existing) {
-      const current = await downloadFileText(existing.id);
+    // Search with retry to handle eventual consistency.
+    let found = null;
+    for (let i = 0; i < 3 && !found; i += 1) {
+      try { found = await findFileInFolder(folderId, fileName); }
+      catch (e) { if (!isTransient(e)) throw e; }
+      if (!found && i < 2) await new Promise((r) => setTimeout(r, 600 * (i + 1)));
+    }
+    if (found) {
+      const current = await downloadFileText(found.id);
       const next = (current.length === 0 || current.endsWith('\n'))
         ? current + lineOrText
         : current + '\n' + lineOrText;
       const blob = new Blob([next], { type: 'text/plain' });
-      const updated = await updateFileContent(existing.id, blob, 'text/plain');
-      return { id: updated.id || existing.id, created: false };
+      const updated = await updateFileContent(found.id, blob, 'text/plain');
+      return { id: updated.id || found.id, created: false };
     }
 
-    // Path 3: create a new file.
+    // Last resort: create.
     const blob = new Blob([lineOrText], { type: 'text/plain' });
     const created = await uploadMultipart({ folderId, fileName, mimeType: 'text/plain', blob });
     return { id: created.id, created: true };
@@ -282,9 +327,12 @@ window.Drive = (function () {
     uploadFile,
     uploadMultipart,
     uploadResumable,
+    deleteFile,
     downloadFileText,
     updateFileContent,
     appendToTextFile,
-    sanitizeFolderName
+    sanitizeFolderName,
+    isNotFound,
+    isTransient
   };
 })();

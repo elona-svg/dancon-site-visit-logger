@@ -542,6 +542,153 @@ code { background: #eef0f2; padding: 2px 6px; border-radius: 4px; font-size: 13p
   gap: 8px;
 }
 
+/* ---------- GPS chip ---------- */
+.gps-row {
+  padding: 0 16px 8px;
+}
+.gps-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #111;
+  text-decoration: none;
+  font-weight: 500;
+}
+.gps-chip.muted { color: #6b7280; background: #f4f4f5; }
+.gps-chip:active { background: #f4f4f5; }
+
+/* ---------- Capture topbar inline offline badge ---------- */
+.cap-offline { display: inline-block; min-height: 16px; }
+
+/* ---------- Thumb extras ---------- */
+.thumb-icon {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 36px;
+  color: rgba(255,255,255,0.85);
+  background: linear-gradient(135deg, #1f2937, #111);
+}
+.thumb-progress {
+  position: absolute;
+  left: 6px; right: 6px; bottom: 6px;
+  height: 3px;
+  background: rgba(255,255,255,0.25);
+  border-radius: 2px;
+  overflow: hidden;
+  z-index: 2;
+}
+.thumb-progress-bar {
+  height: 100%;
+  background: #fbbf24;
+  transition: width 200ms;
+}
+.thumb-trash {
+  position: absolute;
+  top: 4px; right: 4px;
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.55);
+  color: #fff;
+  font-size: 14px;
+  display: inline-flex; align-items: center; justify-content: center;
+  z-index: 3;
+}
+.thumb-trash:active { background: rgba(0,0,0,0.8); }
+.thumb-retry {
+  position: absolute;
+  left: 6px; right: 6px; bottom: 18px;
+  background: #ef4444;
+  color: #fff;
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  z-index: 3;
+}
+
+/* ---------- Viewer (full-screen photo nav) ---------- */
+.viewer-overlay {
+  position: fixed; inset: 0; z-index: 1500;
+  background: #000;
+  color: #fff;
+  display: flex; flex-direction: column;
+  user-select: none;
+}
+.viewer-top {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
+  padding: env(safe-area-inset-top) 12px 0;
+  height: calc(56px + env(safe-area-inset-top));
+  background: rgba(0,0,0,0.55);
+}
+.viewer-pos {
+  font-weight: 700; font-size: 14px;
+  background: rgba(255,255,255,0.1);
+  padding: 6px 12px;
+  border-radius: 999px;
+}
+.viewer-actions { display: flex; gap: 6px; }
+.cam-icon-btn.vw-trash { background: rgba(239,68,68,0.85); }
+.viewer-stage {
+  flex: 1;
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden;
+  position: relative;
+  touch-action: pan-y;
+}
+.viewer-stage img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.viewer-arrow {
+  position: absolute;
+  top: 50%; transform: translateY(-50%);
+  width: 48px; height: 48px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.5);
+  color: #fff;
+  font-size: 32px; line-height: 1;
+  border: none;
+  z-index: 2;
+}
+.viewer-arrow.left  { left: 8px; }
+.viewer-arrow.right { right: 8px; }
+.viewer-arrow:disabled { opacity: 0.3; }
+.viewer-bottom {
+  background: rgba(0,0,0,0.55);
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
+}
+.viewer-name {
+  font-size: 12px;
+  color: #d4d4d8;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  flex: 1; min-width: 0;
+}
+.viewer-tag {
+  background: rgba(255,255,255,0.1);
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: #fbbf24;
+}
+.viewer-tag.failed { color: #fecaca; }
+
+/* ---------- Annotate tool divider ---------- */
+.tool-divider {
+  width: 1px;
+  height: 24px;
+  margin: 0 4px;
+  background: rgba(255,255,255,0.2);
+  display: inline-block;
+}
+
 /* ---------- Larger phones / tablets ---------- */
 @media (min-width: 720px) {
   .home-main, .gallery-main { max-width: 720px; margin: 0 auto; width: 100%; }
