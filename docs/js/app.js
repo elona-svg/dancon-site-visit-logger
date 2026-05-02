@@ -475,9 +475,30 @@
   // ---------- Voice & notes ----------
   function startVoiceNote() {
     if (!ensureProject()) return;
+    console.log('[voice] startVoiceNote');
+    // iOS Safari only allows one mic capture at a time. The camera stream
+    // already holds it (audio:true so video records audio), so we MUST
+    // release the camera before opening the voice modal — otherwise
+    // getUserMedia either rejects or returns a stream whose recorder
+    // never fires onstop. We re-attach the camera on close.
+    const wasCamAttached = !!state.cam;
+    if (wasCamAttached) {
+      console.log('[voice] detaching camera so iOS releases the mic');
+      detachCamera({ silent: true });
+    }
     window.AudioNote.open({
-      onCapture: (blob, mime) => enqueueCapture(blob, mime, 'audio'),
-      onClose: () => { /* overlay only — no re-render */ }
+      onCapture: (blob, mime) => {
+        console.log('[voice] app.onCapture — blob:', blob?.size, 'mime:', mime);
+        enqueueCapture(blob, mime, 'audio');
+      },
+      onClose: () => {
+        console.log('[voice] AudioNote closed; reattach camera?', wasCamAttached, 'view:', state.view);
+        if (wasCamAttached && state.view === 'capture') {
+          // Small delay lets iOS fully release the audio track before we
+          // re-acquire it through the camera stream.
+          setTimeout(() => attachCamera(), 250);
+        }
+      }
     });
   }
 
@@ -524,14 +545,22 @@
 
   // ---------- Capture queue ----------
   async function enqueueCapture(blob, mime, kind) {
+    console.log('[capture] enqueueCapture kind=', kind, 'mime=', mime, 'size=', blob?.size, 'project=', state.currentProjectId);
     const folderId = state.currentProjectId;
     const folderName = state.currentProjectName;
     if (!folderId) {
+      console.warn('[capture] no project — capture discarded');
       toast('No project — capture discarded', 'error');
+      return;
+    }
+    if (!blob || blob.size === 0) {
+      console.warn('[capture] empty blob — capture discarded');
+      toast('Empty capture — try again', 'error');
       return;
     }
     const ext = extFromMime(mime);
     const fileName = await nextFileName(folderId, ext);
+    console.log('[capture] generated fileName=', fileName, 'ext=', ext);
     const item = await window.DB.queueAdd({
       projectId: folderId,
       projectName: folderName,
@@ -542,8 +571,8 @@
       status: 'pending',
       attempts: 0
     });
+    console.log('[capture] queued id=', item.id);
 
-    // Always add a thumb so the tech can see (and tap) the asset right away.
     const previewUrl = (kind === 'photo' || kind === 'video' || kind === 'audio')
       ? URL.createObjectURL(blob)
       : null;
@@ -592,6 +621,7 @@
   }
 
   function startUpload(item) {
+    console.log('[upload] starting id=', item.id, 'name=', item.fileName, 'kind=', item.kind, 'size=', item.blob?.size);
     const promise = (async () => {
       await window.DB.queueUpdate(item.id, { status: 'uploading' });
       patchThumbByQueueId(item.id, { status: 'uploading', progress: 0 });
@@ -604,6 +634,7 @@
           blob: item.blob,
           onProgress: (p) => patchThumbByQueueId(item.id, { progress: p })
         });
+        console.log('[upload] success id=', item.id, 'driveFileId=', result?.id);
         await window.DB.queueDelete(item.id);
         patchThumbByQueueId(item.id, {
           status: 'success',
@@ -614,7 +645,7 @@
           `uploaded ${item.kind || 'file'}: ${item.fileName} (${fmtBytes(item.blob.size)})`
         ).catch(() => {});
       } catch (err) {
-        console.error('Upload failed', err);
+        console.error('[upload] failed id=', item.id, err);
         const attempts = (item.attempts || 0) + 1;
         await window.DB.queueUpdate(item.id, {
           status: 'error',
@@ -728,6 +759,45 @@
       out.push({ ts: matches[i].ts, tech: matches[i].tech, body });
     }
     return out.reverse();
+  }
+
+  // Inverse of parseNotes — entries are newest-first; file is chronological.
+  function serializeNotes(entries) {
+    const ascending = [...entries].reverse();
+    return ascending.map((e) => `\n--- ${e.ts} — ${e.tech} ---\n${e.body}\n`).join('');
+  }
+
+  async function deleteNoteAt(idx) {
+    const note = state.notesEntries[idx];
+    if (!note) return;
+    if (!confirm('Delete this note?')) return;
+
+    if (!state.notesFileId) {
+      toast('Notes file not loaded yet', 'warn');
+      return;
+    }
+
+    // Optimistic UI update — restore from server if the write fails.
+    const removed = state.notesEntries.splice(idx, 1)[0];
+    updateNotesHistoryDOM();
+
+    try {
+      const text = await window.Drive.downloadFileText(state.notesFileId);
+      const fresh = parseNotes(text); // newest-first
+      const matchIdx = fresh.findIndex(
+        (e) => e.ts === removed.ts && e.tech === removed.tech && e.body === removed.body
+      );
+      if (matchIdx >= 0) fresh.splice(matchIdx, 1);
+      const newText = serializeNotes(fresh);
+      const blob = new Blob([newText], { type: 'text/plain' });
+      await window.Drive.updateFileContent(state.notesFileId, blob, 'text/plain');
+      toast('Note deleted', 'success');
+      appendVisitLog(state.currentProjectId, 'deleted text note').catch(() => {});
+    } catch (err) {
+      console.error('[notes] delete failed:', err);
+      toast(`Could not delete note: ${err.message}`, 'error', 6000);
+      refreshProjectNotes(); // pull authoritative state
+    }
   }
 
   // ---------- Viewer + delete + annotate ----------
@@ -1082,8 +1152,10 @@
 
           <div class="cam-controls">
             <span class="cam-counter" id="cam-counter">0 captured</span>
-            <button class="cam-shutter" id="shutter-btn" aria-label="Take photo"></button>
-            <button class="cam-rec-btn" id="rec-btn" aria-label="Record video"></button>
+            <div class="cam-buttons">
+              <button class="cam-shutter" id="shutter-btn" aria-label="Take photo"></button>
+              <button class="cam-rec-btn" id="rec-btn" aria-label="Record video"></button>
+            </div>
           </div>
 
           <div class="gps-row" id="gps-row"></div>
@@ -1250,12 +1322,21 @@
       root.innerHTML = '';
       return;
     }
-    root.innerHTML = state.notesEntries.map((n) => `
+    root.innerHTML = state.notesEntries.map((n, idx) => `
       <div class="note-item">
-        <div class="note-meta">${escapeHtml(n.ts)} · ${escapeHtml(n.tech)}</div>
+        <div class="note-meta">
+          <span>${escapeHtml(n.ts)} · ${escapeHtml(n.tech)}</span>
+          <button class="note-trash" data-note-idx="${idx}" aria-label="Delete note" title="Delete note">🗑</button>
+        </div>
         <div class="note-body">${escapeHtml(n.body)}</div>
       </div>
     `).join('');
+    root.querySelectorAll('[data-note-idx]').forEach((b) => {
+      b.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        deleteNoteAt(parseInt(b.dataset.noteIdx, 10));
+      });
+    });
   }
 
   // ---------- GALLERY ----------
