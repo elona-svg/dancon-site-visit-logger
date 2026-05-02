@@ -233,51 +233,8 @@ code { background: #eef0f2; padding: 2px 6px; border-radius: 4px; font-size: 13p
   50% { opacity: 0.35; }
 }
 
-.cam-controls {
-  background: #fff;
-  border-bottom: 1px solid #e5e7eb;
-  padding: 10px 16px 14px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-}
-.cam-buttons {
-  display: flex;
-  align-items: center;
-  gap: 18px;
-}
-.cam-shutter {
-  width: 72px; height: 72px;
-  border-radius: 50%;
-  background: #fff;
-  border: 4px solid #111;
-  box-shadow: 0 0 0 4px #fff inset;
-  transition: transform 80ms ease;
-}
-.cam-shutter:active { transform: scale(0.94); }
-.cam-shutter:disabled { opacity: 0.4; }
-
-.cam-rec-btn {
-  width: 64px; height: 64px;
-  border-radius: 50%;
-  background: #fff;
-  border: 2px solid #d4d4d8;
-  display: inline-flex; align-items: center; justify-content: center;
-}
-.cam-rec-btn::after {
-  content: '';
-  width: 22px; height: 22px;
-  background: #ef4444;
-  border-radius: 50%;
-  transition: all 120ms ease;
-}
-.cam-rec-btn.recording { border-color: #ef4444; }
-.cam-rec-btn.recording::after {
-  width: 20px; height: 20px;
-  border-radius: 4px;
-}
-.cam-rec-btn:disabled { opacity: 0.4; }
+/* (Inline cam-controls / cam-shutter / cam-rec-btn from the inline preview
+   are no longer mounted — kept stub for backwards-compat only.) */
 
 .cam-counter {
   color: #6b7280;
@@ -750,17 +707,34 @@ code { background: #eef0f2; padding: 2px 6px; border-radius: 4px; font-size: 13p
 /* ---------- Open Camera button ---------- */
 .open-camera-btn {
   width: calc(100% - 32px);
-  margin: 4px 16px 12px;
-  background: #111;
+  margin: 6px 16px 14px;
+  background: linear-gradient(180deg, #FF2222 0%, #CC0000 100%);
   color: #fff;
+  border: 1px solid rgba(255,255,255,0.18);
   border-radius: 16px;
-  padding: 22px 16px;
-  display: flex; align-items: center; justify-content: center; gap: 12px;
-  font-weight: 700;
-  font-size: 18px;
+  padding: 18px 16px;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  font-weight: 600;
+  font-size: 17px;
+  letter-spacing: 0.04em;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.25),
+    inset 0 -1px 0 rgba(0,0,0,0.18),
+    0 6px 14px rgba(204,0,0,0.30);
+  transition: transform 80ms, box-shadow 80ms, background 80ms;
 }
-.open-camera-btn:active { transform: scale(0.99); opacity: 0.92; }
-.open-camera-icon { font-size: 26px; }
+.open-camera-btn:active {
+  background: linear-gradient(180deg, #CC0000 0%, #990000 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.10),
+    inset 0 -1px 0 rgba(0,0,0,0.30),
+    0 2px 6px rgba(204,0,0,0.20);
+  transform: translateY(1px);
+}
+.open-camera-icon-svg {
+  width: 22px; height: 22px;
+  flex-shrink: 0;
+}
 
 /* ---------- Fullscreen camera ---------- */
 body.camera-fs-open { background: #000; }
@@ -818,20 +792,72 @@ body.camera-fs-open #app { display: none; }
   padding: 6px 12px;
   border-radius: 999px;
 }
-.cam-fs-controls {
+.cam-fs-bottom {
   position: relative;
   z-index: 3;
   margin-top: auto;
-  display: flex; align-items: center; justify-content: center;
-  gap: 22px;
-  padding: 14px 16px calc(22px + env(safe-area-inset-bottom));
+  display: flex; flex-direction: column; align-items: center;
+  gap: 14px;
+  padding: 16px 16px calc(28px + env(safe-area-inset-bottom));
 }
-.cam-fs-controls .cam-shutter {
-  border-color: #fff;
+
+/* Mode toggle pill */
+.cam-mode-toggle {
+  display: inline-flex;
+  background: rgba(0,0,0,0.55);
+  border-radius: 999px;
+  padding: 3px;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
-.cam-fs-controls .cam-rec-btn {
-  background: rgba(255,255,255,0.92);
-  border-color: rgba(255,255,255,0.6);
+.cam-mode-btn {
+  padding: 7px 18px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: rgba(255,255,255,0.7);
+  border-radius: 999px;
+  background: transparent;
+  transition: background 150ms, color 150ms;
+}
+.cam-mode-btn.active {
+  background: #fff;
+  color: #111;
+}
+
+/* Single capture button — iOS-style. Photo: white inner. Video: red inner.
+   Recording: red inner becomes a rounded square + ring pulses. */
+.cam-btn {
+  width: 88px; height: 88px;
+  border-radius: 50%;
+  border: 4px solid #fff;
+  background: transparent;
+  display: inline-flex; align-items: center; justify-content: center;
+  position: relative;
+  transition: transform 80ms ease;
+}
+.cam-btn:active { transform: scale(0.93); }
+.cam-btn-inner {
+  width: 72px; height: 72px;
+  border-radius: 50%;
+  background: #fff;
+  transition: width 220ms ease, height 220ms ease, border-radius 220ms ease, background 200ms;
+}
+.cam-btn.video .cam-btn-inner {
+  background: #ef4444;
+}
+.cam-btn.recording .cam-btn-inner {
+  width: 32px; height: 32px;
+  border-radius: 12px;
+  background: #ef4444;
+}
+.cam-btn.recording {
+  animation: cam-ring-pulse 1.4s ease-out infinite;
+}
+@keyframes cam-ring-pulse {
+  0%   { box-shadow: 0 0 0 0   rgba(255,255,255,0.55); }
+  70%  { box-shadow: 0 0 0 14px rgba(255,255,255,0.0); }
+  100% { box-shadow: 0 0 0 0   rgba(255,255,255,0.0); }
 }
 .cam-fs-error {
   position: absolute; inset: 0;
@@ -946,6 +972,26 @@ body.camera-fs-open #app { display: none; }
   font-size: 14px;
 }
 .attach-chip-x:active { background: #fff; color: #111; }
+
+/* Permission pre-prompt */
+.perm-backdrop {
+  align-items: center;
+  padding: 24px;
+}
+.perm-card {
+  background: #fff;
+  border-radius: 20px;
+  padding: 28px 24px;
+  max-width: 380px;
+  width: 100%;
+  text-align: center;
+  display: flex; flex-direction: column; gap: 12px; align-items: center;
+  box-shadow: 0 30px 60px rgba(0,0,0,0.25);
+}
+.perm-icons { font-size: 36px; }
+.perm-card h2 { margin: 0; font-size: 20px; }
+.perm-card p { margin: 0 0 4px; font-size: 14px; line-height: 1.4; }
+.perm-card .btn-primary { width: 100%; }
 
 /* Attachment chooser sheet */
 .attach-sheet, .attach-picker-sheet {

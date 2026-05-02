@@ -111,7 +111,13 @@
       state.view = state.user && window.Auth.isSignedIn() ? 'home' : 'login';
       state.booting = false;
       scheduleRender();
-      if (state.view === 'home') loadProjects();
+      if (state.view === 'home') {
+        loadProjects();
+        // Permissions are requested once at app level on first sign-in. On
+        // subsequent boots we just confirm the cached browser state — no
+        // prompt unless the user revoked it.
+        ensureMediaPermissions();
+      }
       // Reset items left in 'uploading' from a previous run (e.g. a tab
       // close mid-upload). Without this they'd be invisible to pumpQueue
       // which only picks up 'pending'/'error' rows.
@@ -166,6 +172,7 @@
       scheduleRender();
       loadProjects();
       pumpQueue();
+      ensureMediaPermissions(); // first-launch preflight
     } catch (err) {
       toast(err.message || 'Sign in failed', 'error', 6000);
     }
@@ -369,6 +376,69 @@
     if (mime.startsWith('audio/webm')) return 'webm';
     if (mime.startsWith('audio/')) return mime.split('/')[1].split(';')[0] || 'aud';
     return mime.split('/')[1]?.split(';')[0] || 'bin';
+  }
+
+  // ---------- Permissions preflight ----------
+  // Asked exactly once across app installs. After that we rely on the
+  // browser's own permission cache — getUserMedia returns instantly on
+  // 'granted', the in-camera "blocked" panel handles 'denied'.
+  let mediaPermissionsRequested = false;
+  async function ensureMediaPermissions() {
+    if (mediaPermissionsRequested) return;
+    mediaPermissionsRequested = true;
+    try {
+      const cam = await window.Camera.checkPermission('camera');
+      const mic = await window.Camera.checkPermission('microphone');
+      console.log('[perm] cam=', cam, 'mic=', mic);
+      const asked = await window.DB.kvGet('permissions.asked');
+      if ((cam === 'granted' && mic === 'granted') || asked) {
+        // Already settled — do nothing.
+        return;
+      }
+      // Show a one-time pre-prompt explaining why, then trigger the OS
+      // permission dialog from the user's tap on Continue.
+      await showPermissionPrePrompt();
+    } catch (err) {
+      console.warn('[perm] preflight error', err);
+    }
+  }
+
+  function showPermissionPrePrompt() {
+    return new Promise((resolve) => {
+      const root = document.getElementById('overlay-root');
+      root.innerHTML = `
+        <div class="modal-backdrop perm-backdrop">
+          <div class="perm-card">
+            <div class="perm-icons">📷&nbsp;&nbsp;🎙️</div>
+            <h2>One quick setup</h2>
+            <p class="muted">Site Visit needs camera and microphone access to capture photos, videos, and voice notes for your jobs. We only ask once.</p>
+            <button class="btn-primary big" id="perm-grant">Continue</button>
+            <button class="btn-ghost" id="perm-skip">Skip for now</button>
+          </div>
+        </div>
+      `;
+      const finish = async (granted) => {
+        await window.DB.kvSet('permissions.asked', true);
+        root.innerHTML = '';
+        if (granted) toast('Permissions granted', 'success', 1800);
+        resolve();
+      };
+      document.getElementById('perm-grant').addEventListener('click', async () => {
+        try {
+          const result = await window.Camera.preflightPermissions();
+          if (result === 'denied') {
+            toast('Permission denied — enable it later in browser settings', 'warn', 5000);
+            finish(false);
+          } else {
+            finish(true);
+          }
+        } catch (err) {
+          console.error('[perm] grant failed:', err);
+          finish(false);
+        }
+      });
+      document.getElementById('perm-skip').addEventListener('click', () => finish(false));
+    });
   }
 
   // ---------- Camera (fullscreen) ----------
@@ -1235,7 +1305,10 @@
           <div class="gps-row" id="gps-row"></div>
 
           <button class="open-camera-btn" id="open-cam-btn">
-            <span class="open-camera-icon">📷</span>
+            <svg class="open-camera-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 8.5C3 7.67 3.67 7 4.5 7H7l1.4-1.87A1.5 1.5 0 0 1 9.6 4.5h4.8c.47 0 .91.22 1.2.6L17 7h2.5c.83 0 1.5.67 1.5 1.5V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8.5z"/>
+              <circle cx="12" cy="13" r="4"/>
+            </svg>
             <span>Open Camera</span>
           </button>
 

@@ -2,21 +2,23 @@
   "name": "Dancon Site Visit Logger",
   "short_name": "Site Visit",
   "description": "Field documentation for Dancon Services — photos, videos, voice notes organized by job site in Google Drive.",
+  "id": "/dancon-site-visit-logger/",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
+  "display_override": ["standalone", "browser"],
   "orientation": "portrait",
   "background_color": "#0f172a",
-  "theme_color": "#0f172a",
+  "theme_color": "#CC0000",
   "icons": [
     {
-      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect fill='%230f172a' width='192' height='192'/%3E%3Cg fill='none' stroke='%23fbbf24' stroke-width='8' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='40' y='62' width='112' height='84' rx='10'/%3E%3Cpath d='M70 62 L82 46 H110 L122 62'/%3E%3Ccircle cx='96' cy='106' r='22'/%3E%3C/g%3E%3C/svg%3E",
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect fill='%230f172a' width='192' height='192'/%3E%3Cg fill='none' stroke='%23ff2222' stroke-width='8' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='40' y='62' width='112' height='84' rx='10'/%3E%3Cpath d='M70 62 L82 46 H110 L122 62'/%3E%3Ccircle cx='96' cy='106' r='22'/%3E%3C/g%3E%3C/svg%3E",
       "sizes": "192x192",
       "type": "image/svg+xml",
       "purpose": "any"
     },
     {
-      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect fill='%230f172a' width='512' height='512' rx='96'/%3E%3Cg fill='none' stroke='%23fbbf24' stroke-width='20' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='110' y='170' width='292' height='220' rx='24'/%3E%3Cpath d='M186 170 L218 124 H294 L326 170'/%3E%3Ccircle cx='256' cy='280' r='58'/%3E%3C/g%3E%3C/svg%3E",
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect fill='%230f172a' width='512' height='512' rx='96'/%3E%3Cg fill='none' stroke='%23ff2222' stroke-width='20' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='110' y='170' width='292' height='220' rx='24'/%3E%3Cpath d='M186 170 L218 124 H294 L326 170'/%3E%3Ccircle cx='256' cy='280' r='58'/%3E%3C/g%3E%3C/svg%3E",
       "sizes": "512x512",
       "type": "image/svg+xml",
       "purpose": "maskable any"

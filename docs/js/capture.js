@@ -1,16 +1,12 @@
-// Fullscreen camera overlay with continuous photo capture + video recording.
-// Permission handling:
-//   - Uses navigator.permissions.query({name:'camera'}) where supported to
-//     check state up front. If 'granted', getUserMedia returns instantly
-//     with no prompt. If 'denied', shows a one-time "how to enable" panel.
-//     If 'prompt', the OS prompts on first getUserMedia call (once); the
-//     browser caches the answer afterwards.
-//
-// Photo quality: snapshots at the camera's native resolution (no
-// downscaling) at JPEG quality 0.95.
-//
-// History: pushes a state on open so the browser Back gesture closes the
-// overlay instead of leaving the project screen.
+// Fullscreen camera overlay.
+//   - PHOTO | VIDEO pill toggle above a single capture button
+//   - Photo mode: white outer ring + white inner circle. Tap = still frame.
+//   - Video mode: white outer ring + red inner circle. Tap = start; the
+//     inner shape animates to a rounded square and the outer ring pulses.
+//     Tap again = stop.
+//   - Permission preflight via navigator.permissions.query — no prompts
+//     for a granted state, clear "how to enable" panel for denied.
+//   - history.pushState / popstate so the browser Back gesture closes us.
 window.Camera = (function () {
   let stream = null;
   let recorder = null;
@@ -19,12 +15,13 @@ window.Camera = (function () {
   let recStartTs = 0;
   let recTimerHandle = null;
   let counter = 0;
+  let mode = 'photo'; // 'photo' | 'video'
   let isOpen = false;
   let closing = false;
   let onCaptureCb = null;
   let onCloseCb = null;
   let popstateListener = null;
-  let mode = 'multi'; // 'multi' (default) or 'single' (one photo then auto-close)
+  let singleShot = false;
 
   function root() { return document.getElementById('overlay-root'); }
 
@@ -42,14 +39,12 @@ window.Camera = (function () {
     return '';
   }
 
-  async function checkPermission() {
+  async function checkPermission(name) {
     if (!navigator.permissions?.query) return 'unknown';
     try {
-      const status = await navigator.permissions.query({ name: 'camera' });
+      const status = await navigator.permissions.query({ name });
       return status.state; // 'granted' | 'denied' | 'prompt'
-    } catch (e) {
-      return 'unknown';
-    }
+    } catch (e) { return 'unknown'; }
   }
 
   async function open(opts = {}) {
@@ -58,8 +53,9 @@ window.Camera = (function () {
     closing = false;
     onCaptureCb = opts.onCapture || null;
     onCloseCb = opts.onClose || null;
-    mode = opts.mode || 'multi';
+    singleShot = opts.mode === 'single';
     counter = 0;
+    mode = 'photo'; // always start in photo mode
 
     document.body.classList.add('camera-fs-open');
 
@@ -69,35 +65,48 @@ window.Camera = (function () {
         <div id="cam-fs-error" class="cam-fs-error" hidden></div>
 
         <div class="cam-fs-top">
-          <button id="cam-fs-close" class="cam-fs-icon" aria-label="Close">✕</button>
+          <button id="cam-fs-close" class="cam-fs-icon" aria-label="Close">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+              <path d="M6 6 L18 18"/><path d="M18 6 L6 18"/>
+            </svg>
+          </button>
           <div id="cam-fs-rec-bar" class="cam-fs-rec" hidden>
             <span class="rec-dot"></span>
             <span class="rec-time">0:00</span>
           </div>
-          <div class="cam-fs-counter" id="cam-fs-counter">${counter} captured</div>
+          <div class="cam-fs-counter" id="cam-fs-counter">${counter}</div>
         </div>
 
-        <div class="cam-fs-controls">
-          <button id="cam-fs-shutter" class="cam-shutter" aria-label="Take photo"></button>
-          ${mode === 'multi' ? '<button id="cam-fs-rec" class="cam-rec-btn" aria-label="Record video"></button>' : ''}
+        <div class="cam-fs-bottom">
+          ${singleShot ? '' : `
+            <div class="cam-mode-toggle" id="cam-mode-toggle" role="tablist">
+              <button class="cam-mode-btn active" data-mode="photo">PHOTO</button>
+              <button class="cam-mode-btn" data-mode="video">VIDEO</button>
+            </div>
+          `}
+          <button class="cam-btn ${mode}" id="cam-btn" aria-label="Capture">
+            <span class="cam-btn-inner"></span>
+          </button>
         </div>
       </div>
     `;
 
     document.getElementById('cam-fs-close').addEventListener('click', () => close());
-    document.getElementById('cam-fs-shutter').addEventListener('click', onShutter);
-    document.getElementById('cam-fs-rec')?.addEventListener('click', onRec);
+    document.getElementById('cam-btn').addEventListener('click', onCaptureTap);
+    if (!singleShot) {
+      root().querySelectorAll('[data-mode]').forEach((b) => {
+        b.addEventListener('click', () => setMode(b.dataset.mode));
+      });
+    }
 
-    // History entry so Back closes us instead of leaving the project screen.
     history.pushState({ overlay: 'camera' }, '');
     popstateListener = () => close({ fromPop: true });
     window.addEventListener('popstate', popstateListener);
 
-    // Permission preflight — short-circuit denied state with a clear message
-    // so we don't fire a getUserMedia that would just reject again.
-    const perm = await checkPermission();
-    console.log('[camera] permission state:', perm);
-    if (perm === 'denied') {
+    // Permission preflight — short-circuit denied with a clear panel.
+    const camPerm = await checkPermission('camera');
+    console.log('[camera] permission state:', camPerm);
+    if (camPerm === 'denied') {
       showDenied();
       return;
     }
@@ -109,15 +118,12 @@ window.Camera = (function () {
           width:  { ideal: 4096 },
           height: { ideal: 2160 }
         },
-        audio: mode === 'multi' // only acquire mic when video recording is allowed
+        audio: !singleShot
       });
     } catch (err) {
       console.error('[camera] getUserMedia failed:', err);
-      if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
-        showDenied();
-      } else {
-        showError(err.message || err.name || 'Camera unavailable');
-      }
+      if (err.name === 'NotAllowedError' || err.name === 'SecurityError') showDenied();
+      else showError(err.message || err.name || 'Camera unavailable');
       return;
     }
 
@@ -129,6 +135,123 @@ window.Camera = (function () {
     video.setAttribute('playsinline', '');
     video.setAttribute('webkit-playsinline', '');
     try { await video.play(); } catch (e) { /* iOS sometimes needs a tap */ }
+  }
+
+  function setMode(m) {
+    if (m === mode) return;
+    if (recorder && recorder.state === 'recording') return; // can't change mid-record
+    mode = m;
+    const btn = document.getElementById('cam-btn');
+    if (btn) {
+      btn.classList.remove('photo', 'video');
+      btn.classList.add(mode);
+    }
+    root().querySelectorAll('[data-mode]').forEach((b) => {
+      b.classList.toggle('active', b.dataset.mode === mode);
+    });
+  }
+
+  function onCaptureTap() {
+    if (mode === 'photo') return takePhoto();
+    // video mode
+    if (!recorder || recorder.state === 'inactive') startVideo();
+    else stopVideo();
+  }
+
+  async function takePhoto() {
+    if (!stream) return;
+    if (recorder && recorder.state === 'recording') return;
+    const video = document.getElementById('cam-fs-video');
+    if (!video || !video.videoWidth) {
+      await new Promise((r) => setTimeout(r, 120));
+      if (!video.videoWidth) { console.warn('[camera] not ready'); return; }
+    }
+    // Native sensor resolution — no downscaling.
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    const blob = await new Promise((resolve) =>
+      canvas.toBlob(resolve, 'image/jpeg', 0.95)
+    );
+    if (!blob) { console.error('[camera] toBlob returned null'); return; }
+    flashStage();
+    counter += 1;
+    const counterEl = document.getElementById('cam-fs-counter');
+    if (counterEl) counterEl.textContent = String(counter);
+    if (onCaptureCb) {
+      try { onCaptureCb(blob, 'image/jpeg', 'photo'); }
+      catch (err) { console.error('[camera] onCapture threw:', err); }
+    }
+    if (singleShot) close();
+  }
+
+  function startVideo() {
+    if (!stream) return;
+    recMime = pickVideoMime();
+    try {
+      recorder = recMime
+        ? new MediaRecorder(stream, { mimeType: recMime })
+        : new MediaRecorder(stream);
+    } catch (err) {
+      console.error('[camera] MediaRecorder failed:', err);
+      return;
+    }
+    chunks = [];
+    recorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size) chunks.push(ev.data);
+    };
+    recorder.onstop = () => {
+      const mime = recorder?.mimeType || recMime || 'video/webm';
+      const blob = new Blob(chunks, { type: mime });
+      chunks = [];
+      counter += 1;
+      const counterEl = document.getElementById('cam-fs-counter');
+      if (counterEl) counterEl.textContent = String(counter);
+      hideRecBar();
+      document.getElementById('cam-btn')?.classList.remove('recording');
+      if (onCaptureCb && blob.size > 0) {
+        try { onCaptureCb(blob, mime, 'video'); }
+        catch (err) { console.error('[camera] onCapture (video) threw:', err); }
+      }
+    };
+    recorder.start(1000);
+    recStartTs = Date.now();
+    document.getElementById('cam-btn')?.classList.add('recording');
+    showRecBar();
+  }
+
+  function stopVideo() {
+    if (!recorder || recorder.state === 'inactive') return;
+    try { recorder.stop(); } catch (e) { /* ignore */ }
+  }
+
+  function showRecBar() {
+    const bar = document.getElementById('cam-fs-rec-bar');
+    if (!bar) return;
+    bar.hidden = false;
+    bar.querySelector('.rec-time').textContent = '0:00';
+    if (recTimerHandle) clearInterval(recTimerHandle);
+    recTimerHandle = setInterval(() => {
+      const s = Math.floor((Date.now() - recStartTs) / 1000);
+      const mm = Math.floor(s / 60);
+      const ss = String(s % 60).padStart(2, '0');
+      const el = bar.querySelector('.rec-time');
+      if (el) el.textContent = `${mm}:${ss}`;
+    }, 250);
+  }
+
+  function hideRecBar() {
+    const bar = document.getElementById('cam-fs-rec-bar');
+    if (bar) bar.hidden = true;
+    if (recTimerHandle) { clearInterval(recTimerHandle); recTimerHandle = null; }
+  }
+
+  function flashStage() {
+    const stage = document.getElementById('cam-fs');
+    if (!stage) return;
+    stage.classList.add('flash');
+    setTimeout(() => stage.classList.remove('flash'), 200);
   }
 
   function showDenied() {
@@ -170,121 +293,6 @@ window.Camera = (function () {
     })[c]);
   }
 
-  async function onShutter() {
-    if (!stream) return;
-    if (recorder && recorder.state === 'recording') return; // ignore while recording
-    const video = document.getElementById('cam-fs-video');
-    if (!video || !video.videoWidth) {
-      // Camera not ready — let the stream produce a frame, then try once more.
-      await new Promise((r) => setTimeout(r, 120));
-      if (!video.videoWidth) {
-        console.warn('[camera] not ready');
-        return;
-      }
-    }
-    // Snapshot at native resolution. No downscaling — full quality.
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0);
-    const blob = await new Promise((resolve) =>
-      canvas.toBlob(resolve, 'image/jpeg', 0.95)
-    );
-    if (!blob) {
-      console.error('[camera] toBlob returned null');
-      return;
-    }
-    flashStage();
-    counter += 1;
-    const counterEl = document.getElementById('cam-fs-counter');
-    if (counterEl) counterEl.textContent = `${counter} captured`;
-    if (onCaptureCb) {
-      try { onCaptureCb(blob, 'image/jpeg', 'photo'); }
-      catch (err) { console.error('[camera] onCapture threw:', err); }
-    }
-    if (mode === 'single') {
-      close();
-    }
-  }
-
-  function onRec() {
-    if (!stream) return;
-    if (recorder && recorder.state === 'recording') {
-      stopVideo();
-    } else {
-      startVideo();
-    }
-  }
-
-  function startVideo() {
-    if (!stream) return;
-    recMime = pickVideoMime();
-    try {
-      // No artificial bitrate cap — full quality recording per spec.
-      recorder = recMime
-        ? new MediaRecorder(stream, { mimeType: recMime })
-        : new MediaRecorder(stream);
-    } catch (err) {
-      console.error('[camera] MediaRecorder failed:', err);
-      return;
-    }
-    chunks = [];
-    recorder.ondataavailable = (ev) => {
-      if (ev.data && ev.data.size) chunks.push(ev.data);
-    };
-    recorder.onstop = () => {
-      const mime = recorder?.mimeType || recMime || 'video/webm';
-      const blob = new Blob(chunks, { type: mime });
-      chunks = [];
-      counter += 1;
-      const counterEl = document.getElementById('cam-fs-counter');
-      if (counterEl) counterEl.textContent = `${counter} captured`;
-      hideRecBar();
-      if (onCaptureCb && blob.size > 0) {
-        try { onCaptureCb(blob, mime, 'video'); }
-        catch (err) { console.error('[camera] onCapture (video) threw:', err); }
-      }
-    };
-    recorder.start(1000);
-    recStartTs = Date.now();
-    document.getElementById('cam-fs-rec')?.classList.add('recording');
-    showRecBar();
-  }
-
-  function stopVideo() {
-    if (!recorder || recorder.state === 'inactive') return;
-    try { recorder.stop(); } catch (e) { /* ignore */ }
-    document.getElementById('cam-fs-rec')?.classList.remove('recording');
-  }
-
-  function showRecBar() {
-    const bar = document.getElementById('cam-fs-rec-bar');
-    if (!bar) return;
-    bar.hidden = false;
-    bar.querySelector('.rec-time').textContent = '0:00';
-    if (recTimerHandle) clearInterval(recTimerHandle);
-    recTimerHandle = setInterval(() => {
-      const s = Math.floor((Date.now() - recStartTs) / 1000);
-      const mm = Math.floor(s / 60);
-      const ss = String(s % 60).padStart(2, '0');
-      const el = bar.querySelector('.rec-time');
-      if (el) el.textContent = `${mm}:${ss}`;
-    }, 250);
-  }
-
-  function hideRecBar() {
-    const bar = document.getElementById('cam-fs-rec-bar');
-    if (bar) bar.hidden = true;
-    if (recTimerHandle) { clearInterval(recTimerHandle); recTimerHandle = null; }
-  }
-
-  function flashStage() {
-    const stage = document.getElementById('cam-fs');
-    if (!stage) return;
-    stage.classList.add('flash');
-    setTimeout(() => stage.classList.remove('flash'), 200);
-  }
-
   function close(opts = {}) {
     if (!isOpen || closing) return;
     closing = true;
@@ -297,9 +305,7 @@ window.Camera = (function () {
     if (recTimerHandle) { clearInterval(recTimerHandle); recTimerHandle = null; }
 
     if (stream) {
-      stream.getTracks().forEach((t) => {
-        try { t.stop(); } catch (e) { /* ignore */ }
-      });
+      stream.getTracks().forEach((t) => { try { t.stop(); } catch (e) { /* ignore */ } });
       stream = null;
     }
 
@@ -307,16 +313,15 @@ window.Camera = (function () {
       window.removeEventListener('popstate', popstateListener);
       popstateListener = null;
     }
-    if (!opts.fromPop) {
-      // X tapped: pop the history entry we pushed on open.
-      try { history.back(); } catch (e) { /* ignore */ }
-    }
+    if (!opts.fromPop) { try { history.back(); } catch (e) { /* ignore */ } }
 
     root().innerHTML = '';
     document.body.classList.remove('camera-fs-open');
     isOpen = false;
     closing = false;
     counter = 0;
+    mode = 'photo';
+    singleShot = false;
 
     const cb = onCloseCb;
     onCaptureCb = null;
@@ -324,12 +329,30 @@ window.Camera = (function () {
     if (cb) { try { cb(); } catch (err) { console.error('[camera] onClose threw:', err); } }
   }
 
-  function isCameraOpen() { return isOpen; }
+  // Asked once at app startup. Triggers the OS camera+mic prompts so any
+  // later open() finds them in 'granted' state. Caller should pass `silent:
+  // true` to skip showing UI on success.
+  async function preflightPermissions() {
+    const camState = await checkPermission('camera');
+    const micState = await checkPermission('microphone');
+    if (camState === 'granted' && micState === 'granted') return 'granted';
+    if (camState === 'denied' || micState === 'denied') return 'denied';
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      s.getTracks().forEach((t) => t.stop());
+      return 'granted';
+    } catch (err) {
+      console.warn('[camera] preflight rejected:', err.name);
+      if (err.name === 'NotAllowedError') return 'denied';
+      return 'error';
+    }
+  }
 
   return {
     open,
     close,
     checkPermission,
-    isOpen: isCameraOpen
+    preflightPermissions,
+    isOpen: () => isOpen
   };
 })();
