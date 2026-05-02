@@ -1,6 +1,24 @@
 // Top-level app: state, screens, upload queue runner, glue between modules.
+//
+// Defensive boot: a top-level try-catch around module wiring + a hard
+// timeout in boot() so we never get stuck on the white "Loading…" screen
+// even if Google Identity Services fails to load or IndexedDB hangs.
 (function () {
-  const { escapeHtml, fmtTimestampForFilename, fmtDateTime, fmtBytes, fmtRelative, toast } = window.UI;
+  let UI;
+  try {
+    UI = window.UI;
+    if (!UI || !window.DB || !window.Auth || !window.Drive || !window.Camera || !window.AudioNote || !window.Notes || !window.Annotate) {
+      throw new Error('A required module failed to load. Reload the page.');
+    }
+  } catch (err) {
+    document.getElementById('app').innerHTML =
+      `<div class="error-screen"><h2>Could not start</h2><p class="muted">${
+        (err && err.message) || 'Module load failed'
+      }</p><p class="muted small">Pull to refresh, or hard-reload the page.</p></div>`;
+    return;
+  }
+
+  const { escapeHtml, fmtTimestampForFilename, fmtDateTime, fmtBytes, fmtRelative, toast } = UI;
 
   const state = {
     user: null,
@@ -12,24 +30,35 @@
     currentProjectId: null,
     currentProjectName: null,
 
-    // Browse
-    projects: [],         // [{id, name, modifiedTime}]
+    // Home / projects list
+    projects: [],
     projectsLoading: false,
     projectFilter: '',
 
-    // Capture
-    queueCounts: { pending: 0, uploading: 0, error: 0, success: 0 },
+    // Project (capture) screen
+    cam: null,                  // Camera controller while attached
+    camError: null,
+    camCounter: 0,
+    camRecording: false,
+    recStartTs: 0,
+    recTimerHandle: null,
 
-    // Gallery
+    thumbs: [],                 // unified list of photos this project (queued + uploaded)
+    thumbsLoading: false,
+    notesEntries: [],
+    notesFileId: null,
+    notesLoading: false,
+
+    // Drive (gallery) view
     galleryFiles: [],
     galleryLoading: false,
 
-    // View
-    view: 'login' // 'login' | 'home' | 'capture' | 'gallery'
+    view: 'login'               // 'login' | 'home' | 'capture' | 'gallery'
   };
 
   let queueRunnerActive = false;
   let _renderHandle = null;
+
   function scheduleRender() {
     if (_renderHandle) return;
     _renderHandle = requestAnimationFrame(() => {
@@ -39,9 +68,25 @@
   }
 
   // ---------- Initialization ----------
-  document.addEventListener('DOMContentLoaded', boot);
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
 
   async function boot() {
+    // Hard floor: if boot hasn't progressed in 8s, force the login screen so
+    // the user is never stuck on white. Real auth happens on click anyway.
+    const safety = setTimeout(() => {
+      if (state.booting) {
+        state.booting = false;
+        if (!state.initError) state.initError = null;
+        if (!state.user) state.view = 'login';
+        scheduleRender();
+        console.warn('Boot safety timeout fired');
+      }
+    }, 8000);
+
     try {
       await window.DB.open();
       await window.Auth.init();
@@ -51,20 +96,21 @@
       });
       state.user = window.Auth.getUser();
       if (state.user && !window.Auth.isSignedIn()) {
-        // Cached user but token not in memory — try silent token refresh.
-        try { await window.Auth.getAccessToken(); } catch (e) { /* user must click sign in */ }
+        try { await window.Auth.getAccessToken(); }
+        catch (e) { /* user must click Sign in */ }
       }
       state.view = state.user && window.Auth.isSignedIn() ? 'home' : 'login';
       state.booting = false;
       scheduleRender();
-
-      if (state.view === 'home') await loadProjects();
+      if (state.view === 'home') loadProjects(); // background
       runQueue();
     } catch (err) {
+      console.error('Boot failed:', err);
       state.booting = false;
       state.initError = err.message || String(err);
-      console.error(err);
       scheduleRender();
+    } finally {
+      clearTimeout(safety);
     }
   }
 
@@ -80,20 +126,21 @@
     scheduleRender();
   });
 
-  // ---------- Auth handlers ----------
+  // ---------- Auth ----------
   async function onSignInClick() {
     try {
       await window.Auth.signIn();
       state.user = window.Auth.getUser();
       state.view = 'home';
       scheduleRender();
-      await loadProjects();
+      loadProjects();
       runQueue();
     } catch (err) {
       toast(err.message || 'Sign in failed', 'error', 6000);
     }
   }
   async function onSignOutClick() {
+    detachCamera();
     await window.Auth.signOut();
     state.user = null;
     state.currentProjectId = null;
@@ -103,19 +150,19 @@
     scheduleRender();
   }
 
-  // ---------- Projects ----------
+  // ---------- Projects (home) ----------
   async function loadProjects() {
     state.projectsLoading = true;
-    scheduleRender();
+    updateRecentList();
     try {
-      const folders = await window.Drive.listProjectFolders({ pageSize: 100 });
+      const folders = await window.Drive.listProjectFolders({ pageSize: 200 });
       state.projects = folders;
     } catch (err) {
       console.error(err);
       toast(`Could not list projects: ${err.message}`, 'error');
     } finally {
       state.projectsLoading = false;
-      scheduleRender();
+      updateRecentList();
     }
   }
 
@@ -124,29 +171,42 @@
     if (!name) { toast('Type a project name', 'warn'); return; }
     try {
       const { id, name: actualName, created } = await window.Drive.ensureProjectFolder(name);
-      state.currentProjectId = id;
-      state.currentProjectName = actualName;
-      state.view = 'capture';
-      scheduleRender();
-      if (created) toast(`Created "${actualName}"`, 'info');
-      maybeCaptureGPS(id, actualName);
+      enterProject(id, actualName, { created });
     } catch (err) {
       console.error(err);
       toast(`Could not open project: ${err.message}`, 'error', 6000);
     }
   }
 
-  async function openProject(id, name) {
+  async function enterProject(id, name, { created = false } = {}) {
     state.currentProjectId = id;
     state.currentProjectName = name;
     state.view = 'capture';
+    state.thumbs = [];
+    state.thumbsLoading = true;
+    state.notesEntries = [];
+    state.notesFileId = null;
+    state.notesLoading = true;
+    state.camCounter = 0;
     scheduleRender();
+    if (created) toast(`Created "${name}"`, 'info');
+    // Restore notes-fileId cache.
+    try {
+      const cached = await window.DB.kvGet(`notesFileId:${id}`);
+      if (cached) state.notesFileId = cached;
+    } catch { /* ignore */ }
+    // Kick off background loads.
+    refreshProjectMedia();
+    refreshProjectNotes();
     maybeCaptureGPS(id, name);
   }
 
   function leaveProject() {
+    detachCamera();
     state.currentProjectId = null;
     state.currentProjectName = null;
+    state.thumbs = [];
+    state.notesEntries = [];
     state.view = 'home';
     scheduleRender();
     loadProjects();
@@ -157,7 +217,7 @@
     if (!('geolocation' in navigator)) return;
     try {
       const existing = await window.Drive.findFileInFolder(folderId, 'gps.txt');
-      if (existing) return; // already captured
+      if (existing) return;
     } catch (err) {
       console.warn('GPS check failed:', err.message);
       return;
@@ -174,9 +234,8 @@
           `Accuracy (m): ${Math.round(accuracy)}\n` +
           `Maps link: ${link}\n`;
         try {
-          // Re-check in case of race with another teammate.
-          const existing = await window.Drive.findFileInFolder(folderId, 'gps.txt');
-          if (existing) return;
+          const recheck = await window.Drive.findFileInFolder(folderId, 'gps.txt');
+          if (recheck) return;
           await window.Drive.uploadMultipart({
             folderId,
             fileName: 'gps.txt',
@@ -193,21 +252,28 @@
     );
   }
 
-  // ---------- Visit log ----------
+  // ---------- Visit log + filenames ----------
   async function appendVisitLog(folderId, summary) {
     const line = `${fmtDateTime()} — ${state.user?.name || 'unknown'} — ${summary}\n`;
     try {
-      await window.Drive.appendToTextFile({
+      const cachedKey = `visitLogId:${folderId}`;
+      const cached = await window.DB.kvGet(cachedKey);
+      const result = await window.Drive.appendToTextFile({
         folderId,
         fileName: 'visit_log.txt',
-        lineOrText: line
+        lineOrText: line,
+        cachedFileId: cached || null
       });
+      if (result?.id && result.id !== cached) {
+        await window.DB.kvSet(cachedKey, result.id);
+      }
     } catch (err) {
       console.warn('visit_log append failed:', err.message);
     }
   }
 
-  // ---------- Filename builder ----------
+  function pad2(n) { return String(n).padStart(2, '0'); }
+
   async function nextFileName(folderId, ext) {
     const today = new Date();
     const dayKey = `${today.getFullYear()}-${pad2(today.getMonth() + 1)}-${pad2(today.getDate())}`;
@@ -221,7 +287,6 @@
     const seq = String(next).padStart(3, '0');
     return `${stamp}_${first}_${seq}.${ext}`;
   }
-  function pad2(n) { return String(n).padStart(2, '0'); }
 
   function extFromMime(mime) {
     if (!mime) return 'bin';
@@ -236,48 +301,147 @@
     return mime.split('/')[1]?.split(';')[0] || 'bin';
   }
 
-  // ---------- Capture handlers ----------
-  function startPhoto() {
-    if (!ensureProject()) return;
-    window.Camera.open({
-      kind: 'photo',
-      onCapture: (blob, mime, kind) => enqueueCapture(blob, mime, kind),
-      onClose: () => scheduleRender()
-    });
+  // ---------- Camera (inline) ----------
+  async function attachCamera() {
+    const videoEl = document.getElementById('cam-video');
+    if (!videoEl) return;
+    if (state.cam) return;
+    state.camError = null;
+    try {
+      state.cam = await window.Camera.attach(videoEl, { withAudio: true });
+      state.camError = null;
+      updateCamErrorDOM();
+    } catch (err) {
+      console.warn('Camera attach failed:', err);
+      state.camError = err.message || String(err);
+      state.cam = null;
+      updateCamErrorDOM();
+    }
   }
-  function startVideo() {
-    if (!ensureProject()) return;
-    window.Camera.open({
-      kind: 'video',
-      onCapture: (blob, mime, kind) => enqueueCapture(blob, mime, kind),
-      onClose: () => scheduleRender()
-    });
+
+  function detachCamera() {
+    if (state.cam) {
+      try { state.cam.stop(); } catch (e) { /* ignore */ }
+      state.cam = null;
+    }
+    if (state.recTimerHandle) {
+      clearInterval(state.recTimerHandle);
+      state.recTimerHandle = null;
+    }
+    state.camRecording = false;
+    state.camCounter = 0;
   }
-  function startAudio() {
+
+  async function onShutterClick() {
+    if (!state.cam) {
+      attachCamera(); // user gesture — retry
+      return;
+    }
+    if (state.camRecording) return;
+    let blob;
+    try { blob = await state.cam.takePhoto(); }
+    catch (err) {
+      toast(`Photo failed: ${err.message}`, 'error');
+      return;
+    }
+    flashStage();
+    state.camCounter += 1;
+    updateCamCounterDOM();
+    enqueueCapture(blob, blob.type || 'image/jpeg', 'photo');
+  }
+
+  async function onRecordClick() {
+    if (!state.cam) {
+      attachCamera();
+      return;
+    }
+    if (state.camRecording) {
+      // stop
+      const btn = document.getElementById('rec-btn');
+      btn?.classList.remove('recording');
+      const recBar = document.getElementById('rec-bar');
+      if (recBar) recBar.hidden = true;
+      if (state.recTimerHandle) { clearInterval(state.recTimerHandle); state.recTimerHandle = null; }
+      state.camRecording = false;
+      try {
+        const { blob, mime } = await state.cam.stopVideo();
+        state.camCounter += 1;
+        updateCamCounterDOM();
+        enqueueCapture(blob, mime, 'video');
+      } catch (err) {
+        toast(`Video failed: ${err.message}`, 'error');
+      }
+      return;
+    }
+    // start
+    try {
+      state.cam.startVideo();
+      state.camRecording = true;
+      state.recStartTs = Date.now();
+      const btn = document.getElementById('rec-btn');
+      btn?.classList.add('recording');
+      const recBar = document.getElementById('rec-bar');
+      if (recBar) {
+        recBar.hidden = false;
+        recBar.querySelector('.rec-time').textContent = '0:00';
+      }
+      if (state.recTimerHandle) clearInterval(state.recTimerHandle);
+      state.recTimerHandle = setInterval(() => {
+        const s = Math.floor((Date.now() - state.recStartTs) / 1000);
+        const mm = Math.floor(s / 60);
+        const ss = String(s % 60).padStart(2, '0');
+        const el = document.querySelector('#rec-bar .rec-time');
+        if (el) el.textContent = `${mm}:${ss}`;
+      }, 250);
+    } catch (err) {
+      toast(`Could not start recording: ${err.message}`, 'error');
+    }
+  }
+
+  function flashStage() {
+    const stage = document.getElementById('cam-stage');
+    if (!stage) return;
+    stage.classList.add('flash');
+    setTimeout(() => stage.classList.remove('flash'), 220);
+  }
+
+  // ---------- Voice & notes ----------
+  function startVoiceNote() {
     if (!ensureProject()) return;
     window.AudioNote.open({
-      onCapture: (blob, mime, kind) => enqueueCapture(blob, mime, kind),
-      onClose: () => scheduleRender()
+      onCapture: (blob, mime) => enqueueCapture(blob, mime, 'audio'),
+      // No re-render on close — the modal overlays the project screen, so
+      // the underlying live <video> must stay mounted with its srcObject.
+      onClose: () => { /* no-op */ }
     });
   }
-  function startNote() {
+
+  async function saveNote() {
     if (!ensureProject()) return;
+    const ta = document.getElementById('notes-textarea');
+    const text = ta?.value.trim();
+    if (!text) return;
     const folderId = state.currentProjectId;
-    window.Notes.open({
-      onSave: async (text) => {
-        const stamp = fmtDateTime();
-        const tech = state.user?.name || 'unknown';
-        const block = `\n--- ${stamp} — ${tech} ---\n${text}\n`;
-        await window.Drive.appendToTextFile({
-          folderId,
-          fileName: 'notes.txt',
-          lineOrText: block
-        });
-        toast('Note saved', 'success');
-        await appendVisitLog(folderId, 'added text note');
-      },
-      onClose: () => scheduleRender()
-    });
+    const stamp = fmtDateTime();
+    const tech = state.user?.name || 'unknown';
+    const block = `\n--- ${stamp} — ${tech} ---\n${text}\n`;
+    try {
+      const result = await window.Drive.appendToTextFile({
+        folderId,
+        fileName: 'notes.txt',
+        lineOrText: block,
+        cachedFileId: state.notesFileId
+      });
+      state.notesFileId = result.id;
+      await window.DB.kvSet(`notesFileId:${folderId}`, result.id);
+      ta.value = '';
+      toast('Note saved', 'success');
+      await appendVisitLog(folderId, 'added text note');
+      // Refresh notes inline.
+      refreshProjectNotes();
+    } catch (err) {
+      toast(`Note save failed: ${err.message}`, 'error', 6000);
+    }
   }
 
   function ensureProject() {
@@ -288,6 +452,7 @@
     return true;
   }
 
+  // ---------- Capture queue ----------
   async function enqueueCapture(blob, mime, kind) {
     const folderId = state.currentProjectId;
     const folderName = state.currentProjectName;
@@ -307,26 +472,28 @@
       status: 'pending',
       attempts: 0
     });
-    await refreshQueueCounts();
-    toast(`Queued ${kind}: ${fileName}`, 'info', 1800);
-    runQueue();
-  }
 
-  // ---------- Upload queue runner ----------
-  async function refreshQueueCounts() {
-    const all = await window.DB.queueAll();
-    const counts = { pending: 0, uploading: 0, error: 0, success: 0 };
-    for (const item of all) counts[item.status] = (counts[item.status] || 0) + 1;
-    state.queueCounts = counts;
-    scheduleRender();
+    if (kind === 'photo') {
+      const previewUrl = URL.createObjectURL(blob);
+      state.thumbs.unshift({
+        type: 'photo',
+        src: previewUrl,
+        name: fileName,
+        status: 'queued',
+        queueId: item.id,
+        objectUrl: previewUrl
+      });
+      updateThumbsDOM();
+    }
+    runQueue();
   }
 
   async function runQueue() {
     if (queueRunnerActive) return;
-    if (!state.isOnline) { await refreshQueueCounts(); return; }
+    if (!state.isOnline) return;
     if (!window.Auth.isSignedIn()) {
       try { await window.Auth.getAccessToken(); }
-      catch (e) { await refreshQueueCounts(); return; }
+      catch (e) { return; }
     }
 
     queueRunnerActive = true;
@@ -334,15 +501,13 @@
       while (true) {
         const pending = await window.DB.queuePending();
         if (pending.length === 0) break;
-        // Sort by attempts asc then createdAt asc — give failed items a chance later.
         pending.sort((a, b) => (a.attempts - b.attempts) || (a.createdAt - b.createdAt));
         const item = pending[0];
 
         await window.DB.queueUpdate(item.id, { status: 'uploading' });
-        await refreshQueueCounts();
 
         try {
-          await window.Drive.uploadFile({
+          const result = await window.Drive.uploadFile({
             folderId: item.projectId,
             fileName: item.fileName,
             mimeType: item.mimeType,
@@ -351,8 +516,17 @@
           await appendVisitLog(item.projectId,
             `uploaded ${item.kind || 'file'}: ${item.fileName} (${fmtBytes(item.blob.size)})`);
           await window.DB.queueUpdate(item.id, { status: 'success' });
-          // Successful items can drop out of the queue immediately.
           await window.DB.queueDelete(item.id);
+
+          // Patch thumb to success state.
+          if (state.currentProjectId === item.projectId) {
+            const t = state.thumbs.find((x) => x.queueId === item.id);
+            if (t) {
+              t.status = 'success';
+              t.fileId = result?.id || null;
+              updateThumbsDOM();
+            }
+          }
         } catch (err) {
           console.error('Upload failed', err);
           const attempts = (item.attempts || 0) + 1;
@@ -361,66 +535,133 @@
             attempts,
             lastError: err.message || String(err)
           });
-          await refreshQueueCounts();
-
-          // Backoff before next pass — but only block if there are remaining errors.
-          const delay = Math.min(
-            window.CONFIG.RETRY_BASE_DELAY * Math.pow(2, attempts - 1),
-            window.CONFIG.RETRY_MAX_DELAY
-          );
-          await new Promise((r) => setTimeout(r, delay));
-          if (attempts >= 6) {
-            // Stop the auto-runner; user can hit Retry to try again.
-            break;
+          if (state.currentProjectId === item.projectId) {
+            const t = state.thumbs.find((x) => x.queueId === item.id);
+            if (t) { t.status = 'failed'; updateThumbsDOM(); }
           }
+          const delay = Math.min(60000, 2000 * Math.pow(2, attempts - 1));
+          await new Promise((r) => setTimeout(r, delay));
+          if (attempts >= 6) break;
         }
-        await refreshQueueCounts();
       }
     } finally {
       queueRunnerActive = false;
-      await refreshQueueCounts();
     }
   }
 
-  async function retryAllErrored() {
-    const all = await window.DB.queueAll();
-    for (const item of all.filter((i) => i.status === 'error')) {
-      await window.DB.queueUpdate(item.id, { status: 'pending', attempts: 0, lastError: null });
+  // ---------- Project media (thumbs + notes) ----------
+  async function refreshProjectMedia() {
+    if (!state.currentProjectId) return;
+    state.thumbsLoading = true;
+    updateThumbsDOM();
+    try {
+      const files = await window.Drive.listFolderFiles(state.currentProjectId);
+      const photos = files
+        .filter((f) => (f.mimeType || '').startsWith('image/'))
+        .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+
+      // Preserve in-flight queued/failed items not yet in Drive.
+      const pendingThumbs = state.thumbs.filter((t) => t.status !== 'success');
+      const driveThumbs = photos.map((f) => ({
+        type: 'photo',
+        src: f.thumbnailLink || '',
+        name: f.name,
+        status: 'success',
+        fileId: f.id
+      }));
+      state.thumbs = [...pendingThumbs, ...driveThumbs];
+    } catch (err) {
+      console.warn('Could not refresh media:', err.message);
+    } finally {
+      state.thumbsLoading = false;
+      updateThumbsDOM();
     }
-    runQueue();
-  }
-  async function retryItem(id) {
-    await window.DB.queueUpdate(id, { status: 'pending', attempts: 0, lastError: null });
-    runQueue();
-  }
-  async function discardItem(id) {
-    await window.DB.queueDelete(id);
-    await refreshQueueCounts();
   }
 
-  // ---------- Gallery ----------
+  async function refreshProjectNotes() {
+    if (!state.currentProjectId) return;
+    state.notesLoading = true;
+    updateNotesHistoryDOM();
+    try {
+      // Find the notes file. Prefer cached id, fall back to search.
+      let notesFile = null;
+      if (state.notesFileId) {
+        notesFile = { id: state.notesFileId };
+      } else {
+        notesFile = await window.Drive.findFileInFolder(state.currentProjectId, 'notes.txt');
+        if (notesFile) {
+          state.notesFileId = notesFile.id;
+          await window.DB.kvSet(`notesFileId:${state.currentProjectId}`, notesFile.id);
+        }
+      }
+      if (!notesFile) {
+        state.notesEntries = [];
+        return;
+      }
+      const text = await window.Drive.downloadFileText(notesFile.id);
+      state.notesEntries = parseNotes(text);
+    } catch (err) {
+      // If cached id is stale (file gone), clear it and try once more by search.
+      if (state.notesFileId) {
+        state.notesFileId = null;
+        await window.DB.kvDelete(`notesFileId:${state.currentProjectId}`);
+      }
+      state.notesEntries = [];
+      console.warn('Notes load failed:', err.message);
+    } finally {
+      state.notesLoading = false;
+      updateNotesHistoryDOM();
+    }
+  }
+
+  function parseNotes(text) {
+    if (!text) return [];
+    // Split on the divider header lines: "--- 2026-05-01 14:32 — Tech ---"
+    const re = /^---\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+—\s+(.+?)\s+---$/gm;
+    const matches = [];
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      matches.push({ index: m.index, end: re.lastIndex, ts: m[1], tech: m[2] });
+    }
+    if (matches.length === 0) return [];
+    const out = [];
+    for (let i = 0; i < matches.length; i += 1) {
+      const start = matches[i].end;
+      const stop = i + 1 < matches.length ? matches[i + 1].index : text.length;
+      const body = text.slice(start, stop).replace(/^\s+|\s+$/g, '');
+      out.push({ ts: matches[i].ts, tech: matches[i].tech, body });
+    }
+    return out.reverse(); // newest first
+  }
+
+  // ---------- Drive (gallery) view ----------
   async function openGallery() {
     if (!ensureProject()) return;
+    // Stop the camera before unmounting the project screen — a stale
+    // controller would keep the camera light on after navigation.
+    detachCamera();
     state.view = 'gallery';
     state.galleryLoading = true;
     state.galleryFiles = [];
     scheduleRender();
     try {
       const files = await window.Drive.listFolderFiles(state.currentProjectId);
-      // Hide bookkeeping files from the visual gallery; surface them as a small footer.
       state.galleryFiles = files;
     } catch (err) {
-      toast(`Could not load gallery: ${err.message}`, 'error');
+      toast(`Could not load Drive: ${err.message}`, 'error');
     } finally {
       state.galleryLoading = false;
       scheduleRender();
     }
   }
-  function closeGallery() { state.view = 'capture'; scheduleRender(); }
 
-  async function annotateFile(fileId) {
-    // Fetch raw bytes so we can re-upload an annotated copy. Drive returns
-    // image bytes via alt=media when the user has read access.
+  function closeGallery() {
+    state.view = 'capture';
+    scheduleRender();
+  }
+
+  async function annotateThumb(fileId) {
+    if (!fileId) return;
     let blob;
     try {
       const token = await window.Auth.getAccessToken();
@@ -439,7 +680,6 @@
       onSave: async (annotated) => {
         const folderId = state.currentProjectId;
         const fileName = await nextFileName(folderId, 'jpg');
-        // Insert "_annotated" before the seq for clarity.
         const annotatedName = fileName.replace(/_(\d+)\.jpg$/, '_annotated_$1.jpg');
         await window.DB.queueAdd({
           projectId: folderId,
@@ -452,10 +692,11 @@
         });
         toast('Annotation queued', 'success');
         runQueue();
-        // Refresh gallery in the background.
-        setTimeout(openGallery, 1500);
+        setTimeout(refreshProjectMedia, 1500);
       },
-      onClose: () => scheduleRender()
+      // Skip re-render on close — annotate is an overlay; the project
+      // screen's <video> must keep its stream attached.
+      onClose: () => { /* no-op */ }
     });
   }
 
@@ -468,16 +709,18 @@
     }
     if (state.initError) {
       app.innerHTML = `
-        <div class="screen error-screen">
+        <div class="error-screen">
           <h2>Setup needed</h2>
           <p class="muted">${escapeHtml(state.initError)}</p>
           <p class="muted small">Edit <code>js/config.js</code> and set <code>CLIENT_ID</code>. See README.md.</p>
+          <button class="btn-secondary" id="retry-btn">Retry</button>
         </div>
       `;
+      document.getElementById('retry-btn')?.addEventListener('click', () => location.reload());
       return;
     }
     if (state.view === 'login') return renderLogin(app);
-    if (state.view === 'home') return renderHome(app);
+    if (state.view === 'home')  return renderHome(app);
     if (state.view === 'gallery') return renderGallery(app);
     return renderCapture(app);
   }
@@ -505,17 +748,16 @@
   }
 
   function renderHome(app) {
-    const filter = state.projectFilter.trim().toLowerCase();
-    const filtered = filter
-      ? state.projects.filter((p) => p.name.toLowerCase().includes(filter))
-      : state.projects;
-
+    // Render the shell once. The input element keeps focus across filter
+    // updates because we never replace it — only the recent list region.
     app.innerHTML = `
       <div class="screen home-screen">
         <header class="topbar">
           <div>
             <div class="topbar-title">Site Visits</div>
-            <div class="topbar-sub">${escapeHtml(state.user?.name || '')} ${state.isOnline ? '' : '<span class="badge offline">offline</span>'}</div>
+            <div class="topbar-sub">${escapeHtml(state.user?.name || '')}${
+              state.isOnline ? '' : ' <span class="badge offline">offline</span>'
+            }</div>
           </div>
           <button class="btn-ghost" id="signout-btn">Sign out</button>
         </header>
@@ -528,42 +770,28 @@
                 type="text"
                 id="project-input"
                 placeholder="e.g. 55 East 87th — Water Damage"
-                value="${escapeHtml(state.projectFilter)}"
                 autocomplete="off"
                 autocapitalize="words"
+                inputmode="text"
               />
-              <button class="btn-primary" id="open-btn">Open</button>
+              <button class="btn-primary" id="start-visit-btn">Start Visit</button>
             </div>
-            <p class="muted small">Type to filter recent sites, or tap Open to create a new one.</p>
+            <p class="muted small">Type to filter recent sites, or tap Start Visit to create a new one.</p>
           </label>
 
           <section class="recent">
             <h2 class="section-h">Recent sites</h2>
-            ${state.projectsLoading
-              ? '<div class="muted">Loading…</div>'
-              : (filtered.length === 0
-                  ? '<div class="muted">No matching projects.</div>'
-                  : filtered.slice(0, 50).map((p) => `
-                    <button class="list-row" data-project-id="${escapeHtml(p.id)}" data-project-name="${escapeHtml(p.name)}">
-                      <div class="list-row-main">
-                        <div class="list-row-title">${escapeHtml(p.name)}</div>
-                        <div class="list-row-sub">${escapeHtml(fmtRelative(p.modifiedTime))}</div>
-                      </div>
-                      <span class="list-row-chev">›</span>
-                    </button>
-                  `).join('')
-                )
-            }
+            <div id="recent-list"></div>
           </section>
         </main>
       </div>
     `;
 
     const input = document.getElementById('project-input');
+    input.value = state.projectFilter;
     input.addEventListener('input', (e) => {
       state.projectFilter = e.target.value;
-      // Re-render only the list portion (cheap; dom is small).
-      scheduleRender();
+      updateRecentList();
     });
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
@@ -571,18 +799,48 @@
         openOrCreateProject(state.projectFilter);
       }
     });
-    document.getElementById('open-btn').addEventListener('click', () => openOrCreateProject(state.projectFilter));
+    document.getElementById('start-visit-btn').addEventListener('click',
+      () => openOrCreateProject(state.projectFilter));
     document.getElementById('signout-btn').addEventListener('click', onSignOutClick);
-    app.querySelectorAll('.list-row').forEach((row) => {
+
+    updateRecentList();
+  }
+
+  function updateRecentList() {
+    const list = document.getElementById('recent-list');
+    if (!list) return;
+    const filter = state.projectFilter.trim().toLowerCase();
+    const filtered = filter
+      ? state.projects.filter((p) => p.name.toLowerCase().includes(filter))
+      : state.projects;
+
+    if (state.projectsLoading && state.projects.length === 0) {
+      list.innerHTML = '<div class="muted">Loading…</div>';
+      return;
+    }
+    if (filtered.length === 0) {
+      list.innerHTML = filter
+        ? '<div class="muted">No matching projects. Tap Start Visit to create.</div>'
+        : '<div class="muted">No projects yet. Type a name and tap Start Visit.</div>';
+      return;
+    }
+    list.innerHTML = filtered.slice(0, 100).map((p) => `
+      <button class="list-row" data-project-id="${escapeHtml(p.id)}" data-project-name="${escapeHtml(p.name)}">
+        <div class="list-row-main">
+          <div class="list-row-title">${escapeHtml(p.name)}</div>
+          <div class="list-row-sub">${escapeHtml(fmtRelative(p.modifiedTime))}</div>
+        </div>
+        <span class="list-row-chev">›</span>
+      </button>
+    `).join('');
+    list.querySelectorAll('.list-row').forEach((row) => {
       row.addEventListener('click', () => {
-        openProject(row.dataset.projectId, row.dataset.projectName);
+        enterProject(row.dataset.projectId, row.dataset.projectName);
       });
     });
   }
 
   function renderCapture(app) {
-    const counts = state.queueCounts || {};
-    const queueText = describeQueue(counts);
     app.innerHTML = `
       <div class="screen capture-screen">
         <header class="topbar">
@@ -591,55 +849,133 @@
             <div class="topbar-title">${escapeHtml(state.currentProjectName)}</div>
             ${state.isOnline ? '' : '<div class="badge offline">offline</div>'}
           </div>
-          <button class="btn-ghost" id="gallery-btn">Files</button>
+          <button class="btn-ghost" id="drive-btn">📁 Drive</button>
         </header>
 
         <main class="capture-main">
-          <div class="capture-grid">
-            <button class="action-tile photo" id="btn-photo">
-              <span class="action-glyph">📷</span>
-              <span class="action-label">Photo</span>
-            </button>
-            <button class="action-tile video" id="btn-video">
-              <span class="action-glyph">🎥</span>
-              <span class="action-label">Video</span>
-            </button>
-            <button class="action-tile audio" id="btn-audio">
-              <span class="action-glyph">🎙️</span>
-              <span class="action-label">Voice</span>
-            </button>
-            <button class="action-tile note" id="btn-note">
-              <span class="action-glyph">📝</span>
-              <span class="action-label">Note</span>
-            </button>
+          <div class="cam-stage" id="cam-stage">
+            <video id="cam-video" playsinline autoplay muted></video>
+            <div id="cam-error-box" class="cam-error" hidden></div>
+            <div id="rec-bar" class="cam-rec-bar" hidden>
+              <span class="rec-dot"></span>
+              <span class="rec-time">0:00</span>
+            </div>
           </div>
 
-          <div class="queue-strip ${counts.error ? 'has-error' : ''}">
-            <div class="queue-label">${queueText}</div>
-            ${counts.error
-              ? '<button class="btn-secondary small" id="retry-all">Retry failed</button>'
-              : ''}
+          <div class="cam-controls">
+            <span class="cam-counter" id="cam-counter">${state.camCounter} captured</span>
+            <button class="cam-shutter" id="shutter-btn" aria-label="Take photo"></button>
+            <button class="cam-rec-btn" id="rec-btn" aria-label="Record video"></button>
           </div>
+
+          <section class="thumb-section">
+            <div class="section-row">
+              <h3 class="section-h">Photos</h3>
+            </div>
+            <div id="thumb-strip" class="thumb-strip"></div>
+          </section>
+
+          <section class="notes-section">
+            <div class="section-row">
+              <h3 class="section-h">Notes</h3>
+            </div>
+            <textarea id="notes-textarea" placeholder="Type a note…"></textarea>
+            <div class="notes-actions">
+              <button class="btn-primary" id="save-note-btn">Save note</button>
+            </div>
+            <div id="notes-history" class="notes-history"></div>
+          </section>
+
+          <section class="voice-section">
+            <button class="voice-btn" id="voice-btn">🎙️ Record voice note</button>
+          </section>
         </main>
       </div>
     `;
 
     document.getElementById('back-btn').addEventListener('click', leaveProject);
-    document.getElementById('gallery-btn').addEventListener('click', openGallery);
-    document.getElementById('btn-photo').addEventListener('click', startPhoto);
-    document.getElementById('btn-video').addEventListener('click', startVideo);
-    document.getElementById('btn-audio').addEventListener('click', startAudio);
-    document.getElementById('btn-note').addEventListener('click', startNote);
-    document.getElementById('retry-all')?.addEventListener('click', retryAllErrored);
+    document.getElementById('drive-btn').addEventListener('click', openGallery);
+    document.getElementById('shutter-btn').addEventListener('click', onShutterClick);
+    document.getElementById('rec-btn').addEventListener('click', onRecordClick);
+    document.getElementById('voice-btn').addEventListener('click', startVoiceNote);
+    document.getElementById('save-note-btn').addEventListener('click', saveNote);
+
+    updateThumbsDOM();
+    updateNotesHistoryDOM();
+    attachCamera(); // async
   }
 
-  function describeQueue(c) {
-    const parts = [];
-    if (c.uploading) parts.push(`${c.uploading} uploading`);
-    if (c.pending) parts.push(`${c.pending} queued`);
-    if (c.error) parts.push(`${c.error} failed`);
-    if (parts.length === 0) return 'All uploads up to date ✓';
-    return parts.join(' · ');
+  // Section-only updates so we don't tear down the live <video> element.
+  function updateThumbsDOM() {
+    const strip = document.getElementById('thumb-strip');
+    if (!strip) return;
+    const thumbs = state.thumbs;
+    if (state.thumbsLoading && thumbs.length === 0) {
+      strip.innerHTML = '<div class="thumb-empty">Loading…</div>';
+      return;
+    }
+    if (thumbs.length === 0) {
+      strip.innerHTML = '<div class="thumb-empty">No photos yet — tap the shutter above.</div>';
+      return;
+    }
+    strip.innerHTML = thumbs.map((t, idx) => {
+      const cls = t.status === 'success' ? '' : (t.status === 'failed' ? 'failed' : 'queued');
+      const stateLabel = t.status === 'queued' ? 'Uploading…' : (t.status === 'failed' ? 'Failed' : '');
+      const img = t.src
+        ? `<img loading="lazy" alt="" src="${escapeHtml(t.src)}" onerror="this.style.display='none'"/>`
+        : '';
+      return `
+        <button class="thumb ${cls}" data-thumb-idx="${idx}" data-file-id="${escapeHtml(t.fileId || '')}">
+          ${img}
+          ${stateLabel ? `<span class="thumb-state">${escapeHtml(stateLabel)}</span>` : ''}
+        </button>
+      `;
+    }).join('');
+    strip.querySelectorAll('.thumb').forEach((b) => {
+      b.addEventListener('click', () => {
+        const fileId = b.dataset.fileId;
+        if (fileId) annotateThumb(fileId);
+      });
+    });
+  }
+
+  function updateNotesHistoryDOM() {
+    const root = document.getElementById('notes-history');
+    if (!root) return;
+    if (state.notesLoading && state.notesEntries.length === 0) {
+      root.innerHTML = '<div class="muted small" style="padding:8px 0;">Loading notes…</div>';
+      return;
+    }
+    if (state.notesEntries.length === 0) {
+      root.innerHTML = '';
+      return;
+    }
+    root.innerHTML = state.notesEntries.map((n) => `
+      <div class="note-item">
+        <div class="note-meta">${escapeHtml(n.ts)} · ${escapeHtml(n.tech)}</div>
+        <div class="note-body">${escapeHtml(n.body)}</div>
+      </div>
+    `).join('');
+  }
+
+  function updateCamCounterDOM() {
+    const el = document.getElementById('cam-counter');
+    if (el) el.textContent = `${state.camCounter} captured`;
+  }
+
+  function updateCamErrorDOM() {
+    const box = document.getElementById('cam-error-box');
+    if (!box) return;
+    if (state.camError) {
+      box.hidden = false;
+      box.innerHTML = `${escapeHtml(state.camError)}<br><br><button class="btn-secondary small" id="cam-retry">Retry camera</button>`;
+      box.querySelector('#cam-retry')?.addEventListener('click', () => {
+        state.camError = null;
+        attachCamera();
+      });
+    } else {
+      box.hidden = true;
+    }
   }
 
   function renderGallery(app) {
@@ -657,7 +993,7 @@
             <div class="topbar-title">${escapeHtml(state.currentProjectName)}</div>
             <div class="topbar-sub">${files.length} files</div>
           </div>
-          <button class="btn-ghost" id="g-refresh">Refresh</button>
+          <button class="btn-ghost" id="g-refresh">↻</button>
         </header>
         <main class="gallery-main">
           ${state.galleryLoading ? '<div class="muted">Loading…</div>' : ''}
@@ -666,7 +1002,7 @@
             <h3 class="section-h">Photos (${images.length})</h3>
             <div class="thumb-grid">
               ${images.map((f) => `
-                <button class="thumb" data-file-id="${escapeHtml(f.id)}" data-mime="${escapeHtml(f.mimeType)}">
+                <button class="thumb" data-file-id="${escapeHtml(f.id)}">
                   ${f.thumbnailLink
                     ? `<img loading="lazy" alt="" src="${escapeHtml(f.thumbnailLink)}" onerror="this.style.display='none'"/>`
                     : ''}
@@ -724,13 +1060,7 @@
     document.getElementById('g-back').addEventListener('click', closeGallery);
     document.getElementById('g-refresh').addEventListener('click', openGallery);
     app.querySelectorAll('.thumb').forEach((b) => {
-      b.addEventListener('click', () => annotateFile(b.dataset.fileId));
+      b.addEventListener('click', () => annotateThumb(b.dataset.fileId));
     });
   }
-
-  // ---------- Boot first paint ----------
-  function firstPaint() {
-    document.getElementById('app').innerHTML = '<div class="boot">Loading…</div>';
-  }
-  firstPaint();
 })();

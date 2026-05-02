@@ -19,12 +19,38 @@ window.Drive = (function () {
     return res;
   }
 
+  // Wrap any async operation with exponential backoff for transient errors.
+  // Retriable: network errors, 5xx, 429, 408. Auth (401) is handled inside
+  // authedFetch already; permanent 4xx pass through immediately.
+  async function withRetry(fn, { retries = 4, baseMs = 1000 } = {}) {
+    let attempt = 0;
+    let lastErr;
+    while (attempt <= retries) {
+      try {
+        return await fn(attempt);
+      } catch (err) {
+        lastErr = err;
+        const msg = String(err && err.message || err);
+        const m = msg.match(/(\d{3})/); // pull a status code if we embedded one
+        const status = m ? parseInt(m[1], 10) : 0;
+        const transient =
+          !status ||
+          status === 408 || status === 429 ||
+          (status >= 500 && status < 600);
+        if (!transient || attempt === retries) throw err;
+        const delay = Math.min(30000, baseMs * Math.pow(2, attempt)) + Math.floor(Math.random() * 250);
+        await new Promise((r) => setTimeout(r, delay));
+        attempt += 1;
+      }
+    }
+    throw lastErr;
+  }
+
   function escapeQ(s) {
     return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
   }
 
   function sanitizeFolderName(name) {
-    // Drive doesn't ban many chars, but slashes/colons/quotes hurt downstream.
     return name.replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim();
   }
 
@@ -64,7 +90,7 @@ window.Drive = (function () {
     return { id: created.id, name: created.name, created: true };
   }
 
-  async function listProjectFolders({ pageSize = 50 } = {}) {
+  async function listProjectFolders({ pageSize = 100 } = {}) {
     const q = encodeURIComponent(
       `'${window.CONFIG.SITE_VISITS_FOLDER_ID}' in parents and ` +
       `mimeType='application/vnd.google-apps.folder' and trashed=false`
@@ -80,7 +106,7 @@ window.Drive = (function () {
   async function listFolderFiles(folderId, { pageSize = 200 } = {}) {
     const q = encodeURIComponent(`'${folderId}' in parents and trashed=false`);
     const res = await authedFetch(
-      `${API}/files?q=${q}&fields=files(id,name,mimeType,size,createdTime,modifiedTime,thumbnailLink,webViewLink)&orderBy=createdTime&pageSize=${pageSize}&supportsAllDrives=true&includeItemsFromAllDrives=true`
+      `${API}/files?q=${q}&fields=files(id,name,mimeType,size,createdTime,modifiedTime,thumbnailLink,webViewLink,webContentLink)&orderBy=createdTime&pageSize=${pageSize}&supportsAllDrives=true&includeItemsFromAllDrives=true`
     );
     if (!res.ok) throw new Error(`Drive list files failed: ${res.status}`);
     const data = await res.json();
@@ -100,63 +126,66 @@ window.Drive = (function () {
   }
 
   // -------- Uploads --------
-  // multipart/related upload — one round trip for files <~5MB, fine for most photos.
   async function uploadMultipart({ folderId, fileName, mimeType, blob }) {
     const metadata = { name: fileName, parents: [folderId] };
-    const boundary = '-------dancon' + Math.random().toString(36).slice(2);
+    const boundary = 'dancon_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
     const head =
       `--${boundary}\r\n` +
       'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
       JSON.stringify(metadata) +
       `\r\n--${boundary}\r\n` +
-      `Content-Type: ${mimeType}\r\n\r\n`;
+      `Content-Type: ${mimeType || 'application/octet-stream'}\r\n\r\n`;
     const tail = `\r\n--${boundary}--`;
 
-    const body = new Blob([head, blob, tail]);
+    const body = new Blob([head, blob, tail], { type: `multipart/related; boundary=${boundary}` });
 
-    const res = await authedFetch(
-      `${UPLOAD}/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,size`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
-        body
+    return withRetry(async () => {
+      const res = await authedFetch(
+        `${UPLOAD}/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,size`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+          body
+        }
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Upload failed (${res.status}): ${text || res.statusText}`);
       }
-    );
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`Upload failed: ${res.status} ${text}`);
-    }
-    return res.json();
+      return res.json();
+    });
   }
 
-  // For larger files (videos), use resumable upload to survive flaky connections.
   async function uploadResumable({ folderId, fileName, mimeType, blob, onProgress }) {
     const metadata = { name: fileName, parents: [folderId] };
-    const initRes = await authedFetch(
-      `${UPLOAD}/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json; charset=UTF-8',
-          'X-Upload-Content-Type': mimeType,
-          'X-Upload-Content-Length': String(blob.size)
-        },
-        body: JSON.stringify(metadata)
+
+    const initRes = await withRetry(async () => {
+      const r = await authedFetch(
+        `${UPLOAD}/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json; charset=UTF-8',
+            'X-Upload-Content-Type': mimeType || 'application/octet-stream',
+            'X-Upload-Content-Length': String(blob.size)
+          },
+          body: JSON.stringify(metadata)
+        }
+      );
+      if (!r.ok) {
+        const text = await r.text().catch(() => '');
+        throw new Error(`Resumable init failed (${r.status}): ${text || r.statusText}`);
       }
-    );
-    if (!initRes.ok) {
-      const text = await initRes.text().catch(() => '');
-      throw new Error(`Resumable init failed: ${initRes.status} ${text}`);
-    }
+      return r;
+    });
+
     const sessionUrl = initRes.headers.get('Location');
     if (!sessionUrl) throw new Error('Resumable session URL missing');
 
-    // PUT in one shot — for the ~tens-of-MB range that MediaRecorder produces,
-    // a single PUT is fine. Server-side resume kicks in on retry if it fails.
-    return new Promise((resolve, reject) => {
+    return withRetry(() => new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('PUT', sessionUrl, true);
-      xhr.setRequestHeader('Content-Type', mimeType);
+      xhr.setRequestHeader('Content-Type', mimeType || 'application/octet-stream');
       xhr.upload.onprogress = (ev) => {
         if (onProgress && ev.lengthComputable) onProgress(ev.loaded / ev.total);
       };
@@ -165,59 +194,84 @@ window.Drive = (function () {
           try { resolve(JSON.parse(xhr.responseText)); }
           catch { resolve({}); }
         } else {
-          reject(new Error(`Upload PUT failed: ${xhr.status} ${xhr.responseText}`));
+          reject(new Error(`Upload PUT failed (${xhr.status}): ${xhr.responseText || ''}`));
         }
       };
       xhr.onerror = () => reject(new Error('Network error during upload'));
       xhr.send(blob);
-    });
+    }));
   }
 
-  // Picks single-shot vs resumable based on size.
   async function uploadFile(opts) {
     const big = opts.blob.size > 5 * 1024 * 1024;
     return big ? uploadResumable(opts) : uploadMultipart(opts);
   }
 
-  // -------- Text-file append (notes.txt, visit_log.txt) --------
-  // Strategy: if the file exists, download, append, PATCH-update content.
-  //           If not, create new file with the content.
+  // -------- Text-file append --------
   async function downloadFileText(fileId) {
     const res = await authedFetch(
       `${API}/files/${fileId}?alt=media&supportsAllDrives=true`
     );
-    if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+    if (!res.ok) throw new Error(`Download failed (${res.status})`);
     return res.text();
   }
 
   async function updateFileContent(fileId, blob, mimeType) {
-    const res = await authedFetch(
-      `${UPLOAD}/files/${fileId}?uploadType=media&supportsAllDrives=true&fields=id,name,size`,
-      {
-        method: 'PATCH',
-        headers: { 'Content-Type': mimeType },
-        body: blob
+    return withRetry(async () => {
+      const res = await authedFetch(
+        `${UPLOAD}/files/${fileId}?uploadType=media&supportsAllDrives=true&fields=id,name,size`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': mimeType },
+          body: blob
+        }
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Update failed (${res.status}): ${text || res.statusText}`);
       }
-    );
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`Update failed: ${res.status} ${text}`);
-    }
-    return res.json();
+      return res.json();
+    });
   }
 
-  async function appendToTextFile({ folderId, fileName, lineOrText }) {
+  // Append text to a file inside a folder. If `cachedFileId` is supplied
+  // (e.g. from a previous successful append), we PATCH directly without a
+  // search query — this avoids the "duplicate file" bug caused by Drive's
+  // eventually-consistent search index. On a cache miss, we search; if no
+  // file exists, we create one. Returns the file id (caller should cache it).
+  async function appendToTextFile({ folderId, fileName, lineOrText, cachedFileId }) {
+    // Path 1: we know the id — fast path, no search.
+    if (cachedFileId) {
+      try {
+        const current = await downloadFileText(cachedFileId);
+        const next = (current.length === 0 || current.endsWith('\n'))
+          ? current + lineOrText
+          : current + '\n' + lineOrText;
+        const blob = new Blob([next], { type: 'text/plain' });
+        const updated = await updateFileContent(cachedFileId, blob, 'text/plain');
+        return { id: updated.id || cachedFileId, created: false };
+      } catch (err) {
+        // Cache miss-path: file might have been deleted. Fall through to search.
+        console.warn('cached fileId failed, falling back to search:', err.message);
+      }
+    }
+
+    // Path 2: search for an existing file in the folder.
     const existing = await findFileInFolder(folderId, fileName);
     if (existing) {
       const current = await downloadFileText(existing.id);
-      const next = current.endsWith('\n') || current.length === 0
+      const next = (current.length === 0 || current.endsWith('\n'))
         ? current + lineOrText
         : current + '\n' + lineOrText;
       const blob = new Blob([next], { type: 'text/plain' });
-      return updateFileContent(existing.id, blob, 'text/plain');
+      const updated = await updateFileContent(existing.id, blob, 'text/plain');
+      return { id: updated.id || existing.id, created: false };
     }
+
+    // Path 3: create a new file.
     const blob = new Blob([lineOrText], { type: 'text/plain' });
-    return uploadMultipart({ folderId, fileName, mimeType: 'text/plain', blob });
+    const created = await uploadMultipart({ folderId, fileName, mimeType: 'text/plain', blob });
+    return { id: created.id, created: true };
   }
 
   return {

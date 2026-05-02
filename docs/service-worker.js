@@ -1,5 +1,5 @@
 // Bump CACHE_VERSION on every release to invalidate stale shells.
-const CACHE_VERSION = 'dancon-svl-v3';
+const CACHE_VERSION = 'dancon-svl-v5';
 const APP_SHELL = [
   './',
   './index.html',
@@ -17,11 +17,16 @@ const APP_SHELL = [
   './js/app.js'
 ];
 
+// Cache shell on install but DO NOT block install on a single 404 — addAll
+// rejects atomically. Use Promise.all + per-URL catches so a transient miss
+// doesn't kill the whole install (which has bitten iOS Safari before).
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_VERSION)
-      .then((cache) => cache.addAll(APP_SHELL))
-      .then(() => self.skipWaiting())
+    caches.open(CACHE_VERSION).then((cache) =>
+      Promise.all(APP_SHELL.map((url) =>
+        cache.add(url).catch((err) => console.warn('SW skip', url, err.message))
+      ))
+    ).then(() => self.skipWaiting())
   );
 });
 
@@ -35,9 +40,12 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Network-first for same-origin requests so updates ship fast; fall back to
-// cache when offline. Never intercept Google API or auth requests — let the
-// network handle googleapis / accounts.google.com directly.
+// Network-first for same-origin GETs so updates ship fast; cache fallback
+// when offline. NEVER intercept cross-origin requests (Google APIs, GIS) —
+// the auth/drive flows handle their own headers.
+//
+// Critical: respondWith must always resolve to a Response (or the page hangs
+// on iOS Safari). The final fallback is a 504 stub so we never return undefined.
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
@@ -45,16 +53,33 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
 
-  event.respondWith(
-    fetch(req)
-      .then((res) => {
-        const copy = res.clone();
-        caches.open(CACHE_VERSION).then((cache) => cache.put(req, copy)).catch(() => {});
-        return res;
-      })
-      .catch(() => caches.match(req).then((hit) => hit || caches.match('./index.html')))
-  );
+  event.respondWith(handleFetch(req));
 });
+
+async function handleFetch(req) {
+  try {
+    const res = await fetch(req);
+    if (res && res.ok) {
+      // Best-effort cache refresh.
+      try {
+        const cache = await caches.open(CACHE_VERSION);
+        cache.put(req, res.clone());
+      } catch (e) { /* ignore */ }
+    }
+    return res;
+  } catch (networkErr) {
+    const cached = await caches.match(req);
+    if (cached) return cached;
+    if (req.mode === 'navigate' || req.destination === 'document') {
+      const shell = await caches.match('./index.html');
+      if (shell) return shell;
+    }
+    return new Response(
+      'Offline and not cached.',
+      { status: 504, statusText: 'Gateway Timeout', headers: { 'Content-Type': 'text/plain' } }
+    );
+  }
+}
 
 self.addEventListener('message', (event) => {
   if (event.data === 'skip-waiting') self.skipWaiting();
