@@ -53,5 +53,24 @@ window.UI = (function () {
     }, ms);
   }
 
-  return { escapeHtml, fmtTimestampForFilename, fmtDateTime, fmtBytes, fmtRelative, toast };
+  // Trigger the device "save" sheet from a Blob. On iOS Safari this opens
+  // the native share sheet (Save to Photos / Save to Files); on Chrome it
+  // streams into the Downloads folder. Filename is honored by both.
+  function downloadBlob(blob, filename) {
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'download';
+    a.rel = 'noopener';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      try { document.body.removeChild(a); } catch (e) { /* ignore */ }
+      try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+    }, 1000);
+  }
+
+  return { escapeHtml, fmtTimestampForFilename, fmtDateTime, fmtBytes, fmtRelative, toast, downloadBlob };
 })();

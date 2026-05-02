@@ -37,6 +37,13 @@ window.VideoPlayer = (function () {
     root().innerHTML = `
       <div class="vplayer-overlay ${isAudio ? 'audio' : ''}" id="vplayer">
         <button class="cam-fs-icon vplayer-close" id="vp-close" aria-label="Close">✕</button>
+        <button class="vw-download-btn" id="vp-dl" aria-label="Save to device" title="Save to device">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 4v12"/>
+            <path d="M6 12l6 6 6-6"/>
+            <path d="M4 21h16"/>
+          </svg>
+        </button>
         <div class="vplayer-stage" id="vp-stage">
           <div class="vplayer-loading" id="vp-loading">Loading…</div>
           <div class="vplayer-error" id="vp-error" hidden>
@@ -56,6 +63,7 @@ window.VideoPlayer = (function () {
 
     document.getElementById('vp-close').addEventListener('click', () => close());
     document.getElementById('vp-retry').addEventListener('click', () => loadAndPlay(opts));
+    document.getElementById('vp-dl').addEventListener('click', () => downloadCurrent(opts));
     const overlay = document.getElementById('vplayer');
     overlay.addEventListener('click', (ev) => {
       if (ev.target.id === 'vplayer' || ev.target.id === 'vp-stage') close();
@@ -160,6 +168,36 @@ window.VideoPlayer = (function () {
       else if (code === 2) detail = 'Network error.';
       showError(isAudio ? 'Audio could not play' : 'Video could not play', detail);
     });
+  }
+
+  async function downloadCurrent(opts) {
+    try {
+      let blob;
+      // If we already streamed the file into a blob URL, fetch from there
+      // (cheap — same blob in memory).
+      if (blobUrl) {
+        const res = await fetch(blobUrl);
+        blob = await res.blob();
+      } else if (opts.src) {
+        const res = await fetch(opts.src);
+        blob = await res.blob();
+      } else if (opts.fileId) {
+        const token = await window.Auth.getAccessToken();
+        const res = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${opts.fileId}?alt=media&supportsAllDrives=true`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        blob = await res.blob();
+      } else {
+        throw new Error('No source available');
+      }
+      window.UI.downloadBlob(blob, opts.name || (opts.kind === 'audio' ? 'audio' : 'video'));
+      window.UI.toast('Saved to device', 'success', 1800);
+    } catch (err) {
+      console.error('[vplayer] download failed:', err);
+      window.UI.toast(`Download failed: ${err.message}`, 'error', 4000);
+    }
   }
 
   function showError(title, detail) {

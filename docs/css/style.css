@@ -94,10 +94,26 @@ code { background: #eef0f2; padding: 2px 6px; border-radius: 4px; font-size: 13p
 }
 .topbar-sub { color: #6b7280; font-size: 12px; line-height: 1.2; }
 .topbar-title-center { text-align: center; flex: 1; min-width: 0; }
+/* Identical pill buttons on either side of the project title. */
 .back-btn,
-.drive-btn { font-weight: 700; font-size: 17px; }
+.drive-btn {
+  background: #374151;
+  color: #fff;
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  height: 36px;
+  min-width: 92px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border: none;
+}
 .back-btn:active,
-.drive-btn:active { opacity: 0.55; }
+.drive-btn:active { background: #1f2937; }
 
 /* ---------- Login ---------- */
 .login-screen {
@@ -710,7 +726,54 @@ code { background: #eef0f2; padding: 2px 6px; border-radius: 4px; font-size: 13p
   border-radius: 999px;
 }
 .viewer-actions { display: flex; gap: 6px; }
-.cam-icon-btn.vw-trash { background: rgba(239,68,68,0.85); }
+.vw-spacer { width: 40px; height: 40px; display: inline-block; }
+
+/* Annotate pencil — top-right, prominent */
+.vw-ann-btn {
+  width: 48px; height: 48px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.55);
+  color: #fff;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid rgba(255,255,255,0.15);
+  flex-shrink: 0;
+}
+.vw-ann-btn svg { width: 24px; height: 24px; }
+.vw-ann-btn:active { background: rgba(0,0,0,0.8); transform: scale(0.95); }
+
+/* Trash — bottom-right corner of the overlay, gray + subtle */
+.vw-trash-btn {
+  position: absolute;
+  right: 14px;
+  bottom: calc(56px + env(safe-area-inset-bottom));
+  width: 36px; height: 36px;
+  border-radius: 50%;
+  background: rgba(75,85,99,0.85);
+  color: #fff;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid rgba(255,255,255,0.1);
+  z-index: 4;
+  opacity: 0.85;
+}
+.vw-trash-btn svg { width: 16px; height: 16px; }
+.vw-trash-btn:active { background: rgba(31,41,55,0.95); transform: scale(0.95); opacity: 1; }
+
+/* Download — bottom-left corner of the overlay */
+.vw-download-btn {
+  position: absolute;
+  left: 14px;
+  bottom: calc(56px + env(safe-area-inset-bottom));
+  width: 40px; height: 40px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.55);
+  color: #fff;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid rgba(255,255,255,0.15);
+  z-index: 4;
+}
+.vw-download-btn svg { width: 18px; height: 18px; }
+.vw-download-btn:active { background: rgba(0,0,0,0.85); transform: scale(0.95); }
+.vplayer-overlay .vw-download-btn { bottom: calc(64px + env(safe-area-inset-bottom)); }
 .viewer-stage {
   flex: 1;
   display: flex; align-items: center; justify-content: center;
@@ -1068,47 +1131,6 @@ body.camera-fs-open #app { display: none; }
   box-shadow: 0 0 0 2px #111 inset;
 }
 
-.note-attach {
-  display: block;
-  width: 100%;
-  max-width: 220px;
-  margin-top: 8px;
-  border-radius: 8px;
-  overflow: hidden;
-  background: #f4f4f5;
-  padding: 0;
-  border: 1px solid #e5e7eb;
-}
-.note-attach img { display: block; width: 100%; height: auto; max-height: 200px; object-fit: cover; }
-.note-attach-missing { margin-top: 8px; }
-
-.attach-chip {
-  display: flex; align-items: center; gap: 8px;
-  margin-top: 8px;
-  padding: 6px 8px;
-  background: #f4f4f5;
-  border: 1px dashed #cbd5e1;
-  border-radius: 10px;
-  font-size: 13px;
-}
-.attach-chip-thumb {
-  width: 36px; height: 36px;
-  border-radius: 6px;
-  overflow: hidden;
-  background: #e5e7eb;
-  display: inline-flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-}
-.attach-chip-thumb img { width: 100%; height: 100%; object-fit: cover; }
-.attach-chip-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.attach-chip-x {
-  width: 28px; height: 28px;
-  border-radius: 50%;
-  background: transparent; color: #6b7280;
-  font-size: 14px;
-}
-.attach-chip-x:active { background: #fff; color: #111; }
-
 /* Permission pre-prompt */
 .perm-backdrop {
   align-items: center;
@@ -1129,108 +1151,9 @@ body.camera-fs-open #app { display: none; }
 .perm-card p { margin: 0 0 4px; font-size: 14px; line-height: 1.4; }
 .perm-card .btn-primary { width: 100%; }
 
-/* Attach Photo button (notes section) */
-.btn-attach {
-  display: inline-flex; align-items: center; gap: 8px;
-  background: #f4f4f5;
-  color: #111;
-  border: 1px solid #d4d4d8;
-  border-radius: 10px;
-  padding: 10px 14px;
-  font-weight: 600;
-  font-size: 14px;
-}
-.btn-attach:active { background: #e5e7eb; transform: translateY(1px); }
-.attach-icon { width: 18px; height: 18px; flex-shrink: 0; }
-
-/* Attachment chooser — single combined sheet */
-.attach-backdrop { align-items: flex-end; }
-.attach-sheet {
-  width: 100%;
-  max-width: 520px;
-  background: #fff;
-  border-radius: 20px 20px 0 0;
-  padding: 16px 16px calc(20px + env(safe-area-inset-bottom));
-  display: flex; flex-direction: column; gap: 12px;
-  max-height: 88vh;
-  overflow-y: auto;
-}
-.attach-action {
-  width: 100%;
-  background: #fff;
-  border: 1px solid #e5e7eb;
-  border-radius: 14px;
-  padding: 14px 16px;
-  text-align: left;
-  display: flex; align-items: center; gap: 12px;
-  font-size: 15px;
-}
-.attach-action:active { background: #f4f4f5; }
-.attach-action.primary {
-  background: linear-gradient(180deg, #FF2222 0%, #CC0000 100%);
-  color: #fff;
-  border-color: rgba(255,255,255,0.18);
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.25),
-    inset 0 -1px 0 rgba(0,0,0,0.18),
-    0 6px 14px rgba(204,0,0,0.30);
-}
-.attach-action.primary:active {
-  background: linear-gradient(180deg, #CC0000 0%, #990000 100%);
-}
-.attach-action-icon {
-  width: 36px; height: 36px;
-  border-radius: 50%;
-  background: rgba(255,255,255,0.16);
-  display: inline-flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-}
-.attach-action-icon svg { width: 20px; height: 20px; }
-.attach-action-text { display: flex; flex-direction: column; gap: 2px; line-height: 1.25; }
-.attach-action-text strong { font-weight: 700; font-size: 16px; }
-.attach-action-text small { opacity: 0.85; font-size: 12px; }
-
-.attach-divider {
-  display: flex; align-items: center; gap: 8px;
-  color: #9ca3af; font-size: 12px; font-weight: 600;
-  letter-spacing: 0.04em;
-  margin: 4px 2px;
-}
-.attach-divider::before,
-.attach-divider::after {
-  content: '';
-  flex: 1;
-  height: 1px;
-  background: #e5e7eb;
-}
-
-.attach-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 6px;
-}
-@media (min-width: 480px) {
-  .attach-grid { grid-template-columns: repeat(4, 1fr); }
-}
-.attach-thumb {
-  aspect-ratio: 1 / 1;
-  background: #e5e7eb;
-  border-radius: 8px;
-  overflow: hidden;
-  padding: 0;
-}
-.attach-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.attach-thumb:active { opacity: 0.8; }
-
-.attach-empty {
-  text-align: center;
-  color: #9ca3af;
-  font-size: 13px;
-  padding: 18px 8px;
-  background: #f9fafb;
-  border-radius: 12px;
-  border: 1px dashed #e5e7eb;
-}
+/* Note item + tap-to-edit */
+.note-item { cursor: pointer; transition: background 120ms; }
+.note-item:active { background: #f4f4f5; }
 
 /* ---------- Larger phones / tablets ---------- */
 @media (min-width: 720px) {

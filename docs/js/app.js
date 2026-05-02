@@ -44,7 +44,6 @@
     notesFileId: null,
     notesLoading: false,
     editingNoteIdx: null,    // index in notesEntries currently being edited
-    draftAttachment: null,   // { name, queueId?, fileId? } pending attachment
 
     isRenaming: false,
     renameSaving: false,
@@ -230,7 +229,6 @@
     state.gps = null;
     state.gpsLoading = true;
     state.editingNoteIdx = null;
-    state.draftAttachment = null;
     state.isRenaming = false;
     state.projectFilter = '';
     scheduleRender();
@@ -256,7 +254,6 @@
     state.notesEntries = [];
     state.gps = null;
     state.editingNoteIdx = null;
-    state.draftAttachment = null;
     state.isRenaming = false;
     state.view = 'home';
     scheduleRender();
@@ -264,20 +261,82 @@
   }
 
   // ---------- GPS ----------
+  // Build a polished standalone HTML page that the office team can open
+  // straight from Drive. No external resources, inline CSS only.
+  function buildGpsHtml({ lat, lng, accuracy, tech, stamp, link }) {
+    const safeTech = escapeHtml(tech);
+    const safeStamp = escapeHtml(stamp);
+    const safeLink = escapeHtml(link);
+    const latStr = Number(lat).toFixed(6);
+    const lngStr = Number(lng).toFixed(6);
+    const acc = Math.round(accuracy);
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Site location</title>
+<style>
+  *,*:before,*:after{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:#f5f5f5;color:#0f172a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:520px;margin:40px auto;padding:0 16px}
+  .card{background:#fff;border-radius:18px;padding:28px;box-shadow:0 12px 30px rgba(15,23,42,.08);border:1px solid #e5e7eb}
+  h1{margin:0 0 4px;font-size:20px;font-weight:700;letter-spacing:.01em}
+  .sub{color:#64748b;font-size:13px;margin:0 0 24px}
+  .row{display:flex;justify-content:space-between;padding:12px 0;border-top:1px solid #e5e7eb;font-size:14px}
+  .row:first-of-type{border-top:0}
+  .row .k{color:#64748b}
+  .row .v{font-weight:600;font-variant-numeric:tabular-nums}
+  .btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;margin-top:24px;padding:16px;background:linear-gradient(180deg,#2563eb,#1d4ed8);color:#fff;border-radius:14px;font-weight:700;font-size:16px;text-decoration:none;letter-spacing:.02em;box-shadow:0 8px 20px rgba(37,99,235,.25)}
+  .btn:hover{filter:brightness(1.05)}
+  .footer{margin-top:18px;color:#94a3b8;font-size:12px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Site location</h1>
+    <p class="sub">Captured by ${safeTech} · ${safeStamp}</p>
+
+    <div class="row"><span class="k">Latitude</span><span class="v">${latStr}</span></div>
+    <div class="row"><span class="k">Longitude</span><span class="v">${lngStr}</span></div>
+    <div class="row"><span class="k">Accuracy</span><span class="v">${acc} m</span></div>
+
+    <a class="btn" href="${safeLink}" target="_blank" rel="noopener">📍 Open in Google Maps</a>
+  </div>
+  <p class="footer">Recorded in the Dancon Site Visit Logger.</p>
+</div>
+</body>
+</html>`;
+  }
+
   async function loadOrCaptureGPS(folderId) {
     state.gps = null;
     state.gpsLoading = true;
     updateGpsChipDOM();
 
+    // Look for either the new gps.html or the legacy gps.txt — first one
+    // we find wins for the local chip; we never overwrite either.
     let existing = null;
-    try { existing = await window.Drive.findFileInFolder(folderId, 'gps.txt'); }
-    catch (err) { console.warn('GPS check failed:', err.message); }
+    let existingKind = null;
+    try {
+      existing = await window.Drive.findFileInFolder(folderId, 'gps.html');
+      if (existing) existingKind = 'html';
+    } catch (err) { console.warn('GPS check failed:', err.message); }
+    if (!existing) {
+      try {
+        existing = await window.Drive.findFileInFolder(folderId, 'gps.txt');
+        if (existing) existingKind = 'txt';
+      } catch (err) { /* ignore */ }
+    }
 
     if (existing) {
       try {
         const text = await window.Drive.downloadFileText(existing.id);
-        const lat = (text.match(/Latitude:\s*([-\d.]+)/) || [])[1];
-        const lng = (text.match(/Longitude:\s*([-\d.]+)/) || [])[1];
+        const lat = (text.match(/lat(?:itude)?["\s:>=]+(-?\d+\.\d+)/i) || [])[1]
+                 || (text.match(/Latitude:\s*([-\d.]+)/) || [])[1];
+        const lng = (text.match(/(?:lon|lng)(?:gitude)?["\s:>=]+(-?\d+\.\d+)/i) || [])[1]
+                 || (text.match(/Longitude:\s*([-\d.]+)/) || [])[1];
         if (lat && lng) {
           state.gps = {
             lat: parseFloat(lat),
@@ -300,26 +359,22 @@
       async (pos) => {
         const { latitude, longitude, accuracy } = pos.coords;
         const link = `https://maps.google.com/?q=${latitude},${longitude}`;
-        const text =
-          `Captured: ${new Date().toISOString()}\n` +
-          `Tech: ${state.user?.name || 'unknown'}\n` +
-          `Latitude: ${latitude}\n` +
-          `Longitude: ${longitude}\n` +
-          `Accuracy (m): ${Math.round(accuracy)}\n` +
-          `Maps link: ${link}\n`;
+        const tech = state.user?.name || 'unknown';
+        const stamp = fmtDateTime();
+        const html = buildGpsHtml({ lat: latitude, lng: longitude, accuracy, tech, stamp, link });
 
-        // Show the chip locally first — even if upload fails, the tech
-        // can confirm the position was captured.
         state.gps = { lat: latitude, lng: longitude, link };
         state.gpsLoading = false;
         updateGpsChipDOM();
 
-        // Push gps.txt through the regular upload queue so transient
+        // Push gps.html through the regular upload queue so transient
         // failures (offline, 5xx) get the same retry/backoff machinery
-        // as photos. Existing gps.txt? Skip — first writer wins.
+        // as photos. Existing GPS file? Skip — first writer wins.
         try {
-          const recheck = await window.Drive.findFileInFolder(folderId, 'gps.txt');
-          if (recheck) return;
+          const checkHtml = await window.Drive.findFileInFolder(folderId, 'gps.html');
+          if (checkHtml) return;
+          const checkTxt = await window.Drive.findFileInFolder(folderId, 'gps.txt');
+          if (checkTxt) return;
         } catch (err) {
           console.warn('[gps] findFile failed, queuing upload anyway:', err.message);
         }
@@ -327,9 +382,9 @@
           await window.DB.queueAdd({
             projectId: folderId,
             projectName: state.currentProjectName,
-            fileName: 'gps.txt',
-            mimeType: 'text/plain',
-            blob: new Blob([text], { type: 'text/plain' }),
+            fileName: 'gps.html',
+            mimeType: 'text/html',
+            blob: new Blob([html], { type: 'text/html' }),
             kind: 'gps',
             status: 'pending',
             attempts: 0
@@ -515,24 +570,6 @@
     });
   }
 
-  async function openCameraForAttachment() {
-    if (!ensureProject()) return;
-    // single-shot photo; capture promotes to draftAttachment then closes camera.
-    let attachedThisOpen = false;
-    window.Camera.open({
-      mode: 'single',
-      onCapture: async (blob, mime) => {
-        if (attachedThisOpen) return;
-        attachedThisOpen = true;
-        await enqueueCapture(blob, mime, 'photo', { setDraftAttachment: true });
-      },
-      onClose: () => {
-        // After camera closes, focus the textarea so the user can keep typing.
-        setTimeout(() => document.getElementById('notes-textarea')?.focus(), 100);
-      }
-    });
-  }
-
   // ---------- Voice & notes ----------
   function startVoiceNote() {
     if (!ensureProject()) return;
@@ -557,7 +594,6 @@
     const stamp = fmtDateTime();
     const tech = state.user?.name || 'unknown';
 
-    const attachLine = state.draftAttachment ? `\n[photo: ${state.draftAttachment.name}]` : '';
     const saveBtn = document.getElementById('save-note-btn');
     if (saveBtn) saveBtn.disabled = true;
 
@@ -568,33 +604,33 @@
         if (!original) throw new Error('Original note not found');
         if (!state.notesFileId) throw new Error('Notes file not loaded yet');
 
-        const editedBody = `${text}${attachLine}\n_(edited ${stamp})_`;
+        const editedBody = `${text}\n_(edited ${stamp})_`;
         const updatedEntry = { ts: original.ts, tech: original.tech, body: editedBody };
 
+        // parseNotesAll preserves soft-deleted entries so editing one note
+        // doesn't inadvertently drop the audit trail.
         const fileText = await window.Drive.downloadFileText(state.notesFileId);
-        const fresh = parseNotes(fileText);
-        const matchIdx = fresh.findIndex(
+        const all = parseNotesAll(fileText);
+        const matchIdx = all.findIndex(
           (e) => e.ts === original.ts && e.tech === original.tech && e.body === original.body
         );
-        if (matchIdx >= 0) fresh[matchIdx] = updatedEntry;
-        else fresh.unshift(updatedEntry); // safety: prepend if not found
+        if (matchIdx >= 0) all[matchIdx] = updatedEntry;
+        else all.unshift(updatedEntry); // safety: prepend if not found
 
-        const newText = serializeNotes(fresh);
+        const newText = serializeNotes(all);
         const blob = new Blob([newText], { type: 'text/plain' });
         await window.Drive.updateFileContent(state.notesFileId, blob, 'text/plain');
 
         state.notesEntries[state.editingNoteIdx] = updatedEntry;
         state.editingNoteIdx = null;
-        state.draftAttachment = null;
         ta.value = '';
         updateNotesHistoryDOM();
         updateNotesEditUIDOM();
-        updateAttachmentChipDOM();
         toast('Note updated', 'success');
         appendVisitLog(folderId, 'edited text note').catch(() => {});
       } else {
         // APPEND path: new note
-        const block = `\n--- ${stamp} — ${tech} ---\n${text}${attachLine}\n`;
+        const block = `\n--- ${stamp} — ${tech} ---\n${text}\n`;
         const result = await window.Drive.appendToTextFile({
           folderId,
           fileName: 'notes.txt',
@@ -604,10 +640,8 @@
         state.notesFileId = result.id;
         await window.DB.kvSet(`notesFileId:${folderId}`, result.id);
         ta.value = '';
-        state.notesEntries.unshift({ ts: stamp, tech, body: `${text}${attachLine}` });
-        state.draftAttachment = null;
+        state.notesEntries.unshift({ ts: stamp, tech, body: text });
         updateNotesHistoryDOM();
-        updateAttachmentChipDOM();
         toast('Note saved', 'success');
         appendVisitLog(folderId, 'added text note').catch(() => {});
       }
@@ -622,11 +656,9 @@
     const note = state.notesEntries[idx];
     if (!note) return;
     state.editingNoteIdx = idx;
-    const parsed = parseNoteBody(note.body);
-    // Strip prior "(edited)" footer when loading into the editor — fresh save
-    // will re-add an updated one.
-    const cleanBody = parsed.body.replace(/\n?_\(edited [^)]+\)_\s*$/, '');
-    state.draftAttachment = parsed.attachment ? { name: parsed.attachment } : null;
+    // Strip a prior "(edited TS)" footer when loading into the editor —
+    // a fresh save will append a new one.
+    const cleanBody = note.body.replace(/\n?_\(edited [^)]+\)_\s*$/, '');
     const ta = document.getElementById('notes-textarea');
     if (ta) {
       ta.value = cleanBody;
@@ -634,36 +666,13 @@
       ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
     updateNotesEditUIDOM();
-    updateAttachmentChipDOM();
   }
 
   function cancelEditNote() {
     state.editingNoteIdx = null;
-    state.draftAttachment = null;
     const ta = document.getElementById('notes-textarea');
     if (ta) ta.value = '';
     updateNotesEditUIDOM();
-    updateAttachmentChipDOM();
-  }
-
-  // Note body may end with "[photo: filename.jpg]". Extract that out so we
-  // can render the attachment as a thumbnail.
-  function parseNoteBody(body) {
-    const m = body.match(/\n?\[photo:\s*([^\]\n]+)\]\s*$/m);
-    if (m) {
-      return { body: body.replace(m[0], '').trimEnd(), attachment: m[1].trim() };
-    }
-    // Also catch inline (in case of edited text where attachment isn't last)
-    const inline = body.match(/\[photo:\s*([^\]\n]+)\]/);
-    if (inline) {
-      return { body: body.replace(inline[0], '').trim(), attachment: inline[1].trim() };
-    }
-    return { body, attachment: null };
-  }
-
-  function findThumbByName(name) {
-    if (!name) return null;
-    return state.thumbs.find((t) => t.name === name) || null;
   }
 
   // state.thumbs is rebuilt every time the tech enters a project, so any
@@ -672,81 +681,6 @@
   // they're always played by passing fileId to VideoPlayer.
   function itemAlive(thumb) {
     return !!(thumb && thumb.objectUrl);
-  }
-
-  // -------- Note attachments --------
-  // Single combined sheet: a primary "Take new photo" CTA at the top and
-  // a grid of project photos below. Empty gallery shows a friendly empty
-  // state instead of toasting and dead-ending.
-  function openAttachmentChooser() {
-    console.log('[attach] open chooser; project=', state.currentProjectId);
-    if (!ensureProject()) return;
-    const photos = state.thumbs.filter((t) => t.type === 'photo');
-    console.log('[attach] gallery photo count:', photos.length);
-
-    const root = document.getElementById('overlay-root');
-    root.innerHTML = `
-      <div class="modal-backdrop attach-backdrop">
-        <div class="attach-sheet">
-          <div class="modal-header">
-            <h3>Attach photo to note</h3>
-            <button class="modal-x" id="attach-x" aria-label="Close">✕</button>
-          </div>
-
-          <button class="attach-action primary" id="attach-take" type="button">
-            <span class="attach-action-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M3 8.5C3 7.67 3.67 7 4.5 7H7l1.4-1.87A1.5 1.5 0 0 1 9.6 4.5h4.8c.47 0 .91.22 1.2.6L17 7h2.5c.83 0 1.5.67 1.5 1.5V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8.5z"/>
-                <circle cx="12" cy="13" r="4"/>
-              </svg>
-            </span>
-            <span class="attach-action-text">
-              <strong>Take new photo</strong>
-              <small>Opens the in-app camera</small>
-            </span>
-          </button>
-
-          <div class="attach-divider"><span>Or pick from this project</span></div>
-
-          ${photos.length === 0
-            ? '<div class="attach-empty">No photos in this project yet. Use Take new photo above.</div>'
-            : `<div class="attach-grid">${photos.map((t, idx) => `
-                <button class="attach-thumb" data-pick-idx="${idx}" type="button">
-                  ${t.src ? `<img src="${escapeHtml(t.src)}" alt=""/>` : ''}
-                </button>
-              `).join('')}</div>`
-          }
-        </div>
-      </div>
-    `;
-
-    document.getElementById('attach-x').addEventListener('click', closeAttachmentChooser);
-    document.getElementById('attach-take').addEventListener('click', () => {
-      console.log('[attach] take new tapped');
-      closeAttachmentChooser();
-      openCameraForAttachment();
-    });
-    root.querySelectorAll('[data-pick-idx]').forEach((b) => {
-      b.addEventListener('click', () => {
-        const idx = parseInt(b.dataset.pickIdx, 10);
-        const t = photos[idx];
-        if (!t) return;
-        console.log('[attach] picked from gallery:', t.name);
-        state.draftAttachment = { name: t.name, fileId: t.fileId || null };
-        closeAttachmentChooser();
-        updateAttachmentChipDOM();
-        toast('Photo attached to note', 'success', 1500);
-      });
-    });
-  }
-  function closeAttachmentChooser() {
-    const root = document.getElementById('overlay-root');
-    if (root) root.innerHTML = '';
-  }
-
-  function clearDraftAttachment() {
-    state.draftAttachment = null;
-    updateAttachmentChipDOM();
   }
 
   function ensureProject() {
@@ -806,11 +740,6 @@
     state.thumbs.unshift(thumb);
     updateThumbsDOM();
     pumpQueue();
-
-    if (opts.setDraftAttachment && kind === 'photo') {
-      state.draftAttachment = { name: fileName, queueId: item.id };
-      updateAttachmentChipDOM();
-    }
   }
 
   function patchThumbByQueueId(queueId, patch) {
@@ -998,7 +927,8 @@
     }
   }
 
-  function parseNotes(text) {
+  // Returns ALL parsed entries (visible + soft-deleted), newest-first.
+  function parseNotesAll(text) {
     if (!text) return [];
     const re = /^---\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+—\s+(.+?)\s+---$/gm;
     const matches = [];
@@ -1015,6 +945,18 @@
       out.push({ ts: matches[i].ts, tech: matches[i].tech, body });
     }
     return out.reverse();
+  }
+
+  // A note marked as deleted starts its body with "[DELETED ts — tech]".
+  // We keep these in the Drive file forever (audit trail) but hide them
+  // from the in-app list.
+  function isDeletedNote(entry) {
+    return /^\[DELETED\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+—\s+.+?\]/.test(entry?.body || '');
+  }
+
+  // Public visible-only parser — used for the in-app list.
+  function parseNotes(text) {
+    return parseNotesAll(text).filter((e) => !isDeletedNote(e));
   }
 
   // Inverse of parseNotes — entries are newest-first; file is chronological.
@@ -1038,21 +980,30 @@
     updateNotesHistoryDOM();
 
     try {
+      const stamp = fmtDateTime();
+      const tech = state.user?.name || 'unknown';
+      // Soft delete: prepend a "[DELETED ts — tech]" marker to the original
+      // body. The block stays in notes.txt forever — never shrinks.
       const text = await window.Drive.downloadFileText(state.notesFileId);
-      const fresh = parseNotes(text); // newest-first
-      const matchIdx = fresh.findIndex(
+      const all = parseNotesAll(text);
+      const matchIdx = all.findIndex(
         (e) => e.ts === removed.ts && e.tech === removed.tech && e.body === removed.body
       );
-      if (matchIdx >= 0) fresh.splice(matchIdx, 1);
-      const newText = serializeNotes(fresh);
+      if (matchIdx >= 0) {
+        all[matchIdx] = {
+          ...all[matchIdx],
+          body: `[DELETED ${stamp} — ${tech}] ${all[matchIdx].body}`
+        };
+      }
+      const newText = serializeNotes(all);
       const blob = new Blob([newText], { type: 'text/plain' });
       await window.Drive.updateFileContent(state.notesFileId, blob, 'text/plain');
       toast('Note deleted', 'success');
-      appendVisitLog(state.currentProjectId, 'deleted text note').catch(() => {});
+      appendVisitLog(state.currentProjectId, 'deleted text note (soft)').catch(() => {});
     } catch (err) {
       console.error('[notes] delete failed:', err);
       toast(`Could not delete note: ${err.message}`, 'error', 6000);
-      refreshProjectNotes(); // pull authoritative state
+      refreshProjectNotes(); // pull authoritative state on failure
     }
   }
 
@@ -1437,14 +1388,7 @@
               <h3 class="section-h">Notes</h3>
             </div>
             <textarea id="notes-textarea" placeholder="Type a note…"></textarea>
-            <div class="attach-chip" id="attach-chip" hidden></div>
             <div class="notes-actions">
-              <button class="btn-attach" id="attach-btn" type="button">
-                <svg class="attach-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-                </svg>
-                <span>Attach photo</span>
-              </button>
               <button class="btn-secondary small" id="cancel-edit-btn" hidden>Cancel</button>
               <button class="btn-primary" id="save-note-btn">Save note</button>
             </div>
@@ -1464,7 +1408,6 @@
     document.getElementById('voice-btn').addEventListener('click', startVoiceNote);
     document.getElementById('save-note-btn').addEventListener('click', saveNote);
     document.getElementById('cancel-edit-btn').addEventListener('click', cancelEditNote);
-    document.getElementById('attach-btn').addEventListener('click', openAttachmentChooser);
     document.getElementById('sort-btn').addEventListener('click', (ev) => {
       ev.stopPropagation();
       toggleSortPopover();
@@ -1510,7 +1453,6 @@
     updateThumbsDOM();
     updateNotesHistoryDOM();
     updateNotesEditUIDOM();
-    updateAttachmentChipDOM();
     updateGpsChipDOM();
   }
   function updateCaptureTopbar() {
@@ -1754,55 +1696,39 @@
       return;
     }
     root.innerHTML = state.notesEntries.map((n, idx) => {
-      const parsed = parseNoteBody(n.body);
       const editingCls = state.editingNoteIdx === idx ? ' editing' : '';
-      let attachHtml = '';
-      if (parsed.attachment) {
-        const t = findThumbByName(parsed.attachment);
-        if (t) {
-          attachHtml = `
-            <button class="note-attach" data-note-attach="${idx}" aria-label="Open attached photo">
-              ${t.src ? `<img src="${escapeHtml(t.src)}" alt=""/>` : ''}
-            </button>`;
-        } else {
-          attachHtml = `<div class="note-attach-missing muted small">📎 ${escapeHtml(parsed.attachment)}</div>`;
-        }
-      }
       return `
-        <div class="note-item${editingCls}">
+        <div class="note-item${editingCls}" data-note-idx="${idx}">
           <div class="note-meta">
             <span>${escapeHtml(n.ts)} · ${escapeHtml(n.tech)}</span>
             <span class="note-actions">
               <button class="note-edit" data-note-edit="${idx}" aria-label="Edit note" title="Edit note">✎</button>
-              <button class="note-trash" data-note-idx="${idx}" aria-label="Delete note" title="Delete note">🗑</button>
+              <button class="note-trash" data-note-trash="${idx}" aria-label="Delete note" title="Delete note">🗑</button>
             </span>
           </div>
-          <div class="note-body">${escapeHtml(parsed.body)}</div>
-          ${attachHtml}
+          <div class="note-body">${escapeHtml(n.body)}</div>
         </div>
       `;
     }).join('');
-    root.querySelectorAll('[data-note-idx]').forEach((b) => {
-      b.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        deleteNoteAt(parseInt(b.dataset.noteIdx, 10));
+
+    // Whole-card tap opens the note for editing — pencil is purely a visual cue.
+    root.querySelectorAll('.note-item').forEach((card) => {
+      card.addEventListener('click', () => {
+        startEditNote(parseInt(card.dataset.noteIdx, 10));
       });
     });
+    // Pencil and trash live inside the card; both stop propagation so the
+    // card-tap edit handler doesn't ALSO fire.
     root.querySelectorAll('[data-note-edit]').forEach((b) => {
       b.addEventListener('click', (ev) => {
         ev.stopPropagation();
         startEditNote(parseInt(b.dataset.noteEdit, 10));
       });
     });
-    root.querySelectorAll('[data-note-attach]').forEach((b) => {
+    root.querySelectorAll('[data-note-trash]').forEach((b) => {
       b.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        const idx = parseInt(b.dataset.noteAttach, 10);
-        const parsed = parseNoteBody(state.notesEntries[idx].body);
-        const t = findThumbByName(parsed.attachment);
-        if (!t) return;
-        const tIdx = state.thumbs.indexOf(t);
-        if (tIdx >= 0) openViewerForThumb(tIdx);
+        deleteNoteAt(parseInt(b.dataset.noteTrash, 10));
       });
     });
   }
@@ -1815,25 +1741,6 @@
     if (cancelBtn) cancelBtn.hidden = !editing;
   }
 
-  function updateAttachmentChipDOM() {
-    const chip = document.getElementById('attach-chip');
-    if (!chip) return;
-    if (!state.draftAttachment) {
-      chip.hidden = true;
-      chip.innerHTML = '';
-      return;
-    }
-    chip.hidden = false;
-    const t = findThumbByName(state.draftAttachment.name);
-    chip.innerHTML = `
-      <span class="attach-chip-thumb">
-        ${t && t.src ? `<img src="${escapeHtml(t.src)}" alt=""/>` : '📎'}
-      </span>
-      <span class="attach-chip-name">${escapeHtml(state.draftAttachment.name)}</span>
-      <button class="attach-chip-x" id="attach-chip-clear" aria-label="Remove attachment">✕</button>
-    `;
-    document.getElementById('attach-chip-clear')?.addEventListener('click', clearDraftAttachment);
-  }
 
   // ---------- Project rename ----------
   function startRename() {

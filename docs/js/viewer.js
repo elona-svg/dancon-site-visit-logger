@@ -113,10 +113,14 @@ window.Viewer = (function () {
         <header class="viewer-top">
           <button class="cam-icon-btn" id="vw-close" aria-label="Close">✕</button>
           <div class="viewer-pos">${idx + 1} of ${items.length}</div>
-          <div class="viewer-actions">
-            ${canAnnotate ? `<button class="cam-icon-btn" id="vw-ann" aria-label="Annotate" title="Annotate">✎</button>` : ''}
-            ${canDelete ? `<button class="cam-icon-btn vw-trash" id="vw-del" aria-label="Delete" title="Delete">🗑</button>` : ''}
-          </div>
+          ${canAnnotate
+            ? `<button class="vw-ann-btn" id="vw-ann" aria-label="Annotate" title="Annotate">
+                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                   <path d="M12 20h9"/>
+                   <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>
+                 </svg>
+               </button>`
+            : '<span class="vw-spacer"></span>'}
         </header>
 
         <div class="viewer-stage" id="vw-stage">
@@ -126,6 +130,23 @@ window.Viewer = (function () {
 
         <button class="viewer-arrow left"  id="vw-prev" aria-label="Previous" ${idx === 0 ? 'disabled' : ''}>‹</button>
         <button class="viewer-arrow right" id="vw-next" aria-label="Next"     ${idx === items.length - 1 ? 'disabled' : ''}>›</button>
+
+        <button class="vw-download-btn" id="vw-dl" aria-label="Save to device" title="Save to device">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 4v12"/>
+            <path d="M6 12l6 6 6-6"/>
+            <path d="M4 21h16"/>
+          </svg>
+        </button>
+
+        ${canDelete ? `
+          <button class="vw-trash-btn" id="vw-del" aria-label="Delete" title="Delete">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 6h18"/>
+              <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+            </svg>
+          </button>` : ''}
 
         <footer class="viewer-bottom">
           <div class="viewer-name">${escapeHtml(item.name || '')}</div>
@@ -141,6 +162,7 @@ window.Viewer = (function () {
     document.getElementById('vw-ann')?.addEventListener('click', () => {
       if (onAnnotateCb) onAnnotateCb(items[idx]);
     });
+    document.getElementById('vw-dl')?.addEventListener('click', () => downloadCurrent());
     document.getElementById('vw-del')?.addEventListener('click', () => {
       if (!onDeleteCb) return;
       if (!confirm('Delete this file?')) return;
@@ -232,6 +254,38 @@ window.Viewer = (function () {
     if (img.complete && img.naturalWidth > 0) {
       img.hidden = false;
       if (loading) loading.style.display = 'none';
+    }
+  }
+
+  async function downloadCurrent() {
+    const item = items[idx];
+    if (!item) return;
+    try {
+      // Prefer the resolved blob from the viewer cache (full quality, already fetched).
+      const cachedUrl = resolvedSrc.get(idx) || item.objectUrl || null;
+      let blob;
+      if (cachedUrl) {
+        const res = await fetch(cachedUrl);
+        blob = await res.blob();
+      } else if (item.fileId) {
+        const token = await window.Auth.getAccessToken();
+        const res = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${item.fileId}?alt=media&supportsAllDrives=true`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        blob = await res.blob();
+      } else if (item.src) {
+        const res = await fetch(item.src);
+        blob = await res.blob();
+      } else {
+        throw new Error('No source for this image');
+      }
+      window.UI.downloadBlob(blob, item.name || 'photo.jpg');
+      window.UI.toast('Saved to device', 'success', 1800);
+    } catch (err) {
+      console.error('[viewer] download failed:', err);
+      window.UI.toast(`Download failed: ${err.message}`, 'error', 4000);
     }
   }
 
