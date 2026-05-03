@@ -1173,26 +1173,6 @@ body.camera-fs-open #app { display: none; }
   box-shadow: 0 0 0 2px #111 inset;
 }
 
-/* Permission pre-prompt */
-.perm-backdrop {
-  align-items: center;
-  padding: 24px;
-}
-.perm-card {
-  background: #fff;
-  border-radius: 20px;
-  padding: 28px 24px;
-  max-width: 380px;
-  width: 100%;
-  text-align: center;
-  display: flex; flex-direction: column; gap: 12px; align-items: center;
-  box-shadow: 0 30px 60px rgba(0,0,0,0.25);
-}
-.perm-icons { font-size: 36px; }
-.perm-card h2 { margin: 0; font-size: 20px; }
-.perm-card p { margin: 0 0 4px; font-size: 14px; line-height: 1.4; }
-.perm-card .btn-primary { width: 100%; }
-
 /* Note item + tap-to-edit */
 .note-item { cursor: pointer; transition: background 120ms; }
 .note-item:active { background: #f4f4f5; }

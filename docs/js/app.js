@@ -355,52 +355,86 @@
       updateGpsChipDOM();
       return;
     }
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        const { latitude, longitude, accuracy } = pos.coords;
-        const link = `https://maps.google.com/?q=${latitude},${longitude}`;
-        const tech = state.user?.name || 'unknown';
-        const stamp = fmtDateTime();
-        const html = buildGpsHtml({ lat: latitude, lng: longitude, accuracy, tech, stamp, link });
 
-        state.gps = { lat: latitude, lng: longitude, link };
-        state.gpsLoading = false;
-        updateGpsChipDOM();
+    // Background retry strategy: 10s low-accuracy, 30s high-accuracy,
+    // 60s high-accuracy. Total ~100s. The chip stays in "Capturing GPS…"
+    // through the whole sequence; only after every attempt errors out do
+    // we flip to "GPS unavailable". The user is never blocked — this
+    // runs in the background while they capture photos / take notes.
+    const attempts = [
+      { enableHighAccuracy: false, timeout: 10000, maximumAge: 60000 },
+      { enableHighAccuracy: true,  timeout: 30000, maximumAge: 30000 },
+      { enableHighAccuracy: true,  timeout: 60000, maximumAge: 0      }
+    ];
+    runGpsAttempts(folderId, attempts);
+  }
 
-        // Push gps.html through the regular upload queue so transient
-        // failures (offline, 5xx) get the same retry/backoff machinery
-        // as photos. Existing GPS file? Skip — first writer wins.
-        try {
-          const checkHtml = await window.Drive.findFileInFolder(folderId, 'gps.html');
-          if (checkHtml) return;
-          const checkTxt = await window.Drive.findFileInFolder(folderId, 'gps.txt');
-          if (checkTxt) return;
-        } catch (err) {
-          console.warn('[gps] findFile failed, queuing upload anyway:', err.message);
-        }
-        try {
-          await window.DB.queueAdd({
-            projectId: folderId,
-            projectName: state.currentProjectName,
-            fileName: 'gps.html',
-            mimeType: 'text/html',
-            blob: new Blob([html], { type: 'text/html' }),
-            kind: 'gps',
-            status: 'pending',
-            attempts: 0
-          });
-          pumpQueue();
-        } catch (err) {
-          console.warn('[gps] queue add failed:', err.message);
-        }
-      },
-      (err) => {
-        console.warn('GPS denied:', err.message);
-        state.gpsLoading = false;
-        updateGpsChipDOM();
-      },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
-    );
+  function getCurrentPositionPromise(opts) {
+    return new Promise((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, opts);
+    });
+  }
+
+  async function runGpsAttempts(folderId, attempts) {
+    let lastErr;
+    for (let i = 0; i < attempts.length; i += 1) {
+      // Bail if the tech navigated away from this project mid-retry.
+      if (state.currentProjectId !== folderId) return;
+      const opts = attempts[i];
+      console.log(`[gps] attempt ${i + 1}/${attempts.length}`,
+        `highAccuracy=${opts.enableHighAccuracy} timeout=${opts.timeout}ms`);
+      try {
+        const pos = await getCurrentPositionPromise(opts);
+        await onGpsSuccess(folderId, pos);
+        return;
+      } catch (err) {
+        lastErr = err;
+        console.warn(`[gps] attempt ${i + 1} failed:`, err.message || err.code);
+        // PERMISSION_DENIED (1) is terminal — no point retrying.
+        if (err && err.code === 1) break;
+      }
+    }
+    if (state.currentProjectId !== folderId) return;
+    console.warn('[gps] all attempts exhausted; giving up');
+    state.gps = null;
+    state.gpsLoading = false;
+    updateGpsChipDOM();
+  }
+
+  async function onGpsSuccess(folderId, pos) {
+    const { latitude, longitude, accuracy } = pos.coords;
+    const link = `https://maps.google.com/?q=${latitude},${longitude}`;
+    const tech = state.user?.name || 'unknown';
+    const stamp = fmtDateTime();
+    const html = buildGpsHtml({ lat: latitude, lng: longitude, accuracy, tech, stamp, link });
+
+    state.gps = { lat: latitude, lng: longitude, link };
+    state.gpsLoading = false;
+    updateGpsChipDOM();
+
+    try {
+      const checkHtml = await window.Drive.findFileInFolder(folderId, 'gps.html');
+      if (checkHtml) return;
+      const checkTxt = await window.Drive.findFileInFolder(folderId, 'gps.txt');
+      if (checkTxt) return;
+    } catch (err) {
+      console.warn('[gps] findFile failed, queuing upload anyway:', err.message);
+    }
+    try {
+      await window.DB.queueAdd({
+        projectId: folderId,
+        projectName: state.currentProjectName,
+        fileName: 'gps.html',
+        mimeType: 'text/html',
+        blob: new Blob([html], { type: 'text/html' }),
+        kind: 'gps',
+        status: 'pending',
+        attempts: 0
+      });
+      pumpQueue();
+    } catch (err) {
+      console.warn('[gps] queue add failed:', err.message);
+    }
   }
 
   // ---------- Visit log + filenames ----------
@@ -494,67 +528,25 @@
     });
   }
 
-  // ---------- Permissions preflight ----------
-  // Asked exactly once across app installs. After that we rely on the
-  // browser's own permission cache — getUserMedia returns instantly on
-  // 'granted', the in-camera "blocked" panel handles 'denied'.
-  let mediaPermissionsRequested = false;
+  // ---------- Permissions ----------
+  // We DO NOT call getUserMedia at boot. On iOS Safari every getUserMedia
+  // call risks re-prompting the tech, even when the browser already
+  // remembers the previous grant. Instead the OS prompt only fires when
+  // the tech actually taps Open Camera (or Record voice note) — that's
+  // the only time a stream is needed, and the prompt is in context of a
+  // user-initiated action.
+  // Here we just log the current Permissions API state for diagnostics.
+  let mediaPermissionsChecked = false;
   async function ensureMediaPermissions() {
-    if (mediaPermissionsRequested) return;
-    mediaPermissionsRequested = true;
+    if (mediaPermissionsChecked) return;
+    mediaPermissionsChecked = true;
     try {
       const cam = await window.Camera.checkPermission('camera');
       const mic = await window.Camera.checkPermission('microphone');
-      console.log('[perm] cam=', cam, 'mic=', mic);
-      const asked = await window.DB.kvGet('permissions.asked');
-      if ((cam === 'granted' && mic === 'granted') || asked) {
-        // Already settled — do nothing.
-        return;
-      }
-      // Show a one-time pre-prompt explaining why, then trigger the OS
-      // permission dialog from the user's tap on Continue.
-      await showPermissionPrePrompt();
+      console.log('[perm] state cam=', cam, 'mic=', mic, '— deferring any prompt to first Open Camera tap');
     } catch (err) {
-      console.warn('[perm] preflight error', err);
+      console.warn('[perm] check error', err);
     }
-  }
-
-  function showPermissionPrePrompt() {
-    return new Promise((resolve) => {
-      const root = document.getElementById('overlay-root');
-      root.innerHTML = `
-        <div class="modal-backdrop perm-backdrop">
-          <div class="perm-card">
-            <div class="perm-icons">📷&nbsp;&nbsp;🎙️</div>
-            <h2>One quick setup</h2>
-            <p class="muted">Site Visit needs camera and microphone access to capture photos, videos, and voice notes for your jobs. We only ask once.</p>
-            <button class="btn-primary big" id="perm-grant">Continue</button>
-            <button class="btn-ghost" id="perm-skip">Skip for now</button>
-          </div>
-        </div>
-      `;
-      const finish = async (granted) => {
-        await window.DB.kvSet('permissions.asked', true);
-        root.innerHTML = '';
-        if (granted) toast('Permissions granted', 'success', 1800);
-        resolve();
-      };
-      document.getElementById('perm-grant').addEventListener('click', async () => {
-        try {
-          const result = await window.Camera.preflightPermissions();
-          if (result === 'denied') {
-            toast('Permission denied — enable it later in browser settings', 'warn', 5000);
-            finish(false);
-          } else {
-            finish(true);
-          }
-        } catch (err) {
-          console.error('[perm] grant failed:', err);
-          finish(false);
-        }
-      });
-      document.getElementById('perm-skip').addEventListener('click', () => finish(false));
-    });
   }
 
   // ---------- Camera (fullscreen) ----------

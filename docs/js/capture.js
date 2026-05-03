@@ -394,32 +394,10 @@ window.Camera = (function () {
     if (cb) { try { cb(); } catch (err) { console.error('[camera] onClose threw:', err); } }
   }
 
-  // First-launch permission preflight. Triggers the OS camera+mic prompts
-  // and CACHES the resulting stream so the very first Camera.open after
-  // grant doesn't re-prompt. The cache TTL eventually releases the stream
-  // if the tech doesn't open the camera within ~45s of granting.
-  async function preflightPermissions() {
-    const camState = await checkPermission('camera');
-    const micState = await checkPermission('microphone');
-    if (camState === 'granted' && micState === 'granted') return 'granted';
-    if (camState === 'denied' || micState === 'denied') return 'denied';
-    try {
-      const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      cachedStream = s; // keep the grant alive so the next open is silent
-      scheduleStreamCleanup();
-      return 'granted';
-    } catch (err) {
-      console.warn('[camera] preflight rejected:', err.name);
-      if (err.name === 'NotAllowedError') return 'denied';
-      return 'error';
-    }
-  }
-
   return {
     open,
     close,
     checkPermission,
-    preflightPermissions,
     releaseStream, // call on signOut / leave-project / pagehide
     isOpen: () => isOpen
   };
