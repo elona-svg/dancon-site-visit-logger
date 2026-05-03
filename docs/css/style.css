@@ -603,31 +603,89 @@ code { background: #eef0f2; padding: 2px 6px; border-radius: 4px; font-size: 13p
 .file-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .file-meta { color: #6b7280; font-size: 12px; }
 
-/* ---------- iOS install hint banner ---------- */
-.install-banner {
-  pointer-events: auto;
-  background: #0f172a;
-  color: #fff;
-  border: 1px solid rgba(255,255,255,0.15);
-  border-radius: 14px;
-  padding: 10px 12px;
-  font-size: 13px;
-  display: flex; align-items: center; gap: 8px;
-  max-width: min(92vw, 460px);
-  box-shadow: 0 14px 28px rgba(0,0,0,0.35);
-  opacity: 0; transform: translateY(8px);
-  transition: opacity 220ms, transform 220ms;
+/* ---------- PWA install hint screen (cross-platform, blocking) ---------- */
+.install-screen {
+  position: fixed; inset: 0; z-index: 1900;
+  background: #1a1a2e;
+  color: #fafafa;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+  overflow-y: auto;
 }
-.install-banner.show { opacity: 1; transform: translateY(0); }
-.install-banner-text { flex: 1; line-height: 1.35; }
-.install-banner strong { font-weight: 700; }
-.install-banner-x {
-  width: 28px; height: 28px;
-  border-radius: 50%;
-  background: rgba(255,255,255,0.1);
+.install-card {
+  width: 100%;
+  max-width: 420px;
+  display: flex; flex-direction: column; align-items: center;
+  gap: 14px;
+  text-align: center;
+}
+.install-logo {
+  width: 92px; height: 92px;
+  border-radius: 22px;
+}
+.install-card h2 { margin: 4px 0 0; font-size: 22px; font-weight: 700; }
+.install-card p { margin: 0; font-size: 14px; line-height: 1.5; color: #cbd5e1; }
+.install-card strong { color: #fff; font-weight: 700; }
+.install-steps {
+  margin: 0;
+  padding-left: 20px;
+  text-align: left;
+  font-size: 14px;
+  line-height: 1.55;
+  color: #cbd5e1;
+}
+.install-steps li { margin: 6px 0; }
+.install-steps strong { color: #fff; }
+.btn-install-native {
+  width: 100%;
+  padding: 14px 18px;
+  background: #ea580c;
   color: #fff;
-  flex-shrink: 0;
+  border: none;
+  border-radius: 12px;
+  font-weight: 700;
+  font-size: 16px;
+  margin-top: 8px;
+  box-shadow: 0 8px 20px rgba(234,88,12,0.30);
+}
+.btn-install-native:active { background: #c2410c; transform: translateY(1px); }
+.btn-install-skip {
+  background: transparent;
+  color: #94a3b8;
   font-size: 13px;
+  padding: 6px 8px;
+  border: none;
+}
+.btn-install-skip:active { color: #cbd5e1; }
+.install-why { color: #94a3b8 !important; font-size: 12px !important; }
+
+/* ---------- Home: sync dot + skeleton ---------- */
+.recent-head { display: flex; align-items: center; justify-content: flex-start; gap: 8px; }
+.sync-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: #ea580c;
+  display: inline-block;
+  animation: sync-pulse 1.2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+@keyframes sync-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50%      { opacity: 1;    transform: scale(1.1); }
+}
+.list-skeleton {
+  display: flex; flex-direction: column; gap: 8px;
+}
+.list-skeleton > div {
+  height: 56px;
+  border-radius: 12px;
+  background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%);
+  background-size: 200% 100%;
+  animation: skel-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes skel-shimmer {
+  from { background-position: 200% 0; }
+  to   { background-position: -200% 0; }
 }
 
 /* ---------- Toasts ---------- */

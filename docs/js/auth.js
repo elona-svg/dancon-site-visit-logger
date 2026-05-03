@@ -135,10 +135,14 @@ window.Auth = (function () {
   }
 
   // ---- Token request -----------------------------------------------------
-  function requestToken() {
+  // Single GIS attempt with a strict 10s timeout. GIS can hang indefinitely
+  // when its hidden iframe is blocked (Safari ITP, popup-blocker, network
+  // glitch); without an explicit timeout the whole app stalls behind a
+  // never-resolving promise.
+  function requestTokenOnce() {
     return new Promise((resolve, reject) => {
       if (!tokenClient) return reject(new Error('Auth not initialized'));
-      const safety = setTimeout(() => reject(new Error('Token request timed out')), 30000);
+      const safety = setTimeout(() => reject(new Error('TOKEN_TIMEOUT')), 10000);
       tokenClient.callback = async (resp) => {
         clearTimeout(safety);
         if (resp.error) return reject(new Error(resp.error_description || resp.error));
@@ -157,8 +161,30 @@ window.Auth = (function () {
           reject(err);
         }
       };
-      tokenClient.requestAccessToken({ prompt: '' });
+      try { tokenClient.requestAccessToken({ prompt: '' }); }
+      catch (err) { clearTimeout(safety); reject(err); }
     });
+  }
+
+  // Wraps requestTokenOnce with exponential backoff: 5 retries after the
+  // first attempt (delays 500/1000/2000/4000/8000ms = 6 attempts total).
+  async function requestToken() {
+    const delays = [500, 1000, 2000, 4000, 8000];
+    let lastErr;
+    for (let i = 0; i <= delays.length; i += 1) {
+      try {
+        if (i > 0) console.log(`[auth] token retry ${i}/${delays.length} after ${delays[i - 1]}ms`);
+        return await requestTokenOnce();
+      } catch (err) {
+        lastErr = err;
+        const isTimeout = err && err.message === 'TOKEN_TIMEOUT';
+        console.warn('[auth] token attempt failed:', err.message || err, isTimeout ? '(timeout)' : '');
+        if (i < delays.length) {
+          await new Promise((r) => setTimeout(r, delays[i]));
+        }
+      }
+    }
+    throw lastErr || new Error('Token request failed after retries');
   }
 
   async function fetchAndVerifyUser() {
@@ -181,12 +207,17 @@ window.Auth = (function () {
     await persistUser();
   }
 
-  // Returns a valid access token. With forceRefresh=false we trust whatever
-  // is cached if it's not nominally expired. With forceRefresh=true we
-  // discard the cache and ask GIS for a new one (silent if possible).
-  // Concurrent callers share the same in-flight refresh.
+  // Returns a valid access token. With forceRefresh=false we trust the
+  // cached token as long as it has at least 2 minutes of life left — that
+  // 2-minute cushion avoids spending a refresh round-trip on a token that
+  // would expire mid-request anyway. With forceRefresh=true we discard the
+  // cache and ask GIS for a new one (with retries / backoff). Concurrent
+  // callers share the same in-flight refresh promise.
+  const TOKEN_REFRESH_CUSHION_MS = 2 * 60 * 1000;
   async function getAccessToken(forceRefresh = false) {
-    if (!forceRefresh && accessToken && Date.now() < tokenExpiresAt) return accessToken;
+    if (!forceRefresh && accessToken && (tokenExpiresAt - Date.now()) > TOKEN_REFRESH_CUSHION_MS) {
+      return accessToken;
+    }
     if (pendingRefresh) return pendingRefresh;
 
     pendingRefresh = (async () => {

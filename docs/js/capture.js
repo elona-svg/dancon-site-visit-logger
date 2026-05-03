@@ -23,16 +23,6 @@ window.Camera = (function () {
   let popstateListener = null;
   let singleShot = false;
 
-  // Stream cache so consecutive opens never re-prompt for permission.
-  // iOS Safari treats every getUserMedia call as a potential prompt unless
-  // the user picked "Always Allow on Every Visit" in the OS dialog. Holding
-  // the stream alive between opens means we only call getUserMedia once
-  // per session — every subsequent open reuses the cached stream silently.
-  // Tradeoff: privacy indicator stays on for STREAM_TTL after each close.
-  let cachedStream = null;
-  let cleanupTimer = null;
-  const STREAM_TTL_MS = 45_000;
-
   function root() { return document.getElementById('overlay-root'); }
 
   // Prefer MP4 (H264 + AAC). Drive treats MP4 with H264 as native and serves
@@ -68,30 +58,14 @@ window.Camera = (function () {
     } catch (e) { return 'unknown'; }
   }
 
-  function streamAlive(s) {
-    if (!s || !s.active) return false;
-    return s.getVideoTracks().some((t) => t.readyState === 'live');
-  }
-
+  // Always acquire a fresh stream. No cache, no TTL — when the camera
+  // overlay closes, the tracks stop immediately and the OS privacy
+  // indicator turns off. Permissions are persisted by the BROWSER once
+  // the app is installed as a PWA (handled by the install hint flow);
+  // we no longer try to keep a stream alive across overlay opens.
   async function acquireStream({ wantAudio }) {
-    if (cleanupTimer) { clearTimeout(cleanupTimer); cleanupTimer = null; }
-
-    if (streamAlive(cachedStream)) {
-      const hasAudio = cachedStream.getAudioTracks().some((t) => t.readyState === 'live');
-      if (!wantAudio || hasAudio) {
-        console.log('[camera] reusing cached stream — no prompt');
-        return cachedStream;
-      }
-      // Audio is needed but the cached stream doesn't have it. Tear down
-      // and re-acquire. This still triggers a prompt on first audio
-      // request but only once per session.
-      console.log('[camera] cache lacks audio — re-acquiring');
-      cachedStream.getTracks().forEach((t) => { try { t.stop(); } catch (e) { /* ignore */ } });
-      cachedStream = null;
-    }
-
-    console.log('[camera] acquiring fresh stream (may prompt)');
-    cachedStream = await navigator.mediaDevices.getUserMedia({
+    console.log('[camera] acquiring fresh stream');
+    return navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: 'environment' },
         width:  { ideal: 4096 },
@@ -99,24 +73,11 @@ window.Camera = (function () {
       },
       audio: wantAudio
     });
-    return cachedStream;
   }
 
-  function scheduleStreamCleanup() {
-    if (cleanupTimer) clearTimeout(cleanupTimer);
-    cleanupTimer = setTimeout(() => {
-      console.log('[camera] cache TTL expired — releasing stream');
-      releaseStream();
-    }, STREAM_TTL_MS);
-  }
-
-  function releaseStream() {
-    if (cleanupTimer) { clearTimeout(cleanupTimer); cleanupTimer = null; }
-    if (cachedStream) {
-      cachedStream.getTracks().forEach((t) => { try { t.stop(); } catch (e) { /* ignore */ } });
-      cachedStream = null;
-    }
-  }
+  // releaseStream is exposed for backwards-compat; with no cache this is
+  // a no-op. The local stream is stopped inside close().
+  function releaseStream() { /* no-op — no cached stream to release */ }
 
   async function open(opts = {}) {
     if (isOpen) return;
@@ -368,11 +329,19 @@ window.Camera = (function () {
     chunks = [];
     if (recTimerHandle) { clearInterval(recTimerHandle); recTimerHandle = null; }
 
-    // Keep the underlying stream cached so a re-open within STREAM_TTL_MS
-    // doesn't trigger a permission prompt. The cleanup timer eventually
-    // stops the tracks.
-    stream = null;
-    scheduleStreamCleanup();
+    // Stop every track immediately so the OS privacy indicator turns off
+    // the moment the overlay closes (the source of the "indicator stays
+    // on after exit" bug).
+    if (stream) {
+      stream.getTracks().forEach((t) => { try { t.stop(); } catch (e) { /* ignore */ } });
+      stream = null;
+    }
+    // Detach from the <video> element too; some browsers keep the tracks
+    // alive while the element holds the MediaStream reference.
+    const videoEl = document.getElementById('cam-fs-video');
+    if (videoEl) {
+      try { videoEl.srcObject = null; } catch (e) { /* ignore */ }
+    }
 
     if (popstateListener) {
       window.removeEventListener('popstate', popstateListener);

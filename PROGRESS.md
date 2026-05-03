@@ -65,17 +65,46 @@ can pick up exactly where this one stopped.
 ## Known follow-ups / nice-to-haves
 - (none open at the moment — see git log for the most recent changes)
 
-### Recently shipped
-- Audio playback in-app: VideoPlayer now accepts `kind: 'audio'` and
-  renders an `<audio controls autoplay>` card; tapping a voice-note
-  thumb opens the player instead of a new tab.
-- iOS Add-to-Home-Screen hint banner: shown once on iPhone Safari
-  when not running standalone, dismissible, flag persisted in IDB.
-- GPS upload now routed through the regular upload queue, so a flaky
-  network gets the same retry/backoff/persistence as photos. The
-  on-screen GPS chip is set as soon as geolocation resolves so the
-  tech sees their location immediately even if the upload is still
-  pending.
+### Recently shipped — Reliability sweep (SW v18)
+- **Token refresh** ([auth.js](docs/js/auth.js)): `requestTokenOnce` now
+  has a 10s strict per-attempt timeout; `requestToken` wraps it with 5
+  retries on exponential backoff (500/1000/2000/4000/8000ms = 6 total
+  attempts). `getAccessToken` returns the cached token instantly when
+  >2 minutes of life remain; a single in-flight `pendingRefresh` is
+  shared by concurrent callers. Auth-side errors are filtered out of
+  user-facing toasts (`friendlyErrorMessage` rewrites to "Sign-in is
+  reconnecting — please try again in a moment").
+- **Camera indicator** ([capture.js](docs/js/capture.js)): the 45s
+  stream cache is removed entirely. Every `Camera.open` acquires a
+  fresh stream; `close()` stops every track + nulls `videoEl.srcObject`
+  synchronously. App.js adds a `beforeunload` listener as a final
+  safety net alongside the existing `visibilitychange` / `pagehide`
+  hooks.
+- **GPS** ([app.js `runTwoStageGps`](docs/js/app.js)): rewritten to a
+  two-stage parallel strategy. Stage 1 is `enableHighAccuracy:false`,
+  5s timeout, 60s cache age — paints the chip immediately; if it fails
+  it retries once with `maximumAge: 300000`. Stage 2 runs in parallel
+  with `enableHighAccuracy:true`, 20s timeout, no cache; if it returns
+  a tighter `accuracy` than stage 1, the gps file is silently rewritten
+  in-place. Output is now `gps.txt` (Drive renders raw `.html` as code,
+  per office team feedback). Format: `Location captured: <ts EDT>` /
+  Tech / Latitude / Longitude / Accuracy / Google Maps.
+- **Cache-first home** ([app.js `loadProjects`](docs/js/app.js)):
+  reads `projects.cache` from IndexedDB on mount and paints instantly;
+  `listProjectFolders` runs in parallel and only diffs into state when
+  `projectsEqual` returns false. New schema is
+  `{ projects: [{id, name, modifiedTime}], cachedAt }`. A subtle
+  `.sync-dot` next to the "Recent sites" header pulses while syncing;
+  the old "Loading…" line is replaced with a `.list-skeleton` shimmer
+  on first-ever launch only.
+- **Cross-platform install hint** ([app.js `showInstallHint`](docs/js/app.js)):
+  replaces the iOS-only banner with a blocking install screen that
+  picks instructions per platform. iOS Safari → Share/Add to Home
+  Screen; Android Chrome → captures `beforeinstallprompt` and
+  surfaces an Install button that calls `prompt()`; desktop Chrome /
+  Edge → install icon in the address bar. Skipped automatically when
+  `display-mode: standalone` is true. Dismissed flag now lives in
+  `localStorage.install_hint_shown` so it survives IDB resets.
 
 ## How to keep iterating
 - Local dev: `cd docs && python3 -m http.server 8000` → http://localhost:8000

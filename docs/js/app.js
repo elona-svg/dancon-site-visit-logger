@@ -35,6 +35,7 @@
 
     projects: [],
     projectsLoading: false,
+    projectsSyncing: false,
     projectFilter: '',
 
     thumbs: [],
@@ -114,7 +115,7 @@
         loadProjects();
         ensureMediaPermissions();
       }
-      maybeShowIosInstallHint();
+      maybeShowInstallHint();
       // Reset items left in 'uploading' from a previous run (e.g. a tab
       // close mid-upload). Without this they'd be invisible to pumpQueue
       // which only picks up 'pending'/'error' rows.
@@ -162,6 +163,11 @@
     if (window.Camera.isOpen()) window.Camera.close();
     window.Camera.releaseStream();
   });
+  // Final safety net: tab/app being torn down. close() stops every track
+  // synchronously, which is what unblocks the OS privacy indicator.
+  window.addEventListener('beforeunload', () => {
+    if (window.Camera.isOpen()) window.Camera.close();
+  });
 
   // ---------- Auth handlers ----------
   async function onSignInClick() {
@@ -190,19 +196,81 @@
   }
 
   // ---------- Projects ----------
-  async function loadProjects() {
-    state.projectsLoading = true;
+  // Cache-first rendering: paint from IDB instantly, refresh in the
+  // background, diff + update only if changed. Cache schema:
+  //   { projects: [{id, name, modifiedTime}], cachedAt: timestamp }
+  const PROJECTS_CACHE_KEY = 'projects.cache';
+  let projectsCacheLoaded = false;
+
+  function projectsEqual(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (a[i].id !== b[i].id || a[i].name !== b[i].name ||
+          a[i].modifiedTime !== b[i].modifiedTime) return false;
+    }
+    return true;
+  }
+
+  async function preloadProjectsFromCache() {
+    if (projectsCacheLoaded) return;
+    projectsCacheLoaded = true;
+    try {
+      const cached = await window.DB.kvGet(PROJECTS_CACHE_KEY);
+      if (cached && Array.isArray(cached.projects) && cached.projects.length > 0) {
+        state.projects = cached.projects;
+        state.projectsLoading = false;
+        console.log('[home] cache hit:', cached.projects.length, 'projects, age',
+          Math.round((Date.now() - (cached.cachedAt || 0)) / 1000), 's');
+      }
+    } catch (e) { /* ignore */ }
     updateRecentList();
+  }
+
+  async function loadProjects() {
+    // Paint cached list immediately. Only mark "loading" (and render the
+    // skeleton) if there's nothing cached at all.
+    await preloadProjectsFromCache();
+    const hadCache = state.projects.length > 0;
+    state.projectsSyncing = true;
+    if (!hadCache) state.projectsLoading = true;
+    updateRecentList();
+    updateHomeSyncIndicatorDOM();
+
     try {
       const folders = await window.Drive.listProjectFolders({ pageSize: 200 });
+      const changed = !projectsEqual(folders, state.projects);
       state.projects = folders;
+      try {
+        await window.DB.kvSet(PROJECTS_CACHE_KEY, { projects: folders, cachedAt: Date.now() });
+      } catch (e) { /* ignore */ }
+      console.log('[home]', changed ? 'cache updated' : 'cache fresh', '-', folders.length, 'projects');
     } catch (err) {
-      console.error(err);
-      toast(`Could not list projects: ${err.message}`, 'error');
+      const msg = err && err.message || '';
+      // Auth-side failures are silenced when we already have a cached
+      // list painted — the next user action will retry naturally.
+      if (/TOKEN_TIMEOUT|Token request|Auth not initialized/i.test(msg)) {
+        console.warn('[home] live fetch deferred (auth):', msg);
+      } else {
+        console.error(err);
+        if (!hadCache) toast(`Could not list projects: ${msg}`, 'error');
+      }
     } finally {
       state.projectsLoading = false;
+      state.projectsSyncing = false;
       updateRecentList();
+      updateHomeSyncIndicatorDOM();
     }
+  }
+
+  // Map raw error messages to something the tech can act on. The bare
+  // GIS rejection ("TOKEN_TIMEOUT") is meaningless to a field user;
+  // give them the same plain instruction every time auth chokes.
+  function friendlyErrorMessage(err) {
+    const msg = (err && err.message) || String(err || 'Unknown error');
+    if (/TOKEN_TIMEOUT|Token request|popup_closed|popup_blocked|Auth not initialized/i.test(msg)) {
+      return 'Sign-in is reconnecting — please try again in a moment';
+    }
+    return msg;
   }
 
   async function openOrCreateProject(rawName) {
@@ -213,7 +281,7 @@
       enterProject(id, actualName, { created });
     } catch (err) {
       console.error(err);
-      toast(`Could not open project: ${err.message}`, 'error', 6000);
+      toast(`Could not open project: ${friendlyErrorMessage(err)}`, 'error', 6000);
     }
   }
 
@@ -261,8 +329,34 @@
   }
 
   // ---------- GPS ----------
-  // Build a polished standalone HTML page that the office team can open
-  // straight from Drive. No external resources, inline CSS only.
+  // Plain-text format. Drive renders raw .html files as code, which the
+  // office team complained about. .txt opens nicely in any browser.
+  function fmtGpsTimestamp(d = new Date()) {
+    const date = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    let tz = '';
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' }).formatToParts(d);
+      tz = (parts.find((p) => p.type === 'timeZoneName') || {}).value || '';
+    } catch (e) { /* ignore */ }
+    return tz ? `${date} ${time} ${tz}` : `${date} ${time}`;
+  }
+
+  function buildGpsTxt({ lat, lng, accuracy, tech, stamp, link }) {
+    const accStr = accuracy != null ? `±${Math.round(accuracy)}m` : 'unknown';
+    return [
+      `Location captured: ${stamp}`,
+      `Tech: ${tech}`,
+      `Latitude: ${Number(lat).toFixed(6)}`,
+      `Longitude: ${Number(lng).toFixed(6)}`,
+      `Accuracy: ${accStr}`,
+      `Google Maps: ${link}`,
+      ''
+    ].join('\n');
+  }
+
+  // Legacy: kept so we still write the previously-shipped HTML if any
+  // project already has gps.html. New captures use buildGpsTxt above.
   function buildGpsHtml({ lat, lng, accuracy, tech, stamp, link }) {
     const safeTech = escapeHtml(tech);
     const safeStamp = escapeHtml(stamp);
@@ -355,18 +449,7 @@
       updateGpsChipDOM();
       return;
     }
-
-    // Background retry strategy: 10s low-accuracy, 30s high-accuracy,
-    // 60s high-accuracy. Total ~100s. The chip stays in "Capturing GPS…"
-    // through the whole sequence; only after every attempt errors out do
-    // we flip to "GPS unavailable". The user is never blocked — this
-    // runs in the background while they capture photos / take notes.
-    const attempts = [
-      { enableHighAccuracy: false, timeout: 10000, maximumAge: 60000 },
-      { enableHighAccuracy: true,  timeout: 30000, maximumAge: 30000 },
-      { enableHighAccuracy: true,  timeout: 60000, maximumAge: 0      }
-    ];
-    runGpsAttempts(folderId, attempts);
+    runTwoStageGps(folderId);
   }
 
   function getCurrentPositionPromise(opts) {
@@ -375,48 +458,104 @@
     });
   }
 
-  async function runGpsAttempts(folderId, attempts) {
-    let lastErr;
-    for (let i = 0; i < attempts.length; i += 1) {
-      // Bail if the tech navigated away from this project mid-retry.
-      if (state.currentProjectId !== folderId) return;
-      const opts = attempts[i];
-      console.log(`[gps] attempt ${i + 1}/${attempts.length}`,
-        `highAccuracy=${opts.enableHighAccuracy} timeout=${opts.timeout}ms`);
+  // Two-stage strategy:
+  //   Stage 1 — low-accuracy (network/wifi), 5s timeout, 60s cache age.
+  //             Fast and reliable. The chip lights up as soon as this
+  //             returns so the tech sees their location immediately.
+  //             If it fails, we retry once with up to a 5-min-old cached
+  //             fix.
+  //   Stage 2 — high-accuracy (GPS), 20s timeout, no cache. Runs in
+  //             parallel; if it returns a tighter `accuracy` than Stage 1
+  //             we silently upgrade the saved file.
+  // Only when BOTH stages fail do we flip to "GPS unavailable".
+  async function runTwoStageGps(folderId) {
+    let stage1Pos = null;
+    const stage1Promise = (async () => {
       try {
-        const pos = await getCurrentPositionPromise(opts);
-        await onGpsSuccess(folderId, pos);
-        return;
+        const p = await getCurrentPositionPromise({
+          enableHighAccuracy: false, timeout: 5000, maximumAge: 60000
+        });
+        stage1Pos = p;
+        if (state.currentProjectId === folderId) {
+          await applyGpsResult(folderId, p, /* isUpgrade */ false);
+        }
+        return p;
       } catch (err) {
-        lastErr = err;
-        console.warn(`[gps] attempt ${i + 1} failed:`, err.message || err.code);
-        // PERMISSION_DENIED (1) is terminal — no point retrying.
-        if (err && err.code === 1) break;
+        console.warn('[gps] stage1 failed:', err.message || err.code);
+        if (err && err.code === 1) throw err; // PERMISSION_DENIED — terminal
+        // Retry stage 1 once with a wider cache window.
+        try {
+          const p2 = await getCurrentPositionPromise({
+            enableHighAccuracy: false, timeout: 5000, maximumAge: 300000
+          });
+          stage1Pos = p2;
+          if (state.currentProjectId === folderId) {
+            await applyGpsResult(folderId, p2, false);
+          }
+          return p2;
+        } catch (err2) {
+          console.warn('[gps] stage1 retry failed:', err2.message || err2.code);
+          throw err2;
+        }
       }
-    }
+    })();
+
+    const stage2Promise = (async () => {
+      try {
+        const p = await getCurrentPositionPromise({
+          enableHighAccuracy: true, timeout: 20000, maximumAge: 0
+        });
+        if (state.currentProjectId !== folderId) return null;
+        // Only commit if stage 2 actually came back with a better fix.
+        const s1Acc = stage1Pos?.coords?.accuracy ?? Infinity;
+        const s2Acc = p.coords.accuracy ?? Infinity;
+        if (s2Acc < s1Acc) {
+          console.log(`[gps] stage2 upgrade: ${s1Acc.toFixed(0)}m -> ${s2Acc.toFixed(0)}m`);
+          await applyGpsResult(folderId, p, /* isUpgrade */ true);
+        } else {
+          console.log('[gps] stage2 no better than stage1; skipping upgrade');
+        }
+        return p;
+      } catch (err) {
+        console.warn('[gps] stage2 failed:', err.message || err.code);
+        return null;
+      }
+    })();
+
+    const [s1, s2] = await Promise.allSettled([stage1Promise, stage2Promise]);
     if (state.currentProjectId !== folderId) return;
-    console.warn('[gps] all attempts exhausted; giving up');
-    state.gps = null;
-    state.gpsLoading = false;
-    updateGpsChipDOM();
+    if (s1.status === 'rejected' && (!s2 || s2.value == null)) {
+      console.warn('[gps] both stages failed; giving up');
+      state.gps = null;
+      state.gpsLoading = false;
+      updateGpsChipDOM();
+    }
   }
 
-  async function onGpsSuccess(folderId, pos) {
+  async function applyGpsResult(folderId, pos, isUpgrade) {
     const { latitude, longitude, accuracy } = pos.coords;
     const link = `https://maps.google.com/?q=${latitude},${longitude}`;
     const tech = state.user?.name || 'unknown';
-    const stamp = fmtDateTime();
-    const html = buildGpsHtml({ lat: latitude, lng: longitude, accuracy, tech, stamp, link });
+    const stamp = fmtGpsTimestamp(new Date());
+    const txt = buildGpsTxt({ lat: latitude, lng: longitude, accuracy, tech, stamp, link });
 
     state.gps = { lat: latitude, lng: longitude, link };
     state.gpsLoading = false;
     updateGpsChipDOM();
 
+    // Upgrade path: if a gps.txt already exists, rewrite it in place
+    // rather than creating a duplicate. Legacy gps.html files are left
+    // alone (Drive renders them as styled pages); the new .txt is added
+    // alongside.
     try {
-      const checkHtml = await window.Drive.findFileInFolder(folderId, 'gps.html');
-      if (checkHtml) return;
-      const checkTxt = await window.Drive.findFileInFolder(folderId, 'gps.txt');
-      if (checkTxt) return;
+      const existingTxt = await window.Drive.findFileInFolder(folderId, 'gps.txt');
+      if (existingTxt && isUpgrade) {
+        await window.Drive.updateFileContent(
+          existingTxt.id, new Blob([txt], { type: 'text/plain' }), 'text/plain'
+        );
+        return;
+      }
+      if (existingTxt && !isUpgrade) return; // stage-1 already wrote
     } catch (err) {
       console.warn('[gps] findFile failed, queuing upload anyway:', err.message);
     }
@@ -424,9 +563,9 @@
       await window.DB.queueAdd({
         projectId: folderId,
         projectName: state.currentProjectName,
-        fileName: 'gps.html',
-        mimeType: 'text/html',
-        blob: new Blob([html], { type: 'text/html' }),
+        fileName: 'gps.txt',
+        mimeType: 'text/plain',
+        blob: new Blob([txt], { type: 'text/plain' }),
         kind: 'gps',
         status: 'pending',
         attempts: 0
@@ -484,47 +623,107 @@
     return mime.split('/')[1]?.split(';')[0] || 'bin';
   }
 
-  // ---------- iOS Add-to-Home-Screen hint ----------
-  // Shown once on iPhone Safari when the app isn't already installed. We
-  // can't prompt programmatically on iOS — the tech has to do Share → Add
-  // to Home Screen — so we just teach them how. Dismissed flag persists
-  // so they never see it twice on the same device.
-  async function maybeShowIosInstallHint() {
+  // ---------- PWA install hint (cross-platform, one-time) ----------
+  // Camera + microphone permissions don't persist reliably for non-
+  // installed pages on iOS Safari. Installation as a PWA fixes that. On
+  // first launch we show a blocking screen with platform-specific
+  // instructions. Dismissed flag persists in localStorage so the screen
+  // never returns. Once detected as standalone we mark it dismissed
+  // automatically.
+  let deferredInstallEvent = null;
+  window.addEventListener('beforeinstallprompt', (ev) => {
+    ev.preventDefault();
+    deferredInstallEvent = ev;
+    console.log('[install] beforeinstallprompt captured — Install button will trigger native prompt');
+    const btn = document.getElementById('install-native-btn');
+    if (btn) btn.hidden = false;
+  });
+
+  function isStandalone() {
+    return window.navigator.standalone === true ||
+      window.matchMedia('(display-mode: standalone)').matches;
+  }
+
+  function detectPlatform() {
+    const ua = navigator.userAgent || '';
+    if (/iPad|iPhone|iPod/.test(ua) && !/Macintosh/.test(ua)) {
+      return /CriOS|FxiOS|EdgiOS/.test(ua) ? 'ios-other' : 'ios-safari';
+    }
+    if (/Android/.test(ua)) return 'android';
+    return 'desktop';
+  }
+
+  function maybeShowInstallHint() {
     try {
-      const dismissed = await window.DB.kvGet('iosInstallHintDismissed');
-      if (dismissed) return;
-      const ua = navigator.userAgent || '';
-      const isIos = /iPad|iPhone|iPod/.test(ua) && !/Macintosh/.test(ua);
-      const isCriOS = /CriOS|FxiOS|EdgiOS/.test(ua); // not Safari
-      const isStandalone =
-        window.navigator.standalone === true ||
-        window.matchMedia('(display-mode: standalone)').matches;
-      if (!isIos || isCriOS || isStandalone) return;
-      // Wait a beat so it doesn't compete with permission card / boot.
-      setTimeout(showIosInstallHint, 1200);
+      // If we're already running standalone, lock the flag forever.
+      if (isStandalone()) {
+        try { localStorage.setItem('install_hint_shown', '1'); } catch (e) { /* ignore */ }
+        return;
+      }
+      let shown = null;
+      try { shown = localStorage.getItem('install_hint_shown'); } catch (e) { /* ignore */ }
+      if (shown === '1') return;
+      // Defer briefly so it doesn't fight the auth/boot path.
+      setTimeout(showInstallHint, 600);
     } catch (e) { /* ignore */ }
   }
 
-  function showIosInstallHint() {
-    const root = document.getElementById('toast-root');
+  function dismissInstallHint() {
+    try { localStorage.setItem('install_hint_shown', '1'); } catch (e) { /* ignore */ }
+    const root = document.getElementById('overlay-root');
+    if (root) root.innerHTML = '';
+  }
+
+  function showInstallHint() {
+    if (isStandalone()) return;
+    const platform = detectPlatform();
+    const root = document.getElementById('overlay-root');
     if (!root) return;
-    if (document.getElementById('ios-install-hint')) return;
-    const el = document.createElement('div');
-    el.id = 'ios-install-hint';
-    el.className = 'install-banner';
-    el.innerHTML = `
-      <span class="install-banner-text">
-        Tap <strong>Share</strong> <span aria-hidden="true">⬆️</span> then
-        <strong>Add to Home Screen</strong> to install this app.
-      </span>
-      <button class="install-banner-x" id="install-banner-x" aria-label="Dismiss">✕</button>
+    if (document.getElementById('install-hint-screen')) return;
+
+    const blocks = {
+      'ios-safari': `
+        <h2>Install on iPhone</h2>
+        <ol class="install-steps">
+          <li>Tap the <strong>Share</strong> button in Safari (the square with ↑).</li>
+          <li>Scroll and choose <strong>Add to Home Screen</strong>.</li>
+          <li>Tap <strong>Add</strong>. Launch the app from your home screen — camera, mic, and sign-in will be remembered.</li>
+        </ol>`,
+      'ios-other': `
+        <h2>Install on iPhone</h2>
+        <p>Open this site in <strong>Safari</strong>, then Share → Add to Home Screen. Other iOS browsers don't support installation.</p>`,
+      'android': `
+        <h2>Install on Android</h2>
+        <p>Tap <strong>Install</strong> below — or open the Chrome menu (⋮) and choose <strong>Install app</strong>.</p>
+        <button class="btn-install-native" id="install-native-btn" ${deferredInstallEvent ? '' : 'hidden'}>Install app</button>`,
+      'desktop': `
+        <h2>Install on this computer</h2>
+        <p>Click the <strong>install</strong> icon at the right of the address bar — or open the browser menu and choose <strong>Install Site Visit Logger</strong>.</p>
+        <button class="btn-install-native" id="install-native-btn" ${deferredInstallEvent ? '' : 'hidden'}>Install app</button>`
+    };
+
+    root.innerHTML = `
+      <div class="install-screen" id="install-hint-screen">
+        <div class="install-card">
+          <img class="install-logo" src="icons/icon-192.png" alt=""/>
+          ${blocks[platform]}
+          <p class="muted small install-why">Installing keeps the camera, microphone, and sign-in granted between visits.</p>
+          <button class="btn-install-skip" id="install-hint-skip">Skip — open in browser</button>
+        </div>
+      </div>
     `;
-    root.appendChild(el);
-    requestAnimationFrame(() => el.classList.add('show'));
-    document.getElementById('install-banner-x').addEventListener('click', async () => {
-      el.classList.remove('show');
-      setTimeout(() => el.remove(), 250);
-      try { await window.DB.kvSet('iosInstallHintDismissed', true); } catch (e) { /* ignore */ }
+    document.getElementById('install-hint-skip')?.addEventListener('click', dismissInstallHint);
+    document.getElementById('install-native-btn')?.addEventListener('click', async () => {
+      if (!deferredInstallEvent) return;
+      try {
+        deferredInstallEvent.prompt();
+        const choice = await deferredInstallEvent.userChoice;
+        console.log('[install] user choice:', choice && choice.outcome);
+        deferredInstallEvent = null;
+        dismissInstallHint();
+      } catch (e) {
+        console.warn('[install] prompt failed:', e);
+      }
     });
   }
 
@@ -1264,7 +1463,10 @@
           </label>
 
           <section class="recent">
-            <h2 class="section-h">Recent sites</h2>
+            <div class="recent-head">
+              <h2 class="section-h">Recent sites</h2>
+              <span id="recent-sync" class="sync-dot" hidden aria-label="Syncing"></span>
+            </div>
             <div id="recent-list"></div>
           </section>
         </main>
@@ -1292,6 +1494,12 @@
   function updateHomeDOM() {
     updateHomeTopbar();
     updateRecentList();
+    updateHomeSyncIndicatorDOM();
+  }
+  function updateHomeSyncIndicatorDOM() {
+    const dot = document.getElementById('recent-sync');
+    if (!dot) return;
+    dot.hidden = !state.projectsSyncing;
   }
   function updateHomeTopbar() {
     const sub = document.getElementById('home-topbar-sub');
@@ -1308,7 +1516,11 @@
       ? state.projects.filter((p) => p.name.toLowerCase().includes(filter))
       : state.projects;
     if (state.projectsLoading && state.projects.length === 0) {
-      list.innerHTML = '<div class="muted">Loading…</div>';
+      // First-ever launch (no cache): skeleton, not a "Loading…" line.
+      list.innerHTML = `
+        <div class="list-skeleton" aria-hidden="true">
+          <div></div><div></div><div></div>
+        </div>`;
       return;
     }
     if (filtered.length === 0) {
