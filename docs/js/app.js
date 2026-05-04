@@ -269,11 +269,67 @@
   });
 
   // ---------- Auth handlers ----------
+  function detectPlatform() {
+    const ua = navigator.userAgent || '';
+    // iPadOS 13+ reports navigator.platform as 'MacIntel'; disambiguate via touch.
+    const isIOS = /iPad|iPhone|iPod/.test(ua) ||
+                  (navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1);
+    if (isIOS) return 'ios-safari';
+    if (/Android/i.test(ua)) return 'android-chrome';
+    return 'desktop';
+  }
+
+  function showLoginError(reason) {
+    const errEl = document.getElementById('login-error');
+    if (!errEl) {
+      toast(`Sign-in failed: ${reason}`, 'error', 8000);
+      return;
+    }
+    const platform = detectPlatform();
+    const open = (p) => p === platform ? ' open' : '';
+    errEl.innerHTML = `
+      <h3 class="login-error-title">Sign-in didn't complete</h3>
+      <p class="login-error-reason">Reason: ${escapeHtml(reason)}</p>
+      <p class="login-error-body">This usually means Safari is blocking part of the Google sign-in. Here's how to fix it (one-time setup):</p>
+      <details class="login-error-section"${open('ios-safari')}>
+        <summary>iPhone / iPad (Safari)</summary>
+        <ol>
+          <li>Open the <strong>Settings</strong> app on your phone</li>
+          <li>Tap <strong>Apps → Safari</strong></li>
+          <li>Turn <strong>OFF</strong> "Block Pop-ups"</li>
+          <li>Turn <strong>OFF</strong> "Prevent Cross-Site Tracking"</li>
+          <li>Come back and tap "Try sign-in again"</li>
+        </ol>
+      </details>
+      <details class="login-error-section"${open('android-chrome')}>
+        <summary>Android (Chrome)</summary>
+        <ol>
+          <li>Tap the three-dot menu in Chrome → <strong>Settings</strong> → <strong>Site Settings</strong></li>
+          <li>Tap <strong>Pop-ups and redirects</strong> → Allow</li>
+          <li>Tap <strong>Cookies</strong> → Allow</li>
+          <li>Come back and tap "Try sign-in again"</li>
+        </ol>
+      </details>
+      <details class="login-error-section"${open('desktop')}>
+        <summary>Desktop browser</summary>
+        <ol>
+          <li>Allow popups for <strong>elona-svg.github.io</strong> in your browser settings</li>
+          <li>Try sign-in again</li>
+        </ol>
+      </details>
+      <button type="button" id="signin-retry-btn" class="btn-signin-retry">Try sign-in again</button>
+      <a class="login-error-contact" href="mailto:elona@danconservices.com?subject=Site%20Visit%20Logger%20sign-in%20issue">Still not working? Contact Elona</a>
+    `;
+    errEl.hidden = false;
+    const retryBtn = document.getElementById('signin-retry-btn');
+    if (retryBtn) retryBtn.addEventListener('click', onSignInClick);
+  }
+
   async function onSignInClick() {
     console.log('[auth] sign-in button tapped');
     const errEl = document.getElementById('login-error');
     const btn = document.getElementById('signin-btn');
-    if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+    if (errEl) { errEl.hidden = true; errEl.innerHTML = ''; }
     if (btn) { btn.disabled = true; btn.textContent = 'Signing in…'; }
     try {
       await window.Auth.signIn();
@@ -288,14 +344,9 @@
     } catch (err) {
       console.error('[auth] signIn failed:', err);
       const reason = (err && err.message === 'TOKEN_TIMEOUT')
-        ? 'Sign-in timed out — please try again'
+        ? 'Sign-in timed out'
         : (err && err.message) || 'Sign-in failed';
-      if (errEl) {
-        errEl.hidden = false;
-        errEl.textContent = `${reason}. Tap to retry.`;
-      } else {
-        toast(`Sign-in failed: ${reason}`, 'error', 8000);
-      }
+      showLoginError(reason);
       if (btn) { btn.disabled = false; btn.textContent = 'Sign in with Google'; }
     }
   }
