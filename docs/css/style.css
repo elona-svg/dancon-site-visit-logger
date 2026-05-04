@@ -736,6 +736,79 @@ code { background: #eef0f2; padding: 2px 6px; border-radius: 4px; font-size: 13p
 .file-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .file-meta { color: #6b7280; font-size: 12px; }
 
+/* Gallery cards (videos + voice notes) — tap opens in-app player. */
+.gallery-card-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.gallery-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.gallery-card:active { background: #f4f4f5; }
+.gallery-card-thumb {
+  position: relative;
+  flex: 0 0 auto;
+  width: 96px;
+  height: 64px;
+  background: #111827;
+  color: #cbd5e1;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+}
+.gallery-card-thumb img {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%; object-fit: cover;
+}
+.gallery-card-thumb .play-overlay {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.32);
+  color: #fff;
+  font-size: 24px;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+}
+.gallery-card.audio .gallery-card-thumb { background: #1e293b; }
+.gallery-card-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.gallery-card-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: #111827;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gallery-card-size { color: #6b7280; font-size: 12px; }
+.gallery-card-trash {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: rgba(220,38,38,0.88);
+  color: #fff;
+  font-size: 22px;
+  border-radius: 12px;
+  cursor: pointer;
+  display: none;
+  align-items: center;
+  justify-content: center;
+}
+.gallery-card.show-trash .gallery-card-trash { display: flex; }
+.gallery-card.show-trash .gallery-card-trash:active {
+  background: rgba(185,28,28,0.92);
+  transform: scale(0.98);
+}
+
 /* ---------- Heartbeat status dot ---------- */
 .conn-dot {
   position: fixed;

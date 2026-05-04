@@ -1795,21 +1795,70 @@
   }
 
   // ---------- Drive (gallery) view ----------
+  // Cache-first paint: read project.{folderId}.cache (same cache used by the
+  // capture-screen thumb strip) and render immediately, then refresh from
+  // Drive in the background. First-ever open with no cache shows a brief
+  // skeleton; subsequent opens paint within ~150ms.
+  let galleryLoadToken = 0;
   async function openGallery() {
     if (!ensureProject()) return;
     if (window.Camera.isOpen()) window.Camera.close();
+    const folderId = state.currentProjectId;
+    const myToken = ++galleryLoadToken;
     state.view = 'gallery';
-    state.galleryLoading = true;
     state.galleryFiles = [];
+    state.galleryLoading = true;
+    setGalleryLongPressed(null);
     scheduleRender();
+
     try {
-      const files = await window.Drive.listFolderFiles(state.currentProjectId);
-      state.galleryFiles = files;
+      const cached = await window.DB.kvGet(projectCacheKey(folderId));
+      if (cached && Array.isArray(cached.files) && cached.files.length > 0
+          && myToken === galleryLoadToken
+          && state.currentProjectId === folderId && state.view === 'gallery') {
+        state.galleryFiles = cached.files;
+        state.galleryLoading = false;
+        console.log('[gallery] cache hit:', cached.files.length, 'files, age',
+          Math.round((Date.now() - (cached.cachedAt || 0)) / 1000), 's');
+        updateGalleryListDOM();
+      }
+    } catch (e) { /* ignore */ }
+
+    try {
+      const files = await window.Drive.listFolderFiles(folderId);
+      // Invalidate result if the user navigated away or a delete bumped the
+      // token — otherwise a stale list would re-include deleted files.
+      if (myToken !== galleryLoadToken) return;
+      if (state.currentProjectId !== folderId || state.view !== 'gallery') return;
+      try {
+        await window.DB.kvSet(projectCacheKey(folderId), {
+          files: files.map((f) => ({
+            id: f.id, name: f.name, mimeType: f.mimeType,
+            size: f.size, modifiedTime: f.modifiedTime,
+            createdTime: f.createdTime,
+            thumbnailLink: f.thumbnailLink || '',
+            webViewLink: f.webViewLink || ''
+          })),
+          cachedAt: Date.now()
+        });
+      } catch (e) { /* ignore */ }
+      if (!fileListEqual(state.galleryFiles, files)) {
+        state.galleryFiles = files;
+        updateGalleryListDOM();
+      }
     } catch (err) {
-      toast(`Could not load Drive: ${err.message}`, 'error');
+      if (myToken !== galleryLoadToken) return;
+      // If we already painted from cache, don't toast over a working view.
+      if (!state.galleryFiles || state.galleryFiles.length === 0) {
+        toast(`Could not load Drive: ${err.message}`, 'error');
+      } else {
+        console.warn('[gallery] background refresh failed:', err.message);
+      }
     } finally {
-      state.galleryLoading = false;
-      updateGalleryListDOM();
+      if (myToken === galleryLoadToken) {
+        state.galleryLoading = false;
+        updateGalleryListDOM();
+      }
     }
   }
 
@@ -2534,53 +2583,175 @@
   function updateGalleryDOM() {
     updateGalleryListDOM();
   }
+
+  // ---------- Gallery long-press (mirror of capture-screen pattern) ----------
+  let galleryLpId = null;
+  let galleryLpTimer = null;
+  let galleryLpSuppressClick = false;
+  let galleryDocListenerAttached = false;
+
+  function clearGalleryLongPress() {
+    if (galleryLpTimer) { clearTimeout(galleryLpTimer); galleryLpTimer = null; }
+  }
+  function setGalleryLongPressed(key) {
+    galleryLpId = key;
+    document.querySelectorAll('.thumb.gallery-thumb.show-trash, .gallery-card.show-trash')
+      .forEach((el) => el.classList.remove('show-trash'));
+    if (key != null) {
+      const el = document.querySelector(`[data-gallery-key="${CSS.escape(String(key))}"]`);
+      if (el) el.classList.add('show-trash');
+      if (navigator.vibrate) try { navigator.vibrate(20); } catch (e) { /* ignore */ }
+    }
+  }
+  function attachGalleryLongPress(root) {
+    root.querySelectorAll('[data-gallery-key]').forEach((el) => {
+      const key = el.dataset.galleryKey;
+      el.addEventListener('pointerdown', () => {
+        clearGalleryLongPress();
+        galleryLpTimer = setTimeout(() => {
+          galleryLpSuppressClick = true;
+          setGalleryLongPressed(key);
+        }, 500);
+      });
+      ['pointerup', 'pointercancel', 'pointerleave'].forEach((evt) => {
+        el.addEventListener(evt, clearGalleryLongPress);
+      });
+    });
+    if (!galleryDocListenerAttached) {
+      galleryDocListenerAttached = true;
+      document.addEventListener('pointerdown', (ev) => {
+        if (state.view !== 'gallery') return;
+        if (galleryLpId == null) return;
+        if (ev.target.closest('[data-gallery-key]')) return;
+        setGalleryLongPressed(null);
+      }, { capture: true });
+    }
+  }
+
+  async function deleteGalleryFile(file) {
+    if (!file) return;
+    const mime = file.mimeType || '';
+    // Stop any in-flight playback that might hold this file's blob.
+    if ((mime.startsWith('audio/') || mime.startsWith('video/')) && window.VideoPlayer?.isOpen()) {
+      try { window.VideoPlayer.close(); } catch (e) { /* ignore */ }
+    }
+    try {
+      await window.Drive.deleteFile(file.id);
+    } catch (err) {
+      toast(`Delete failed: ${err.message}`, 'error');
+      return;
+    }
+    // Voice notes: also remove paired _transcript.txt sibling (if any).
+    let transcriptId = null;
+    if (mime.startsWith('audio/') && file.name) {
+      const transcriptName = file.name.replace(/\.[^.]+$/, '_transcript.txt');
+      try {
+        const t = await window.Drive.findFileInFolder(state.currentProjectId, transcriptName);
+        if (t) { transcriptId = t.id; await window.Drive.deleteFile(t.id); }
+      } catch (e) { /* best-effort */ }
+    }
+    const kindLabel = mime.startsWith('audio/') ? 'voice recording'
+      : mime.startsWith('video/') ? 'video'
+      : mime.startsWith('image/') ? 'photo'
+      : 'file';
+    appendVisitLog(state.currentProjectId, `[DELETED ${kindLabel} ${file.name}]`).catch(() => {});
+
+    // Invalidate any in-flight gallery refresh — its stale list would
+    // otherwise re-include the file we just deleted.
+    galleryLoadToken += 1;
+
+    // In-memory: gallery list + capture-screen thumbs (they share a fileId).
+    state.galleryFiles = (state.galleryFiles || []).filter((f) => f.id !== file.id && (transcriptId == null || f.id !== transcriptId));
+    state.thumbs = state.thumbs.filter((t) => t.fileId !== file.id && (transcriptId == null || t.fileId !== transcriptId));
+
+    // Persistent cache: keep next open from re-painting the deleted entry.
+    try {
+      const folderId = state.currentProjectId;
+      const cached = await window.DB.kvGet(projectCacheKey(folderId));
+      if (cached && Array.isArray(cached.files)) {
+        cached.files = cached.files.filter((f) => f.id !== file.id && (transcriptId == null || f.id !== transcriptId));
+        cached.cachedAt = Date.now();
+        await window.DB.kvSet(projectCacheKey(folderId), cached);
+      }
+    } catch (e) { /* ignore */ }
+
+    setGalleryLongPressed(null);
+    updateGalleryListDOM();
+    toast('Deleted', 'success');
+  }
+
   function updateGalleryListDOM() {
     const root = document.getElementById('gallery-main');
     if (!root) return;
     const files = state.galleryFiles || [];
-    document.getElementById('gallery-count').textContent = `${files.length} files`;
-    if (state.galleryLoading) { root.innerHTML = '<div class="muted">Loading…</div>'; return; }
+    const countEl = document.getElementById('gallery-count');
+    if (countEl) countEl.textContent = `${files.length} files`;
+
+    // First-ever open with no cache: skeleton. Otherwise cache paint already
+    // populated `files` and we render normally even while a refresh runs.
+    if (state.galleryLoading && files.length === 0) {
+      root.innerHTML = `
+        <div class="thumb-skeleton" aria-hidden="true">
+          <div></div><div></div><div></div><div></div><div></div><div></div>
+        </div>`;
+      return;
+    }
     if (files.length === 0) {
       root.innerHTML = '<div class="muted">No files yet — start capturing.</div>';
       return;
     }
+
     const images = files.filter((f) => (f.mimeType || '').startsWith('image/'));
     const videos = files.filter((f) => (f.mimeType || '').startsWith('video/'));
     const audios = files.filter((f) => (f.mimeType || '').startsWith('audio/'));
-    const docs = files.filter((f) => /\.txt$/i.test(f.name));
+    const docs = files.filter((f) =>
+      /\.txt$/i.test(f.name) && !(f.mimeType || '').startsWith('audio/'));
+
+    const photoCellHtml = (f) => `
+      <div class="thumb gallery-thumb" data-gallery-key="${escapeHtml(f.id)}" data-gallery-id="${escapeHtml(f.id)}" data-gallery-mime="${escapeHtml(f.mimeType || '')}">
+        ${f.thumbnailLink ? `<img loading="lazy" alt="" src="${escapeHtml(upscaleDriveThumb(f.thumbnailLink))}" onerror="this.style.display='none'"/>` : ''}
+        <span class="thumb-label">${escapeHtml(f.name)}</span>
+        <button class="thumb-trash" data-gallery-action="delete" aria-label="Delete">🗑</button>
+      </div>`;
+
+    const videoCardHtml = (f) => `
+      <div class="gallery-card video" data-gallery-key="${escapeHtml(f.id)}" data-gallery-id="${escapeHtml(f.id)}" data-gallery-mime="${escapeHtml(f.mimeType || '')}" data-gallery-name="${escapeHtml(f.name)}">
+        <div class="gallery-card-thumb">
+          ${f.thumbnailLink ? `<img loading="lazy" alt="" src="${escapeHtml(upscaleDriveThumb(f.thumbnailLink))}" onerror="this.style.display='none'"/>` : ''}
+          <div class="play-overlay">▶</div>
+        </div>
+        <div class="gallery-card-meta">
+          <span class="gallery-card-name">${escapeHtml(f.name)}</span>
+          <span class="gallery-card-size">${escapeHtml(fmtBytes(Number(f.size || 0)))}</span>
+        </div>
+        <button class="gallery-card-trash" data-gallery-action="delete" aria-label="Delete">🗑</button>
+      </div>`;
+
+    const audioCardHtml = (f) => `
+      <div class="gallery-card audio" data-gallery-key="${escapeHtml(f.id)}" data-gallery-id="${escapeHtml(f.id)}" data-gallery-mime="${escapeHtml(f.mimeType || '')}" data-gallery-name="${escapeHtml(f.name)}">
+        <div class="gallery-card-thumb"><span aria-hidden="true">🎙</span></div>
+        <div class="gallery-card-meta">
+          <span class="gallery-card-name">${escapeHtml(f.name)}</span>
+          <span class="gallery-card-size">${escapeHtml(fmtBytes(Number(f.size || 0)))}</span>
+        </div>
+        <button class="gallery-card-trash" data-gallery-action="delete" aria-label="Delete">🗑</button>
+      </div>`;
 
     root.innerHTML = `
       ${images.length ? `
         <h3 class="section-h">Photos (${images.length})</h3>
         <div class="thumb-grid">
-          ${images.map((f) => `
-            <button class="thumb" data-file-id="${escapeHtml(f.id)}" data-file-name="${escapeHtml(f.name)}">
-              ${f.thumbnailLink ? `<img loading="lazy" alt="" src="${escapeHtml(upscaleDriveThumb(f.thumbnailLink))}" onerror="this.style.display='none'"/>` : ''}
-              <span class="thumb-label">${escapeHtml(f.name)}</span>
-            </button>
-          `).join('')}
+          ${images.map(photoCellHtml).join('')}
         </div>` : ''}
       ${videos.length ? `
         <h3 class="section-h">Videos (${videos.length})</h3>
-        <div class="file-list">
-          ${videos.map((f) => `
-            <a class="file-row" href="${escapeHtml(f.webViewLink || '#')}" target="_blank" rel="noopener">
-              <span class="file-glyph">🎥</span>
-              <span class="file-name">${escapeHtml(f.name)}</span>
-              <span class="file-meta">${escapeHtml(fmtBytes(Number(f.size || 0)))}</span>
-            </a>
-          `).join('')}
+        <div class="gallery-card-list">
+          ${videos.map(videoCardHtml).join('')}
         </div>` : ''}
       ${audios.length ? `
         <h3 class="section-h">Voice notes (${audios.length})</h3>
-        <div class="file-list">
-          ${audios.map((f) => `
-            <a class="file-row" href="${escapeHtml(f.webViewLink || '#')}" target="_blank" rel="noopener">
-              <span class="file-glyph">🎙️</span>
-              <span class="file-name">${escapeHtml(f.name)}</span>
-              <span class="file-meta">${escapeHtml(fmtBytes(Number(f.size || 0)))}</span>
-            </a>
-          `).join('')}
+        <div class="gallery-card-list">
+          ${audios.map(audioCardHtml).join('')}
         </div>` : ''}
       ${docs.length ? `
         <h3 class="section-h">Notes &amp; log</h3>
@@ -2594,14 +2765,45 @@
         </div>` : ''}
     `;
 
-    root.querySelectorAll('.thumb-grid .thumb').forEach((el) => {
-      el.addEventListener('click', () => {
-        const fileId = el.dataset.fileId;
-        const fileName = el.dataset.fileName;
-        // Open in viewer using Drive content URL via authed fetch.
-        const item = images.find((f) => f.id === fileId);
-        annotateFromDrive(fileId);
+    // Trash button click → confirm + delete.
+    root.querySelectorAll('[data-gallery-action="delete"]').forEach((btn) => {
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const card = btn.closest('[data-gallery-key]');
+        const id = card?.dataset.galleryId;
+        const file = files.find((f) => f.id === id);
+        if (!file) return;
+        const label = (file.mimeType || '').startsWith('audio/') ? 'voice recording'
+          : (file.mimeType || '').startsWith('video/') ? 'video'
+          : 'photo';
+        if (confirm(`Delete this ${label}?`)) deleteGalleryFile(file);
+        else setGalleryLongPressed(null);
       });
     });
+
+    // Card tap → photo viewer / video player / audio player.
+    root.querySelectorAll('[data-gallery-key]').forEach((el) => {
+      el.addEventListener('click', (ev) => {
+        if (ev.target.closest('[data-gallery-action="delete"]')) return;
+        if (galleryLpSuppressClick) { galleryLpSuppressClick = false; return; }
+        if (galleryLpId != null) { setGalleryLongPressed(null); return; }
+        const id = el.dataset.galleryId;
+        const mime = el.dataset.galleryMime || '';
+        const name = el.dataset.galleryName || '';
+        if (mime.startsWith('image/')) {
+          annotateFromDrive(id);
+        } else if (mime.startsWith('video/')) {
+          window.VideoPlayer.open({ fileId: id, name, kind: 'video', onClose: () => {} });
+        } else if (mime.startsWith('audio/')) {
+          window.VideoPlayer.open({ fileId: id, name, kind: 'audio', onClose: () => {} });
+        }
+      });
+    });
+
+    attachGalleryLongPress(root);
+    if (galleryLpId != null) {
+      const el = root.querySelector(`[data-gallery-key="${CSS.escape(String(galleryLpId))}"]`);
+      if (el) el.classList.add('show-trash');
+    }
   }
 })();
