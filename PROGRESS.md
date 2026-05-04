@@ -65,7 +65,62 @@ can pick up exactly where this one stopped.
 ## Known follow-ups / nice-to-haves
 - (none open at the moment — see git log for the most recent changes)
 
-### Recently shipped — Reliability sweep (SW v18)
+### Recently shipped — Reliability sweep #2 (SW v19)
+- **A: Auth decoupled from initial render** ([auth.js](docs/js/auth.js)).
+  `Auth.init()` is now cache-only — restores user/token from IDB+LS and
+  returns. The GIS script wait moved into `ensureTokenClient()` which
+  is called lazily by `requestToken`. The boot path never blocks on
+  GIS, so the home screen paints from cache even when GIS is slow to
+  load after wake-from-idle.
+- **B: No more silent sign-out on refresh failure** (auth.js). The
+  `getAccessToken` failure path no longer clears `user`. Sign-out is
+  now reserved for: explicit `Auth.signOut()`, OAuth `invalid_grant` /
+  `unauthorized_client` (caught from `requestToken`), and a 7-day
+  stale-token check at init time. Auth is also instrumented with a
+  `tokenStatus` ('unknown' | 'valid' | 'refreshing' | 'failed') that
+  the rest of the app subscribes to.
+- **E: Heartbeat status dot** ([app.js](docs/js/app.js),
+  [style.css](docs/css/style.css)). Fixed-position 10px dot at top-
+  right; green = connected, yellow pulsing = reconnecting, red =
+  offline. Hidden on the login screen.
+- **Reconnect loop** (app.js). `tokenStatus === 'failed'` arms a 30-
+  second background retry that calls `getAccessToken(true)` until it
+  succeeds. The UI is never blocked.
+- **F: Wake-from-idle handler** (app.js). On `visibilitychange` →
+  visible after >5 min hidden, we proactively refresh the token + re-
+  validate the cached project list / project media. Background only.
+- **C: GPS as pinned location** (app.js). The new `loadPinnedLocation`
+  reads from `project.{folderId}.pinnedLocation` in IDB; if empty it
+  parses an existing `gps.txt` / legacy `gps.html` from Drive and
+  populates the cache (one-time migration). `getCurrentPosition` is
+  ONLY called from `captureLocationExplicit`, which fires on tap of
+  the new "📍 Capture location" button or long-press of the pinned
+  chip ("Update location" with a confirmation). The chip flips between
+  capture-CTA orange and pinned-confirmed green based on state.
+- **D: Camera permission recovery** ([capture.js](docs/js/capture.js)).
+  `showDenied()` now picks platform-specific instructions
+  (iOS-PWA / iOS-Safari / iOS-other / Android / desktop) and offers
+  an **"I've enabled it"** retry button that re-runs `getUserMedia`
+  inline. A separate `showWakeBug()` panel handles the case where
+  `permissions.query` reports 'granted' but `getUserMedia` still
+  rejects with NotAllowedError — that's the iOS wake-from-idle quirk;
+  the message tells the tech to close + reopen the app.
+- **G: Voice delete** (app.js `deleteThumb`). Long-press already
+  surfaced trash for any thumb; now the delete path also: (a) closes
+  any in-flight VideoPlayer holding this blob; (b) deletes the
+  matching `_transcript.txt` sibling on Drive if present;
+  (c) appends a `[DELETED voice recording <name>]` line to
+  `visit_log.txt`; (d) updates the strip in place without a refresh.
+- **H: Per-project cache-first** (app.js). New IDB key
+  `project.{folderId}.cache` stores the file list. `enterProject` now
+  calls `preloadProjectMediaFromCache` BEFORE `refreshProjectMedia`,
+  so the gallery paints in <200ms; the live Drive fetch runs in the
+  background and only re-renders when `fileListEqual` returns false.
+  A subtle `.sync-dot` next to the "Captured" header pulses while
+  syncing; the old "Loading…" line is replaced with a 3×2
+  `.thumb-skeleton` shimmer on first-ever project opens.
+
+### Recently shipped — Reliability sweep #1 (SW v18)
 - **Token refresh** ([auth.js](docs/js/auth.js)): `requestTokenOnce` now
   has a 10s strict per-attempt timeout; `requestToken` wraps it with 5
   retries on exponential backoff (500/1000/2000/4000/8000ms = 6 total

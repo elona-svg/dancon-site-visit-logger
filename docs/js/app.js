@@ -40,6 +40,7 @@
 
     thumbs: [],
     thumbsLoading: false,
+    thumbsSyncing: false,
 
     notesEntries: [],
     notesFileId: null,
@@ -92,7 +93,6 @@
       await window.DB.open();
       await window.Auth.init();
       window.Auth.onChange(({ user }) => {
-        const wasUser = !!state.user;
         state.user = user;
         if (!user && state.view !== 'login') {
           state.view = 'login';
@@ -102,6 +102,7 @@
         } else if (state.view === 'capture') {
           updateCaptureTopbar();
         }
+        onAuthStateUpdate();
       });
       state.user = window.Auth.getUser();
       // Trust the cached profile as proof of past sign-in. Token refresh
@@ -144,11 +145,104 @@
     toast('Back online — resuming uploads', 'info');
     pumpQueue();
     updateOnlineBadges();
+    updateConnDotDOM();
+    // Kick a refresh so the status dot turns green again ASAP.
+    if (window.Auth.getTokenStatus() !== 'valid') {
+      window.Auth.getAccessToken(true).catch(() => {});
+    }
   });
   window.addEventListener('offline', () => {
     state.isOnline = false;
     toast('Offline — captures will queue', 'warn');
     updateOnlineBadges();
+    updateConnDotDOM();
+  });
+
+  // Connection state machine ------------------------------------------------
+  // Combines navigator.onLine + Auth.tokenStatus into a single signal that
+  // the topbar dot reflects. State transitions also drive the 30s reconnect
+  // loop: when Auth gives up after its 5 retries we keep poking it in the
+  // background — the UI never gates on this and the user is never signed
+  // out as a side effect.
+  function getConnectionStatus() {
+    if (!state.isOnline) return 'offline';
+    const ts = window.Auth.getTokenStatus();
+    if (ts === 'failed' || ts === 'refreshing') return 'reconnecting';
+    return 'connected';
+  }
+  let reconnectTimer = null;
+  function startReconnectLoop() {
+    if (reconnectTimer) return;
+    console.log('[conn] starting 30s reconnect loop');
+    reconnectTimer = setInterval(async () => {
+      if (!state.isOnline) return;
+      if (window.Auth.getTokenStatus() === 'valid') {
+        stopReconnectLoop();
+        return;
+      }
+      console.log('[conn] reconnect attempt …');
+      try { await window.Auth.getAccessToken(true); }
+      catch (e) { /* keep looping */ }
+    }, 30000);
+  }
+  function stopReconnectLoop() {
+    if (!reconnectTimer) return;
+    console.log('[conn] reconnect loop done');
+    clearInterval(reconnectTimer);
+    reconnectTimer = null;
+  }
+  function onAuthStateUpdate() {
+    updateConnDotDOM();
+    const ts = window.Auth.getTokenStatus();
+    if (ts === 'failed') startReconnectLoop();
+    else if (ts === 'valid') stopReconnectLoop();
+  }
+
+  function ensureConnDotMounted() {
+    if (document.getElementById('conn-dot')) return;
+    const dot = document.createElement('div');
+    dot.id = 'conn-dot';
+    dot.className = 'conn-dot';
+    dot.title = '';
+    dot.setAttribute('role', 'status');
+    document.body.appendChild(dot);
+  }
+  function updateConnDotDOM() {
+    ensureConnDotMounted();
+    const dot = document.getElementById('conn-dot');
+    if (!dot) return;
+    // Hide on the login screen — we don't have a session to monitor.
+    if (state.view === 'login' || state.booting) { dot.hidden = true; return; }
+    dot.hidden = false;
+    const status = getConnectionStatus();
+    dot.classList.remove('connected', 'reconnecting', 'offline');
+    dot.classList.add(status);
+    dot.title = status === 'connected' ? 'Connected to Drive'
+      : status === 'reconnecting' ? 'Reconnecting…'
+      : 'Offline — working from cache';
+  }
+
+  // Wake-from-idle: when the tab is shown again after >5 min hidden, give
+  // the token a fresh poke and revalidate the cache the user is looking
+  // at. NEVER blocks the UI.
+  let lastVisibleTs = Date.now();
+  const WAKE_THRESHOLD_MS = 5 * 60 * 1000;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      const idleMs = Date.now() - lastVisibleTs;
+      if (idleMs > WAKE_THRESHOLD_MS) {
+        console.log('[wake] back from', Math.round(idleMs / 1000), 's idle — revalidating');
+        if (window.Auth.isSignedIn()) {
+          window.Auth.getAccessToken(true).catch(() => {});
+        }
+        if (state.view === 'home') loadProjects();
+        else if (state.view === 'capture' && state.currentProjectId) {
+          refreshProjectMedia();
+        }
+      }
+    } else {
+      lastVisibleTs = Date.now();
+    }
   });
   // If the camera overlay is open and the page is backgrounded, close it
   // and force-release the cached stream so iOS turns off the camera/mic
@@ -307,9 +401,12 @@
       if (cached) state.notesFileId = cached;
     } catch { /* ignore */ }
 
+    // Cache-first project page: paint thumbs from IDB before kicking off
+    // the live Drive fetch. The first-paint target is <200ms.
+    await preloadProjectMediaFromCache(id);
     refreshProjectMedia();
     refreshProjectNotes();
-    loadOrCaptureGPS(id, name);
+    loadPinnedLocation(id);
   }
 
   function leaveProject() {
@@ -404,52 +501,90 @@
 </html>`;
   }
 
-  async function loadOrCaptureGPS(folderId) {
+  // GPS is now treated as a PINNED LOCATION — captured once per project,
+  // shown read-only on every subsequent visit. We NEVER call
+  // getCurrentPosition automatically. The two-stage capture only runs
+  // when the tech taps "Capture location" or "Update location".
+  function pinnedLocationKey(folderId) { return `project.${folderId}.pinnedLocation`; }
+
+  async function loadPinnedLocation(folderId) {
     state.gps = null;
     state.gpsLoading = true;
     updateGpsChipDOM();
 
-    // Look for either the new gps.html or the legacy gps.txt — first one
-    // we find wins for the local chip; we never overwrite either.
-    let existing = null;
-    let existingKind = null;
+    // 1. Cache hit — paint instantly, done.
     try {
-      existing = await window.Drive.findFileInFolder(folderId, 'gps.html');
-      if (existing) existingKind = 'html';
-    } catch (err) { console.warn('GPS check failed:', err.message); }
-    if (!existing) {
-      try {
-        existing = await window.Drive.findFileInFolder(folderId, 'gps.txt');
-        if (existing) existingKind = 'txt';
-      } catch (err) { /* ignore */ }
-    }
+      const cached = await window.DB.kvGet(pinnedLocationKey(folderId));
+      if (cached && cached.lat != null && cached.lng != null) {
+        state.gps = {
+          lat: cached.lat,
+          lng: cached.lng,
+          accuracy: cached.accuracy,
+          capturedAt: cached.capturedAt,
+          capturedBy: cached.capturedBy,
+          link: `https://maps.google.com/?q=${cached.lat},${cached.lng}`
+        };
+        state.gpsLoading = false;
+        updateGpsChipDOM();
+        return;
+      }
+    } catch (e) { /* ignore */ }
 
+    // 2. Migration — look for an existing gps file in Drive. If we find
+    //    one, populate the cache so future opens are instant.
+    let existing = null;
+    try {
+      existing = await window.Drive.findFileInFolder(folderId, 'gps.txt');
+    } catch (e) { /* ignore */ }
+    if (!existing) {
+      try { existing = await window.Drive.findFileInFolder(folderId, 'gps.html'); }
+      catch (e) { /* ignore */ }
+    }
     if (existing) {
       try {
         const text = await window.Drive.downloadFileText(existing.id);
-        const lat = (text.match(/lat(?:itude)?["\s:>=]+(-?\d+\.\d+)/i) || [])[1]
-                 || (text.match(/Latitude:\s*([-\d.]+)/) || [])[1];
-        const lng = (text.match(/(?:lon|lng)(?:gitude)?["\s:>=]+(-?\d+\.\d+)/i) || [])[1]
-                 || (text.match(/Longitude:\s*([-\d.]+)/) || [])[1];
+        const lat = (text.match(/Latitude:\s*([-\d.]+)/) || [])[1]
+                 || (text.match(/lat(?:itude)?["\s:>=]+(-?\d+\.\d+)/i) || [])[1];
+        const lng = (text.match(/Longitude:\s*([-\d.]+)/) || [])[1]
+                 || (text.match(/(?:lon|lng)(?:gitude)?["\s:>=]+(-?\d+\.\d+)/i) || [])[1];
+        const acc = (text.match(/Accuracy:\s*±?(\d+)\s*m/i) || [])[1];
+        const tech = (text.match(/Tech:\s*(.+)/) || [])[1] || '';
         if (lat && lng) {
-          state.gps = {
+          const pinned = {
             lat: parseFloat(lat),
             lng: parseFloat(lng),
-            link: `https://maps.google.com/?q=${lat},${lng}`
+            accuracy: acc ? parseInt(acc, 10) : null,
+            capturedAt: null,
+            capturedBy: tech.trim() || null
           };
+          try { await window.DB.kvSet(pinnedLocationKey(folderId), pinned); } catch (e) {}
+          if (state.currentProjectId === folderId) {
+            state.gps = { ...pinned, link: `https://maps.google.com/?q=${pinned.lat},${pinned.lng}` };
+          }
         }
       } catch (e) { /* ignore */ }
-      state.gpsLoading = false;
-      updateGpsChipDOM();
-      return;
     }
 
+    state.gpsLoading = false;
+    updateGpsChipDOM();
+  }
+
+  // Explicit "Capture location" / "Update location" — the ONLY entry point
+  // that calls getCurrentPosition. Triggered by user tap, never automatic.
+  async function captureLocationExplicit(folderId, { isUpdate = false } = {}) {
     if (!('geolocation' in navigator)) {
-      state.gpsLoading = false;
-      updateGpsChipDOM();
+      toast('GPS not supported on this device', 'warn');
       return;
     }
-    runTwoStageGps(folderId);
+    if (isUpdate) {
+      const ok = confirm('Replace the saved location for this project?');
+      if (!ok) return;
+    }
+    state.gpsCapturing = true;
+    updateGpsChipDOM();
+    await runTwoStageGps(folderId);
+    state.gpsCapturing = false;
+    updateGpsChipDOM();
   }
 
   function getCurrentPositionPromise(opts) {
@@ -536,12 +671,23 @@
     const { latitude, longitude, accuracy } = pos.coords;
     const link = `https://maps.google.com/?q=${latitude},${longitude}`;
     const tech = state.user?.name || 'unknown';
-    const stamp = fmtGpsTimestamp(new Date());
+    const capturedAt = Date.now();
+    const stamp = fmtGpsTimestamp(new Date(capturedAt));
     const txt = buildGpsTxt({ lat: latitude, lng: longitude, accuracy, tech, stamp, link });
 
-    state.gps = { lat: latitude, lng: longitude, link };
+    state.gps = {
+      lat: latitude, lng: longitude, accuracy,
+      capturedAt, capturedBy: tech, link
+    };
     state.gpsLoading = false;
     updateGpsChipDOM();
+
+    // Persist to project cache so the next open is instant + offline-safe.
+    try {
+      await window.DB.kvSet(pinnedLocationKey(folderId), {
+        lat: latitude, lng: longitude, accuracy, capturedAt, capturedBy: tech
+      });
+    } catch (e) { /* ignore */ }
 
     // Upgrade path: if a gps.txt already exists, rewrite it in place
     // rather than creating a duplicate. Legacy gps.html files are left
@@ -1021,63 +1167,119 @@
     return url.replace(/=s\d+(-[a-z])?$/, '=s1024$1');
   }
 
+  // ---- Per-project cache (cache-first project pages) ---------------------
+  // Key: project.{folderId}.cache → { files:[{id,name,mimeType,size,
+  //   modifiedTime,createdTime,thumbnailLink,webViewLink}], cachedAt }
+  // Used to paint the project gallery within ~150ms; live Drive fetch runs
+  // in the background and only re-renders if anything actually changed.
+  function projectCacheKey(folderId) { return `project.${folderId}.cache`; }
+
+  function fileListEqual(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (a[i].id !== b[i].id || a[i].name !== b[i].name ||
+          a[i].modifiedTime !== b[i].modifiedTime || a[i].size !== b[i].size) return false;
+    }
+    return true;
+  }
+
+  function buildThumbsFromFiles(files) {
+    const media = files
+      .filter((f) =>
+        (f.mimeType || '').startsWith('image/') ||
+        (f.mimeType || '').startsWith('video/') ||
+        (f.mimeType || '').startsWith('audio/')
+      )
+      .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+
+    const byFileId = new Map();
+    const byName = new Map();
+    state.thumbs.forEach((t) => {
+      if (t.fileId) byFileId.set(t.fileId, t);
+      if (t.name) byName.set(t.name, t);
+    });
+
+    const driveThumbs = media.map((f) => {
+      const existing = byFileId.get(f.id) || byName.get(f.name);
+      const driveSrc = upscaleDriveThumb(f.thumbnailLink || '');
+      return {
+        type: f.mimeType.startsWith('image/') ? 'photo'
+            : f.mimeType.startsWith('video/') ? 'video' : 'audio',
+        src: existing?.objectUrl || driveSrc,
+        objectUrl: existing?.objectUrl || null,
+        name: f.name,
+        mime: f.mimeType,
+        size: Number(f.size || 0),
+        status: 'success',
+        fileId: f.id,
+        webViewLink: f.webViewLink || '',
+        addedAt: existing?.addedAt || new Date(f.createdTime || Date.now()).getTime(),
+        durationMs: existing?.durationMs || null
+      };
+    });
+
+    const pendingThumbs = state.thumbs.filter((t) => !t.fileId);
+    return [...pendingThumbs, ...driveThumbs];
+  }
+
+  // Synchronous-feeling cache load: paints from IDB before the network
+  // fetch starts. Called from enterProject so the gallery has thumbs
+  // visible within a single repaint.
+  async function preloadProjectMediaFromCache(folderId) {
+    try {
+      const cached = await window.DB.kvGet(projectCacheKey(folderId));
+      if (cached && Array.isArray(cached.files) && cached.files.length > 0) {
+        if (state.currentProjectId !== folderId) return;
+        state.thumbs = buildThumbsFromFiles(cached.files);
+        state.thumbsLoading = false;
+        console.log('[project] cache hit:', cached.files.length, 'files, age',
+          Math.round((Date.now() - (cached.cachedAt || 0)) / 1000), 's');
+        updateThumbsDOM();
+      }
+    } catch (e) { /* ignore */ }
+  }
+
   async function refreshProjectMedia() {
     if (!state.currentProjectId) return;
-    state.thumbsLoading = true;
+    const folderId = state.currentProjectId;
+
+    // Paint from cache first if we haven't yet — so the live fetch runs
+    // in the background, never gating the UI.
+    if (state.thumbs.length === 0) await preloadProjectMediaFromCache(folderId);
+    const hadThumbs = state.thumbs.length > 0;
+    state.thumbsSyncing = true;
+    if (!hadThumbs) state.thumbsLoading = true;
     updateThumbsDOM();
+    updateProjectSyncIndicatorDOM();
+
     try {
-      const files = await window.Drive.listFolderFiles(state.currentProjectId);
-      const media = files
-        .filter((f) =>
-          (f.mimeType || '').startsWith('image/') ||
-          (f.mimeType || '').startsWith('video/') ||
-          (f.mimeType || '').startsWith('audio/')
-        )
-        .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
-
-      // Index existing thumbs so we can preserve blob URLs / queueIds /
-      // duration metadata across the refresh. This is what keeps a
-      // freshly-captured photo at full quality even after its upload
-      // completes — we don't downgrade to Drive's 220 px thumbnailLink
-      // when we already have the sharp local blob.
-      const byFileId = new Map();
-      const byName = new Map();
-      state.thumbs.forEach((t) => {
-        if (t.fileId) byFileId.set(t.fileId, t);
-        if (t.name) byName.set(t.name, t);
-      });
-
-      const driveThumbs = media.map((f) => {
-        const existing = byFileId.get(f.id) || byName.get(f.name);
-        const driveSrc = upscaleDriveThumb(f.thumbnailLink || '');
-        return {
-          type: f.mimeType.startsWith('image/') ? 'photo'
-              : f.mimeType.startsWith('video/') ? 'video' : 'audio',
-          // Prefer the live blob URL so the image stays sharp + identical
-          // size before/after upload. Fall back to a high-res Drive thumb
-          // for files from previous sessions.
-          src: existing?.objectUrl || driveSrc,
-          objectUrl: existing?.objectUrl || null,
-          name: f.name,
-          mime: f.mimeType,
-          size: Number(f.size || 0),
-          status: 'success',
-          fileId: f.id,
-          webViewLink: f.webViewLink || '',
-          addedAt: existing?.addedAt || new Date(f.createdTime || Date.now()).getTime(),
-          durationMs: existing?.durationMs || null
-        };
-      });
-
-      // Anything still pending (queued / uploading / failed) — i.e. not
-      // yet on Drive — gets carried over verbatim.
-      const pendingThumbs = state.thumbs.filter((t) => !t.fileId);
-      state.thumbs = [...pendingThumbs, ...driveThumbs];
+      const files = await window.Drive.listFolderFiles(folderId);
+      if (state.currentProjectId !== folderId) return; // tech navigated away
+      try {
+        await window.DB.kvSet(projectCacheKey(folderId), {
+          files: files.map((f) => ({
+            id: f.id, name: f.name, mimeType: f.mimeType,
+            size: f.size, modifiedTime: f.modifiedTime,
+            createdTime: f.createdTime,
+            thumbnailLink: f.thumbnailLink || '',
+            webViewLink: f.webViewLink || ''
+          })),
+          cachedAt: Date.now()
+        });
+      } catch (e) { /* ignore */ }
+      state.thumbs = buildThumbsFromFiles(files);
     } catch (err) {
-      console.warn('Could not refresh media:', err.message);
+      const msg = err && err.message || '';
+      if (/TOKEN_TIMEOUT|Token request|Auth not initialized/i.test(msg)) {
+        console.warn('[project] live fetch deferred (auth):', msg);
+      } else {
+        console.warn('[project] refresh failed:', msg);
+      }
     } finally {
       state.thumbsLoading = false;
+      state.thumbsSyncing = false;
       updateThumbsDOM();
+      updateProjectSyncIndicatorDOM();
     }
   }
 
@@ -1321,15 +1523,42 @@
 
   async function deleteThumb(thumb) {
     if (!thumb) return;
+    // If a voice/video is currently playing through VideoPlayer or any
+    // <audio> element holds this blob, stop it before deleting so the
+    // browser doesn't keep the file referenced.
+    if ((thumb.type === 'audio' || thumb.type === 'video') && window.VideoPlayer?.isOpen()) {
+      try { window.VideoPlayer.close(); } catch (e) { /* ignore */ }
+    }
+    document.querySelectorAll('audio, video').forEach((el) => {
+      if (el.src && thumb.objectUrl && el.src === thumb.objectUrl) {
+        try { el.pause(); el.removeAttribute('src'); el.load(); } catch (e) {}
+      }
+    });
+
     if (thumb.fileId) {
-      try {
-        await window.Drive.deleteFile(thumb.fileId);
-      } catch (err) {
+      try { await window.Drive.deleteFile(thumb.fileId); }
+      catch (err) {
         toast(`Delete failed: ${err.message}`, 'error');
         return;
       }
+      // Voice notes: also remove the matching _transcript.txt sibling
+      // (if a transcript was ever generated). This mirrors the Drive
+      // file pair so the office team doesn't see stale text.
+      if (thumb.type === 'audio' && thumb.name) {
+        const transcriptName = thumb.name.replace(/\.[^.]+$/, '_transcript.txt');
+        try {
+          const t = await window.Drive.findFileInFolder(state.currentProjectId, transcriptName);
+          if (t) await window.Drive.deleteFile(t.id);
+        } catch (e) { /* best-effort */ }
+      }
+      // Audit trail in visit_log.txt — same pattern as soft-deleted notes.
+      const kindLabel = thumb.type === 'audio' ? 'voice recording'
+        : thumb.type === 'video' ? 'video'
+        : thumb.type === 'photo' ? 'photo'
+        : 'file';
+      appendVisitLog(state.currentProjectId,
+        `[DELETED ${kindLabel} ${thumb.name}]`).catch(() => {});
     } else if (thumb.queueId) {
-      // Local-only — drop from queue.
       try { await window.DB.queueDelete(thumb.queueId); } catch (e) { /* ignore */ }
     }
     const idx = state.thumbs.indexOf(thumb);
@@ -1418,6 +1647,7 @@
     if (target === 'home') updateHomeDOM();
     else if (target === 'capture') updateCaptureDOM();
     else if (target === 'gallery') updateGalleryDOM();
+    updateConnDotDOM();
   }
 
   function renderLogin(app) {
@@ -1501,6 +1731,11 @@
     if (!dot) return;
     dot.hidden = !state.projectsSyncing;
   }
+  function updateProjectSyncIndicatorDOM() {
+    const dot = document.getElementById('thumbs-sync');
+    if (!dot) return;
+    dot.hidden = !state.thumbsSyncing;
+  }
   function updateHomeTopbar() {
     const sub = document.getElementById('home-topbar-sub');
     if (!sub) return;
@@ -1568,6 +1803,7 @@
           <section class="thumb-section">
             <div class="section-row">
               <h3 class="section-h">Captured</h3>
+              <span id="thumbs-sync" class="sync-dot" hidden aria-label="Syncing"></span>
               <div class="sort-wrap">
                 <button class="sort-btn" id="sort-btn" type="button" aria-haspopup="true">↕ ${escapeHtml(sortLabel())}</button>
                 <div class="sort-popover" id="sort-popover" hidden>
@@ -1661,23 +1897,59 @@
     else if (renderedFlag === 'capture') updateCaptureTopbar();
   }
 
+  // The GPS chip is the project's PINNED-LOCATION control.
+  //   • Loading the cache for the first time: small "Loading location…"
+  //   • Cache empty / never captured: "📍 Capture location" button
+  //   • Pinned: "📍 Location: lat, lng ✓" — tap → Maps, long-press → Update
+  //   • Capture in progress: "📍 Capturing location…" (explicit only)
   function updateGpsChipDOM() {
     const row = document.getElementById('gps-row');
     if (!row) return;
+    if (state.gpsCapturing) {
+      row.innerHTML = '<span class="gps-chip muted">📍 Capturing location…</span>';
+      return;
+    }
     if (state.gpsLoading && !state.gps) {
-      row.innerHTML = '<span class="gps-chip muted">📍 Capturing GPS…</span>';
+      row.innerHTML = '<span class="gps-chip muted">📍 Loading location…</span>';
       return;
     }
     if (!state.gps) {
-      row.innerHTML = '<span class="gps-chip muted">📍 GPS unavailable</span>';
+      row.innerHTML = `
+        <button class="gps-chip gps-chip-cta" id="gps-capture-btn" type="button">
+          📍 Capture location
+        </button>`;
+      document.getElementById('gps-capture-btn')?.addEventListener('click', () => {
+        if (state.currentProjectId) captureLocationExplicit(state.currentProjectId, { isUpdate: false });
+      });
       return;
     }
     const lat = state.gps.lat.toFixed(5);
     const lng = state.gps.lng.toFixed(5);
     row.innerHTML = `
-      <a class="gps-chip" href="${escapeHtml(state.gps.link)}" target="_blank" rel="noopener">
-        📍 Location: ${escapeHtml(lat)}, ${escapeHtml(lng)} — Open Maps
-      </a>`;
+      <button class="gps-chip gps-chip-pinned" id="gps-pinned-btn" type="button"
+              data-link="${escapeHtml(state.gps.link)}">
+        📍 Location: ${escapeHtml(lat)}, ${escapeHtml(lng)} ✓
+      </button>`;
+    const btn = document.getElementById('gps-pinned-btn');
+    let lpTimer = null;
+    let lpFired = false;
+    btn?.addEventListener('click', (ev) => {
+      if (lpFired) { lpFired = false; ev.preventDefault(); return; }
+      // Default tap → open Maps
+      window.open(btn.dataset.link, '_blank', 'noopener');
+    });
+    btn?.addEventListener('pointerdown', () => {
+      lpFired = false;
+      lpTimer = setTimeout(() => {
+        lpFired = true;
+        if (state.currentProjectId) {
+          captureLocationExplicit(state.currentProjectId, { isUpdate: true });
+        }
+      }, 600);
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach((evt) => {
+      btn?.addEventListener(evt, () => { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } });
+    });
   }
 
   // -------- Sort --------
@@ -1796,7 +2068,11 @@
     if (!strip) return;
     const sorted = sortedThumbs();
     if (state.thumbsLoading && sorted.length === 0) {
-      strip.innerHTML = '<div class="thumb-empty">Loading…</div>';
+      // First-ever project open with no cache — skeleton shimmer.
+      strip.innerHTML = `
+        <div class="thumb-skeleton" aria-hidden="true">
+          <div></div><div></div><div></div><div></div><div></div><div></div>
+        </div>`;
       return;
     }
     if (sorted.length === 0) {

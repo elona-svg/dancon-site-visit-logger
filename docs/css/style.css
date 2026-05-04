@@ -603,6 +603,30 @@ code { background: #eef0f2; padding: 2px 6px; border-radius: 4px; font-size: 13p
 .file-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .file-meta { color: #6b7280; font-size: 12px; }
 
+/* ---------- Heartbeat status dot ---------- */
+.conn-dot {
+  position: fixed;
+  top: calc(env(safe-area-inset-top, 0px) + 12px);
+  right: 14px;
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: #16a34a;
+  box-shadow: 0 0 0 2px rgba(255,255,255,0.85);
+  z-index: 1200;
+  pointer-events: none;
+  transition: background 200ms;
+}
+.conn-dot.connected   { background: #16a34a; }
+.conn-dot.reconnecting {
+  background: #f59e0b;
+  animation: conn-pulse 1.2s ease-in-out infinite;
+}
+.conn-dot.offline     { background: #dc2626; }
+@keyframes conn-pulse {
+  0%, 100% { opacity: 0.5; transform: scale(0.85); }
+  50%      { opacity: 1;   transform: scale(1.15); }
+}
+
 /* ---------- PWA install hint screen (cross-platform, blocking) ---------- */
 .install-screen {
   position: fixed; inset: 0; z-index: 1900;
@@ -683,6 +707,18 @@ code { background: #eef0f2; padding: 2px 6px; border-radius: 4px; font-size: 13p
   background-size: 200% 100%;
   animation: skel-shimmer 1.4s ease-in-out infinite;
 }
+.thumb-skeleton {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.thumb-skeleton > div {
+  aspect-ratio: 1 / 1;
+  border-radius: 10px;
+  background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%);
+  background-size: 200% 100%;
+  animation: skel-shimmer 1.4s ease-in-out infinite;
+}
 @keyframes skel-shimmer {
   from { background-position: 200% 0; }
   to   { background-position: -200% 0; }
@@ -741,6 +777,19 @@ code { background: #eef0f2; padding: 2px 6px; border-radius: 4px; font-size: 13p
 }
 .gps-chip.muted { color: #6b7280; background: #f4f4f5; }
 .gps-chip:active { background: #f4f4f5; }
+button.gps-chip { font: inherit; cursor: pointer; }
+.gps-chip-cta {
+  background: #fff7ed;
+  border-color: #fdba74;
+  color: #c2410c;
+}
+.gps-chip-cta:active { background: #ffedd5; }
+.gps-chip-pinned {
+  background: #ecfdf5;
+  border-color: #6ee7b7;
+  color: #065f46;
+}
+.gps-chip-pinned:active { background: #d1fae5; }
 
 /* ---------- Capture topbar inline offline badge ---------- */
 .cap-offline { display: inline-block; min-height: 16px; }
@@ -1155,6 +1204,22 @@ body.camera-fs-open #app { display: none; }
   display: flex; flex-direction: column; gap: 10px;
 }
 .cam-fs-error-card h3 { margin: 0; font-size: 18px; }
+.cam-fs-error-card p { margin: 0; font-size: 14px; line-height: 1.45; color: #374151; }
+.cam-fs-error-card p.instr {
+  background: #f4f4f5;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+  color: #111;
+}
+.cam-fs-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.cam-fs-actions .btn-primary { width: 100%; }
+.btn-ghost.light {
+  background: transparent;
+  color: #6b7280;
+  font-size: 13px;
+  padding: 8px;
+}
 
 /* ---------- Video player ---------- */
 .vplayer-overlay {

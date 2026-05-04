@@ -1,84 +1,81 @@
 // Google Identity Services OAuth2 token client.
 //
-// Persistence model
-// -----------------
-// GIS implicit-flow access tokens last ~1 hour. We cache the access token,
-// its expiry, and the user profile in BOTH IndexedDB and localStorage so a
-// torn-down storage (rare iOS Safari ITP case) doesn't lose the session.
-//
-// "Signed in" rule
-// ----------------
-// `isSignedIn()` returns true as long as we have a cached `user` profile.
-// We DO NOT gate that on the access token's expiry — the token is just
-// short-lived plumbing for Drive calls, not a proxy for "is the tech
-// signed in". This is what makes the app stay logged in indefinitely:
-//   - Boot: cached user → home screen, no prompt.
-//   - First Drive call: uses cached token. If the token is expired Drive
-//     returns 401, authedFetch calls getAccessToken(true), GIS attempts
-//     a silent refresh (no UI on most browsers; popup if Safari ITP
-//     blocked the silent path).
-//   - Refresh succeeds → we keep going, totally invisible.
-//   - Refresh fails (Google session truly gone) → we clear the cached
-//     user so the app routes back to the Sign-in screen.
+// Design rules
+// ------------
+// 1. `init()` is synchronous-cheap. It only restores the cached profile +
+//    token from IndexedDB / localStorage. The GIS script and tokenClient
+//    are NOT awaited here — the boot path must NEVER block on GIS, even
+//    if the script is slow to load on iOS Safari after wake-from-idle.
+//    `ensureTokenClient()` does the GIS wait lazily, the first time we
+//    actually need to mint a token.
+// 2. `isSignedIn()` is keyed on the cached USER PROFILE, never on token
+//    freshness. The token is short-lived plumbing; its absence/expiry
+//    doesn't mean "logged out".
+// 3. `getAccessToken()` retries on backoff (5 retries, 500/1/2/4/8s).
+//    On exhausted retries it sets tokenStatus='failed' and rejects, but
+//    DOES NOT clear the cached user. Sign-out only happens for: (a) the
+//    explicit signOut() call, (b) an OAuth `invalid_grant` /
+//    `unauthorized_client` error, or (c) a token issued >7 days ago that
+//    has had no successful refresh since.
 window.Auth = (function () {
   let tokenClient = null;
+  let tokenClientReady = false;
+  let tokenClientReadyPromise = null;
   let accessToken = null;
   let tokenExpiresAt = 0;
+  let tokenIssuedAt = 0;
   let user = null;
   let onChangeListeners = [];
-  let pendingRefresh = null; // de-dupes concurrent refresh attempts
+  let pendingRefresh = null;
+
+  // 'unknown' | 'valid' | 'refreshing' | 'failed'
+  let tokenStatus = 'unknown';
+  let lastAuthError = null;
+
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+  const TOKEN_REFRESH_CUSHION_MS = 2 * 60 * 1000;
 
   function notifyChange() {
     onChangeListeners.forEach((fn) => {
-      try { fn({ user, hasToken: !!accessToken }); } catch (e) { console.warn(e); }
+      try { fn({ user, hasToken: !!accessToken, tokenStatus }); } catch (e) { console.warn(e); }
     });
   }
-
   function onChange(fn) {
     onChangeListeners.push(fn);
     return () => { onChangeListeners = onChangeListeners.filter((f) => f !== fn); };
   }
 
-  function gisReady() {
-    return new Promise((resolve, reject) => {
-      const start = Date.now();
-      (function check() {
-        if (window.google?.accounts?.oauth2) return resolve();
-        if (Date.now() - start > 8000) return reject(new Error('Google Identity Services failed to load'));
-        setTimeout(check, 100);
-      })();
-    });
+  function setTokenStatus(s, err) {
+    if (s === tokenStatus && (!err || lastAuthError === err)) return;
+    tokenStatus = s;
+    lastAuthError = err || null;
+    console.log('[auth] tokenStatus →', s, err ? `(${err.message || err})` : '');
+    notifyChange();
   }
 
-  // ---- Persistence helpers ---------------------------------------------
-  // We write to IDB and localStorage in parallel. Either store can be used
-  // to restore on launch — whichever responds first wins.
-  function lsGet(key) {
-    try { return localStorage.getItem(key); } catch (e) { return null; }
-  }
-  function lsSet(key, val) {
-    try { localStorage.setItem(key, val); } catch (e) { /* private mode etc */ }
-  }
-  function lsDelete(key) {
-    try { localStorage.removeItem(key); } catch (e) { /* ignore */ }
-  }
+  // ---- Persistence ------------------------------------------------------
+  function lsGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+  function lsSet(key, v) { try { localStorage.setItem(key, v); } catch (e) {} }
+  function lsDelete(key) { try { localStorage.removeItem(key); } catch (e) {} }
 
   async function persistToken() {
     try {
       if (accessToken) {
         await window.DB.kvSet('auth.token', accessToken);
         await window.DB.kvSet('auth.expiresAt', tokenExpiresAt);
+        await window.DB.kvSet('auth.issuedAt', tokenIssuedAt);
         lsSet('auth.token', accessToken);
         lsSet('auth.expiresAt', String(tokenExpiresAt));
+        lsSet('auth.issuedAt', String(tokenIssuedAt));
       } else {
         await window.DB.kvDelete('auth.token');
         await window.DB.kvDelete('auth.expiresAt');
+        // Note: we keep auth.issuedAt so the 7-day-stale rule keeps working
         lsDelete('auth.token');
         lsDelete('auth.expiresAt');
       }
-    } catch (e) { /* best effort */ }
+    } catch (e) { /* best-effort */ }
   }
-
   async function persistUser() {
     try {
       if (user) {
@@ -86,88 +83,127 @@ window.Auth = (function () {
         lsSet('user', JSON.stringify(user));
       } else {
         await window.DB.kvDelete('user');
+        await window.DB.kvDelete('auth.token');
+        await window.DB.kvDelete('auth.expiresAt');
+        await window.DB.kvDelete('auth.issuedAt');
         lsDelete('user');
+        lsDelete('auth.token');
+        lsDelete('auth.expiresAt');
+        lsDelete('auth.issuedAt');
       }
-    } catch (e) { /* best effort */ }
+    } catch (e) { /* best-effort */ }
   }
 
+  // ---- Init: cache-only, no GIS wait -----------------------------------
   async function init() {
-    await gisReady();
-
     if (window.CONFIG.CLIENT_ID.startsWith('__REPLACE')) {
       throw new Error('OAuth not configured: edit js/config.js and set CLIENT_ID. See README.');
     }
-
-    tokenClient = window.google.accounts.oauth2.initTokenClient({
-      client_id: window.CONFIG.CLIENT_ID,
-      scope: window.CONFIG.SCOPES,
-      hd: window.CONFIG.HOSTED_DOMAIN,
-      prompt: '',
-      callback: () => { /* set per-request below */ }
-    });
-
-    // Restore from IDB first; fall back to localStorage if IDB is empty
-    // for any of the values (e.g. iOS standalone PWA wiping IDB while
-    // keeping LS, or vice versa).
     try {
       let cachedUser = await window.DB.kvGet('user');
       if (!cachedUser) {
         const raw = lsGet('user');
-        if (raw) try { cachedUser = JSON.parse(raw); } catch (e) { /* ignore */ }
+        if (raw) try { cachedUser = JSON.parse(raw); } catch (e) {}
       }
       if (cachedUser) user = cachedUser;
 
       let cachedToken = await window.DB.kvGet('auth.token');
       let cachedExp = await window.DB.kvGet('auth.expiresAt');
+      let cachedIssued = await window.DB.kvGet('auth.issuedAt');
       if (!cachedToken) {
         cachedToken = lsGet('auth.token');
         cachedExp = lsGet('auth.expiresAt');
+        cachedIssued = lsGet('auth.issuedAt');
       }
       if (cachedToken) {
         accessToken = cachedToken;
         tokenExpiresAt = Number(cachedExp || 0);
+        tokenIssuedAt = Number(cachedIssued || 0);
       }
-      console.log('[auth] init restored user?', !!user, 'token?', !!accessToken,
-        'expiresIn(s)=', accessToken ? Math.round((tokenExpiresAt - Date.now()) / 1000) : 'n/a');
+
+      // 7-day stale check: if the last successfully-issued token is older
+      // than 7 days the user really should re-auth.
+      if (user && tokenIssuedAt > 0 && (Date.now() - tokenIssuedAt) > SEVEN_DAYS_MS) {
+        console.warn('[auth] cached token issued >7d ago — forcing sign-out');
+        await hardSignOut();
+        return;
+      }
+
+      console.log('[auth] init restored — user?', !!user, 'token?', !!accessToken,
+        'expiresIn(s)=', accessToken ? Math.round((tokenExpiresAt - Date.now()) / 1000) : 'n/a',
+        'issuedAgo(s)=', tokenIssuedAt ? Math.round((Date.now() - tokenIssuedAt) / 1000) : 'n/a');
+
+      if (accessToken && (tokenExpiresAt - Date.now()) > TOKEN_REFRESH_CUSHION_MS) {
+        setTokenStatus('valid');
+      } else if (user) {
+        setTokenStatus('refreshing'); // expired but signed in — will refresh on demand
+      }
     } catch (e) {
       console.warn('[auth] init restore failed:', e);
     }
   }
 
-  // ---- Token request -----------------------------------------------------
-  // Single GIS attempt with a strict 10s timeout. GIS can hang indefinitely
-  // when its hidden iframe is blocked (Safari ITP, popup-blocker, network
-  // glitch); without an explicit timeout the whole app stalls behind a
-  // never-resolving promise.
+  // ---- Lazy GIS init ---------------------------------------------------
+  async function ensureTokenClient() {
+    if (tokenClient) return tokenClient;
+    if (tokenClientReadyPromise) return tokenClientReadyPromise;
+    tokenClientReadyPromise = (async () => {
+      // Wait for the GIS script to load (up to 8s — same as before).
+      const start = Date.now();
+      while (!window.google?.accounts?.oauth2) {
+        if (Date.now() - start > 8000) throw new Error('Google Identity Services failed to load');
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      tokenClient = window.google.accounts.oauth2.initTokenClient({
+        client_id: window.CONFIG.CLIENT_ID,
+        scope: window.CONFIG.SCOPES,
+        hd: window.CONFIG.HOSTED_DOMAIN,
+        prompt: '',
+        callback: () => { /* set per-request */ }
+      });
+      tokenClientReady = true;
+      return tokenClient;
+    })();
+    return tokenClientReadyPromise;
+  }
+
+  // ---- Token request ---------------------------------------------------
+  // Single attempt with strict 10s timeout.
   function requestTokenOnce() {
     return new Promise((resolve, reject) => {
-      if (!tokenClient) return reject(new Error('Auth not initialized'));
-      const safety = setTimeout(() => reject(new Error('TOKEN_TIMEOUT')), 10000);
-      tokenClient.callback = async (resp) => {
-        clearTimeout(safety);
-        if (resp.error) return reject(new Error(resp.error_description || resp.error));
-        accessToken = resp.access_token;
-        tokenExpiresAt = Date.now() + (resp.expires_in - 60) * 1000;
-        try {
-          await fetchAndVerifyUser();
-          await persistToken();
-          notifyChange();
-          resolve({ accessToken, user });
-        } catch (err) {
-          accessToken = null;
-          tokenExpiresAt = 0;
-          await persistToken();
-          notifyChange();
-          reject(err);
-        }
-      };
-      try { tokenClient.requestAccessToken({ prompt: '' }); }
-      catch (err) { clearTimeout(safety); reject(err); }
+      ensureTokenClient().then((client) => {
+        const safety = setTimeout(() => reject(new Error('TOKEN_TIMEOUT')), 10000);
+        client.callback = async (resp) => {
+          clearTimeout(safety);
+          if (resp.error) {
+            const code = resp.error || '';
+            const desc = resp.error_description || code;
+            const err = new Error(desc);
+            err.oauthCode = code;
+            return reject(err);
+          }
+          accessToken = resp.access_token;
+          tokenIssuedAt = Date.now();
+          tokenExpiresAt = tokenIssuedAt + (resp.expires_in - 60) * 1000;
+          try {
+            await fetchAndVerifyUser();
+            await persistToken();
+            setTokenStatus('valid');
+            resolve({ accessToken, user });
+          } catch (err) {
+            accessToken = null;
+            tokenExpiresAt = 0;
+            await persistToken();
+            reject(err);
+          }
+        };
+        try { client.requestAccessToken({ prompt: '' }); }
+        catch (err) { clearTimeout(safety); reject(err); }
+      }, reject);
     });
   }
 
-  // Wraps requestTokenOnce with exponential backoff: 5 retries after the
-  // first attempt (delays 500/1000/2000/4000/8000ms = 6 attempts total).
+  // Wrapper with exponential backoff (5 retries after first attempt).
   async function requestToken() {
     const delays = [500, 1000, 2000, 4000, 8000];
     let lastErr;
@@ -177,11 +213,15 @@ window.Auth = (function () {
         return await requestTokenOnce();
       } catch (err) {
         lastErr = err;
-        const isTimeout = err && err.message === 'TOKEN_TIMEOUT';
-        console.warn('[auth] token attempt failed:', err.message || err, isTimeout ? '(timeout)' : '');
-        if (i < delays.length) {
-          await new Promise((r) => setTimeout(r, delays[i]));
+        const code = err && err.oauthCode;
+        // OAuth-side terminal errors — server says this user is no longer
+        // valid. Force sign-out.
+        if (code === 'invalid_grant' || code === 'unauthorized_client') {
+          console.warn('[auth] terminal OAuth error', code, '— signing out');
+          await hardSignOut();
+          throw err;
         }
+        if (i < delays.length) await new Promise((r) => setTimeout(r, delays[i]));
       }
     }
     throw lastErr || new Error('Token request failed after retries');
@@ -207,35 +247,25 @@ window.Auth = (function () {
     await persistUser();
   }
 
-  // Returns a valid access token. With forceRefresh=false we trust the
-  // cached token as long as it has at least 2 minutes of life left — that
-  // 2-minute cushion avoids spending a refresh round-trip on a token that
-  // would expire mid-request anyway. With forceRefresh=true we discard the
-  // cache and ask GIS for a new one (with retries / backoff). Concurrent
-  // callers share the same in-flight refresh promise.
-  const TOKEN_REFRESH_CUSHION_MS = 2 * 60 * 1000;
+  // ---- Public ----------------------------------------------------------
   async function getAccessToken(forceRefresh = false) {
     if (!forceRefresh && accessToken && (tokenExpiresAt - Date.now()) > TOKEN_REFRESH_CUSHION_MS) {
+      if (tokenStatus !== 'valid') setTokenStatus('valid');
       return accessToken;
     }
     if (pendingRefresh) return pendingRefresh;
 
     pendingRefresh = (async () => {
-      accessToken = null;
-      tokenExpiresAt = 0;
-      await persistToken();
+      setTokenStatus('refreshing');
       try {
         const { accessToken: t } = await requestToken();
         return t;
       } catch (err) {
-        // We had a session and the refresh failed. Treat as fully signed
-        // out so the app routes back to the Sign-in screen.
-        if (user) {
-          console.warn('[auth] silent refresh failed — clearing session:', err.message);
-          user = null;
-          await persistUser();
-          notifyChange();
-        }
+        // CRITICAL: do NOT clear user on refresh failure. A timeout, a
+        // network blip, or a generic GIS hang must NOT silently sign the
+        // tech out. Only OAuth invalid_grant (handled inside requestToken)
+        // and the 7-day stale check (in init) trigger sign-out.
+        setTokenStatus('failed', err);
         throw err;
       } finally {
         pendingRefresh = null;
@@ -248,25 +278,38 @@ window.Auth = (function () {
     return requestToken();
   }
 
-  async function signOut() {
+  async function hardSignOut() {
     if (accessToken && window.google?.accounts?.oauth2?.revoke) {
-      try { window.google.accounts.oauth2.revoke(accessToken, () => {}); } catch (e) { /* ignore */ }
+      try { window.google.accounts.oauth2.revoke(accessToken, () => {}); } catch (e) {}
     }
     accessToken = null;
     tokenExpiresAt = 0;
+    tokenIssuedAt = 0;
     user = null;
-    try {
-      await persistToken();
-      await persistUser();
-    } catch (e) { /* ignore */ }
+    setTokenStatus('unknown');
+    await persistUser();
     notifyChange();
+  }
+  async function signOut() {
+    console.warn('[auth] explicit signOut');
+    return hardSignOut();
   }
 
   function getUser() { return user; }
-
-  // We're "signed in" as long as a user profile is cached. The token may
-  // be nominally expired — getAccessToken handles refresh on demand.
   function isSignedIn() { return !!user; }
+  function getTokenStatus() { return tokenStatus; }
+  function getLastAuthError() { return lastAuthError; }
 
-  return { init, signIn, signOut, getAccessToken, getUser, isSignedIn, onChange };
+  return {
+    init,
+    ensureTokenClient,
+    signIn,
+    signOut,
+    getAccessToken,
+    getUser,
+    isSignedIn,
+    onChange,
+    getTokenStatus,
+    getLastAuthError
+  };
 })();

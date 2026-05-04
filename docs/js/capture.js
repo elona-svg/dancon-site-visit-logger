@@ -135,7 +135,8 @@ window.Camera = (function () {
     popstateListener = () => close({ fromPop: true });
     window.addEventListener('popstate', popstateListener);
 
-    // Permission preflight — short-circuit denied with a clear panel.
+    // Permission state pre-check. We use the result to choose the right
+    // recovery UI when getUserMedia subsequently fails.
     const camPerm = await checkPermission('camera');
     console.log('[camera] permission state:', camPerm);
     if (camPerm === 'denied') {
@@ -147,8 +148,15 @@ window.Camera = (function () {
       stream = await acquireStream({ wantAudio: !singleShot });
     } catch (err) {
       console.error('[camera] getUserMedia failed:', err);
-      if (err.name === 'NotAllowedError' || err.name === 'SecurityError') showDenied();
-      else showError(err.message || err.name || 'Camera unavailable');
+      if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+        // iOS Safari wake-from-idle quirk: permission was 'granted' but
+        // the OS still rejected the stream. No settings flip fixes that —
+        // surface the close-and-reopen instructions instead.
+        if (camPerm === 'granted') showWakeBug();
+        else showDenied();
+      } else {
+        showError(err.message || err.name || 'Camera unavailable');
+      }
       return;
     }
 
@@ -279,23 +287,87 @@ window.Camera = (function () {
     setTimeout(() => stage.classList.remove('flash'), 200);
   }
 
+  function detectCamPlatform() {
+    const ua = navigator.userAgent || '';
+    const isStandalone =
+      window.navigator.standalone === true ||
+      window.matchMedia('(display-mode: standalone)').matches;
+    if (/iPad|iPhone|iPod/.test(ua) && !/Macintosh/.test(ua)) {
+      return /CriOS|FxiOS|EdgiOS/.test(ua) ? 'ios-other'
+        : isStandalone ? 'ios-pwa' : 'ios-safari';
+    }
+    if (/Android/.test(ua)) return 'android';
+    return 'desktop';
+  }
+
   function showDenied() {
+    const errBox = document.getElementById('cam-fs-error');
+    if (!errBox) return;
+    const platform = detectCamPlatform();
+    const instructions = {
+      'ios-pwa': `
+        <p>iOS revoked camera access for this app. To fix:</p>
+        <p class="instr"><strong>Settings → Apps → Site Visit Logger → Camera → On</strong>, then return here.</p>`,
+      'ios-safari': `
+        <p>Camera access is blocked. To fix in Safari:</p>
+        <p class="instr">Tap the <strong>"AA"</strong> icon in the address bar → <strong>Website Settings → Camera → Allow</strong>.</p>`,
+      'ios-other': `
+        <p>Camera access is blocked. Open this site in <strong>Safari</strong> (or your browser's settings) and allow camera access.</p>`,
+      'android': `
+        <p>Camera access is blocked. To fix:</p>
+        <p class="instr">Tap the <strong>lock icon</strong> next to the URL → <strong>Permissions → Camera → Allow</strong>.</p>`,
+      'desktop': `
+        <p>Camera access is blocked. To fix:</p>
+        <p class="instr">Click the <strong>lock icon</strong> in the address bar → <strong>Camera → Allow</strong>, then reload.</p>`
+    };
+    errBox.hidden = false;
+    errBox.innerHTML = `
+      <div class="cam-fs-error-card">
+        <h3>Camera access needed</h3>
+        ${instructions[platform]}
+        <div class="cam-fs-actions">
+          <button class="btn-primary" id="cam-fs-retry">I've enabled it</button>
+          <button class="btn-ghost light" id="cam-fs-deny-close">Cancel</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('cam-fs-deny-close')?.addEventListener('click', () => close());
+    document.getElementById('cam-fs-retry')?.addEventListener('click', async () => {
+      // Hide the panel, retry getUserMedia. If still denied, the catch
+      // re-shows this exact panel so the tech can try again.
+      errBox.hidden = true;
+      try {
+        stream = await acquireStream({ wantAudio: !singleShot });
+        const video = document.getElementById('cam-fs-video');
+        if (video) {
+          video.srcObject = stream;
+          try { await video.play(); } catch (e) { /* ignore */ }
+        }
+      } catch (err) {
+        if (err.name === 'NotAllowedError' || err.name === 'SecurityError') showDenied();
+        else showError(err.message || err.name || 'Camera unavailable');
+      }
+    });
+  }
+
+  // Distinct from showDenied — used when navigator.permissions.query said
+  // 'granted' but getUserMedia still threw NotAllowedError. That's the
+  // known iOS Safari wake-from-idle bug; no settings change will fix it,
+  // closing and reopening the app does.
+  function showWakeBug() {
     const errBox = document.getElementById('cam-fs-error');
     if (!errBox) return;
     errBox.hidden = false;
     errBox.innerHTML = `
       <div class="cam-fs-error-card">
-        <h3>Camera access blocked</h3>
-        <p class="muted">Enable camera access for this site in your browser settings:</p>
-        <p class="muted small">
-          <strong>iPhone Safari:</strong> Settings → Safari → Camera → Allow<br>
-          <strong>Chrome:</strong> tap the lock icon in the address bar → Camera → Allow<br>
-          Then reload this page.
-        </p>
-        <button class="btn-primary" id="cam-fs-deny-close">Got it</button>
+        <h3>Camera needs to reconnect</h3>
+        <p class="muted">Close and reopen the app, then tap Open Camera again. iOS sometimes drops the camera link after the app has been idle.</p>
+        <div class="cam-fs-actions">
+          <button class="btn-primary" id="cam-fs-wake-close">OK</button>
+        </div>
       </div>
     `;
-    document.getElementById('cam-fs-deny-close')?.addEventListener('click', () => close());
+    document.getElementById('cam-fs-wake-close')?.addEventListener('click', () => close());
   }
 
   function showError(msg) {
