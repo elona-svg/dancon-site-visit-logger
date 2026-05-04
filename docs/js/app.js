@@ -268,6 +268,69 @@
     if (window.Camera.isOpen()) window.Camera.close();
   });
 
+  // ---------- Login debug log (production diagnostic) ----------
+  // Mirrors every [auth]-prefixed console.log / .warn / .error to an on-screen
+  // panel so users can copy a transcript when sign-in fails on a device where
+  // Web Inspector isn't practical. Pure passive surface — no auth logic
+  // changes; we only patch console to also append to a buffer + DOM.
+  const DEBUG_BUFFER_MAX = 200;
+  const debugLogBuffer = [];
+  let debugPanelDismissed = false;
+
+  function fmtDebugTime() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+  function fmtDebugArg(a) {
+    if (a instanceof Error) {
+      const stackHead = (a.stack || '').split('\n').slice(0, 3).join('\n  ');
+      return `${a.name || 'Error'}: ${a.message}${stackHead ? '\n  ' + stackHead : ''}`;
+    }
+    if (typeof a === 'string') return a;
+    if (a === null || a === undefined) return String(a);
+    try { return JSON.stringify(a); } catch (_) { return String(a); }
+  }
+  function appendDebugLine(level, args) {
+    const body = args.map(fmtDebugArg).join(' ');
+    const line = `[${fmtDebugTime()}] ${level.padEnd(4)} ${body}`;
+    debugLogBuffer.push(line);
+    if (debugLogBuffer.length > DEBUG_BUFFER_MAX) debugLogBuffer.shift();
+    const bodyEl = document.getElementById('login-debug-log-body');
+    const panelEl = document.getElementById('login-debug-log');
+    if (bodyEl && panelEl) {
+      bodyEl.textContent = debugLogBuffer.join('\n');
+      bodyEl.scrollTop = bodyEl.scrollHeight;
+      if (!debugPanelDismissed && panelEl.hidden) panelEl.hidden = false;
+    }
+  }
+  (function patchConsoleForAuth() {
+    const levels = [['log', 'LOG'], ['warn', 'WARN'], ['error', 'ERR']];
+    for (const [name, label] of levels) {
+      const orig = console[name].bind(console);
+      console[name] = function (...args) {
+        orig(...args);
+        if (typeof args[0] === 'string' && args[0].startsWith('[auth]')) {
+          try { appendDebugLine(label, args); } catch (_) { /* never break console */ }
+        }
+      };
+    }
+  })();
+  async function onCopyDebugLog() {
+    const text = debugLogBuffer.join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('Log copied to clipboard', 'success', 2000);
+    } catch (e) {
+      toast('Copy failed: ' + (e && e.message || e), 'error', 4000);
+    }
+  }
+  function onHideDebugLog() {
+    debugPanelDismissed = true;
+    const panel = document.getElementById('login-debug-log');
+    if (panel) panel.hidden = true;
+  }
+
   // ---------- Auth handlers ----------
   function detectPlatform() {
     const ua = navigator.userAgent || '';
@@ -1808,6 +1871,7 @@
   }
 
   function renderLogin(app) {
+    const showPanel = !debugPanelDismissed && debugLogBuffer.length > 0;
     app.innerHTML = `
       <div class="screen login-screen">
         <div class="brand">
@@ -1817,9 +1881,23 @@
         <button id="signin-btn" class="btn-signin">Sign in with Google</button>
         <div id="login-error" class="login-error" role="alert" hidden></div>
         <p class="login-fineprint">Only @${escapeHtml(window.CONFIG.HOSTED_DOMAIN)} accounts can sign in.</p>
+        <div id="login-debug-log" class="login-debug-log"${showPanel ? '' : ' hidden'}>
+          <div class="login-debug-log-header">
+            <span class="login-debug-log-title">Debug log</span>
+            <button type="button" id="login-debug-copy" class="login-debug-btn">Copy log</button>
+            <button type="button" id="login-debug-hide" class="login-debug-btn">Hide</button>
+          </div>
+          <pre id="login-debug-log-body" class="login-debug-log-body"></pre>
+        </div>
       </div>
     `;
     document.getElementById('signin-btn').addEventListener('click', onSignInClick);
+    const dbgBody = document.getElementById('login-debug-log-body');
+    if (dbgBody) dbgBody.textContent = debugLogBuffer.join('\n');
+    const copyBtn = document.getElementById('login-debug-copy');
+    if (copyBtn) copyBtn.addEventListener('click', onCopyDebugLog);
+    const hideBtn = document.getElementById('login-debug-hide');
+    if (hideBtn) hideBtn.addEventListener('click', onHideDebugLog);
   }
 
   function renderHome(app) {
