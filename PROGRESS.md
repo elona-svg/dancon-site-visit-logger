@@ -65,6 +65,31 @@ can pick up exactly where this one stopped.
 ## Known follow-ups / nice-to-haves
 - (none open at the moment — see git log for the most recent changes)
 
+### Recently shipped — Project ownership marker (SW v20)
+- **`.dancon-project` marker file** ([drive.js](docs/js/drive.js)).
+  When a tech creates a project through the app, we now also write a
+  hidden `.dancon-project` JSON file inside the new folder containing
+  `{ createdAt, createdBy, appVersion, projectId }`. New helpers:
+  `findProjectMarker(folderId)`, `createProjectMarker(folderId, payload)`,
+  `listAllProjectMarkers()`.
+- **Home list filtered to app-owned folders only** ([app.js](docs/js/app.js)
+  `loadProjects`). We run two queries in parallel — every subfolder of
+  Site Visits, and every `.dancon-project` marker we own — and keep
+  only the folders whose IDs appear in some marker's `parents` array.
+  Manually-created Drive folders are invisible to the app: no list
+  entry, no GPS auto-capture, no caching.
+- **One-time backfill migration** (app.js `runProjectMarkerMigration`).
+  Runs once per device after first launch on this version (tracked by
+  `markers.migrated.v1` in IDB). Walks every Site Visits subfolder
+  without a marker, lists its top files, and stamps a `migrated: true`
+  marker on any folder that already contains app-generated content
+  (`visit_log.txt`, `notes.txt`, `gps.txt`, `gps.html`, or files
+  matching `YYYY-MM-DD_HH-MM_…`). Folders with no app content stay
+  unmarked.
+- Marker stamping is also re-checked on `openOrCreateProject` — if a
+  folder already has a marker (rename / reuse path) we skip the
+  duplicate write.
+
 ### Recently shipped — Reliability sweep #2 (SW v19)
 - **A: Auth decoupled from initial render** ([auth.js](docs/js/auth.js)).
   `Auth.init()` is now cache-only — restores user/token from IDB+LS and

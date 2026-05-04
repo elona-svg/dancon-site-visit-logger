@@ -235,6 +235,42 @@ window.Drive = (function () {
     return big ? uploadResumable(opts) : uploadMultipart(opts);
   }
 
+  // -------- Project ownership marker --------
+  // The app marks every folder it creates with a `.dancon-project` JSON
+  // file inside it. The home list filters Drive subfolders to only those
+  // that contain such a marker, so manually-created Drive folders never
+  // appear in the app.
+  const MARKER_FILENAME = '.dancon-project';
+
+  async function findProjectMarker(folderId) {
+    return findFileInFolder(folderId, MARKER_FILENAME);
+  }
+
+  async function createProjectMarker(folderId, payload) {
+    const text = JSON.stringify(payload || {}, null, 2);
+    return uploadMultipart({
+      folderId,
+      fileName: MARKER_FILENAME,
+      mimeType: 'application/json',
+      blob: new Blob([text], { type: 'application/json' })
+    });
+  }
+
+  // Returns every `.dancon-project` marker we own. Each entry has the
+  // marker's `id` plus a `parents` array — the parent is the project
+  // folder. We use this to filter the global subfolder list to just the
+  // app-owned ones.
+  async function listAllProjectMarkers({ pageSize = 500 } = {}) {
+    const q = encodeURIComponent(`name='${escapeQ(MARKER_FILENAME)}' and trashed=false`);
+    const res = await authedFetch(
+      `${API}/files?q=${q}&fields=files(id,parents,createdTime)&pageSize=${pageSize}` +
+      `&supportsAllDrives=true&includeItemsFromAllDrives=true`
+    );
+    if (!res.ok) throw new Error(`Drive list markers failed: ${res.status}`);
+    const data = await res.json();
+    return data.files || [];
+  }
+
   // -------- Rename --------
   async function renameFile(fileId, newName) {
     const name = sanitizeFolderName(newName);
@@ -350,6 +386,9 @@ window.Drive = (function () {
     uploadResumable,
     deleteFile,
     renameFile,
+    findProjectMarker,
+    createProjectMarker,
+    listAllProjectMarkers,
     downloadFileText,
     updateFileContent,
     appendToTextFile,

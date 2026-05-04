@@ -113,7 +113,12 @@
       state.booting = false;
       scheduleRender();
       if (state.view === 'home') {
-        loadProjects();
+        // Migrate FIRST so loadProjects only sees marker-aware data.
+        // The migration is async + non-blocking; loadProjects starts
+        // immediately and will pick up newly stamped projects once a
+        // refresh cycle (or visibilitychange wake) re-runs it.
+        runProjectMarkerMigration().then(() => loadProjects());
+        loadProjects(); // also kick off an immediate cached paint
         ensureMediaPermissions();
       }
       maybeShowInstallHint();
@@ -270,9 +275,10 @@
       state.user = window.Auth.getUser();
       state.view = 'home';
       scheduleRender();
+      runProjectMarkerMigration().then(() => loadProjects());
       loadProjects();
       pumpQueue();
-      ensureMediaPermissions(); // first-launch preflight
+      ensureMediaPermissions();
     } catch (err) {
       toast(err.message || 'Sign in failed', 'error', 6000);
     }
@@ -290,6 +296,58 @@
   }
 
   // ---------- Projects ----------
+  // One-time migration: walk every subfolder in Site Visits and stamp a
+  // .dancon-project marker on any folder that already has app-generated
+  // content (visit_log.txt, notes.txt, gps.*, or YYYY-MM-DD_HH-MM_…
+  // captures). Folders with no app-generated content stay un-marked,
+  // making them invisible to the new project list. Idempotent + tracked
+  // by an IDB flag so it only runs once per device.
+  const APP_FILE_PATTERN = /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}_/;
+  const APP_KNOWN_NAMES = new Set(['visit_log.txt', 'notes.txt', 'gps.txt', 'gps.html']);
+  async function runProjectMarkerMigration() {
+    try {
+      const done = await window.DB.kvGet('markers.migrated.v1');
+      if (done) return;
+    } catch (e) { /* ignore */ }
+    console.log('[marker-migration] starting');
+    try {
+      const [allFolders, markers] = await Promise.all([
+        window.Drive.listProjectFolders({ pageSize: 500 }),
+        window.Drive.listAllProjectMarkers({ pageSize: 500 })
+      ]);
+      const alreadyMarked = new Set();
+      markers.forEach((m) => (m.parents || []).forEach((p) => alreadyMarked.add(p)));
+      const candidates = allFolders.filter((f) => !alreadyMarked.has(f.id));
+      console.log(`[marker-migration] ${candidates.length} folder(s) without marker; checking contents`);
+
+      let stamped = 0;
+      for (const folder of candidates) {
+        try {
+          const files = await window.Drive.listFolderFiles(folder.id, { pageSize: 25 });
+          const looksLikeProject = files.some((f) =>
+            APP_KNOWN_NAMES.has(f.name) || APP_FILE_PATTERN.test(f.name || '')
+          );
+          if (!looksLikeProject) continue;
+          await window.Drive.createProjectMarker(folder.id, {
+            createdAt: new Date().toISOString(),
+            createdBy: state.user?.email || 'migration',
+            appVersion: 'v20',
+            projectId: `migrated-${folder.id}`,
+            migrated: true
+          });
+          stamped += 1;
+          console.log('[marker-migration] stamped', folder.name);
+        } catch (e) {
+          console.warn('[marker-migration] failed for', folder.name, e.message);
+        }
+      }
+      try { await window.DB.kvSet('markers.migrated.v1', Date.now()); } catch (e) {}
+      console.log(`[marker-migration] done — stamped ${stamped} pre-existing project(s)`);
+    } catch (err) {
+      console.warn('[marker-migration] aborted:', err.message);
+    }
+  }
+
   // Cache-first rendering: paint from IDB instantly, refresh in the
   // background, diff + update only if changed. Cache schema:
   //   { projects: [{id, name, modifiedTime}], cachedAt: timestamp }
@@ -331,7 +389,22 @@
     updateHomeSyncIndicatorDOM();
 
     try {
-      const folders = await window.Drive.listProjectFolders({ pageSize: 200 });
+      // Two parallel queries: every subfolder of Site Visits, and every
+      // .dancon-project marker we own. We then keep only the folders
+      // whose IDs appear in some marker's `parents` array — i.e. the
+      // app-owned set. Manually-created Drive folders are excluded.
+      const [allFolders, markers] = await Promise.all([
+        window.Drive.listProjectFolders({ pageSize: 500 }),
+        window.Drive.listAllProjectMarkers({ pageSize: 500 })
+      ]);
+      const ownedIds = new Set();
+      markers.forEach((m) => {
+        (m.parents || []).forEach((p) => ownedIds.add(p));
+      });
+      const folders = allFolders.filter((f) => ownedIds.has(f.id));
+      const skipped = allFolders.length - folders.length;
+      if (skipped > 0) console.log(`[home] filtered ${skipped} unmarked folder(s)`);
+
       const changed = !projectsEqual(folders, state.projects);
       state.projects = folders;
       try {
@@ -372,6 +445,23 @@
     if (!name) { toast('Type a project name', 'warn'); return; }
     try {
       const { id, name: actualName, created } = await window.Drive.ensureProjectFolder(name);
+      // Stamp every newly-created folder with the .dancon-project marker
+      // so the home list (and any other device) recognizes it as ours.
+      // If the folder already had one (re-open path), this is a no-op.
+      try {
+        const existingMarker = await window.Drive.findProjectMarker(id);
+        if (!existingMarker) {
+          await window.Drive.createProjectMarker(id, {
+            createdAt: new Date().toISOString(),
+            createdBy: state.user?.email || 'unknown',
+            appVersion: 'v20',
+            projectId: (window.crypto?.randomUUID && window.crypto.randomUUID()) || `proj-${Date.now()}`
+          });
+          console.log('[marker] stamped new project', id);
+        }
+      } catch (e) {
+        console.warn('[marker] could not stamp project:', e.message);
+      }
       enterProject(id, actualName, { created });
     } catch (err) {
       console.error(err);
