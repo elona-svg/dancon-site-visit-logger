@@ -168,18 +168,33 @@ window.Auth = (function () {
   }
 
   // ---- Token request ---------------------------------------------------
-  // Single attempt with strict 10s timeout.
-  function requestTokenOnce() {
+  // Single attempt with caller-controlled timeout + prompt. Used both for
+  // interactive sign-in (long timeout, prompt:'select_account') and for
+  // silent refresh (short timeout + retries, prompt:'').
+  //
+  // CRITICAL: we set client.callback BEFORE invoking requestAccessToken
+  // so when GIS fires it (after the user picks an account), the response
+  // lands in our handler. We never call requestAccessToken twice for the
+  // same user gesture — that races the in-flight popup and swallows the
+  // user's actual response.
+  function requestTokenOnce({ timeoutMs = 10000, prompt = '' } = {}) {
     return new Promise((resolve, reject) => {
       ensureTokenClient().then((client) => {
-        const safety = setTimeout(() => reject(new Error('TOKEN_TIMEOUT')), 10000);
+        console.log('[auth] ensureTokenClient() resolved');
+        const safety = setTimeout(() => {
+          console.warn(`[auth] token request timed out after ${timeoutMs}ms`);
+          reject(new Error('TOKEN_TIMEOUT'));
+        }, timeoutMs);
+
         client.callback = async (resp) => {
           clearTimeout(safety);
+          console.log('[auth] token callback fired', resp && resp.error ? `(error: ${resp.error})` : '(success)');
           if (resp.error) {
             const code = resp.error || '';
             const desc = resp.error_description || code;
             const err = new Error(desc);
             err.oauthCode = code;
+            console.warn('[auth] token callback received error:', code, '-', desc);
             return reject(err);
           }
           accessToken = resp.access_token;
@@ -189,33 +204,45 @@ window.Auth = (function () {
             await fetchAndVerifyUser();
             await persistToken();
             setTokenStatus('valid');
+            console.log('[auth] token persisted, user signed in:', user?.email);
             resolve({ accessToken, user });
           } catch (err) {
+            console.warn('[auth] post-callback failure:', err.message);
             accessToken = null;
             tokenExpiresAt = 0;
+            tokenIssuedAt = 0;
             await persistToken();
             reject(err);
           }
         };
-        try { client.requestAccessToken({ prompt: '' }); }
-        catch (err) { clearTimeout(safety); reject(err); }
-      }, reject);
+
+        console.log('[auth] requestAccessToken called with prompt=', JSON.stringify(prompt));
+        try { client.requestAccessToken({ prompt }); }
+        catch (err) {
+          clearTimeout(safety);
+          console.warn('[auth] requestAccessToken threw synchronously:', err.message);
+          reject(err);
+        }
+      }, (err) => {
+        console.warn('[auth] ensureTokenClient failed:', err.message);
+        reject(err);
+      });
     });
   }
 
-  // Wrapper with exponential backoff (5 retries after first attempt).
-  async function requestToken() {
+  // Silent-refresh wrapper with backoff. Used by getAccessToken when the
+  // cached token is stale. SHORT timeout + retries are appropriate here —
+  // there's no user gesture in flight, just an iframe-driven refresh.
+  async function requestTokenWithRetries() {
     const delays = [500, 1000, 2000, 4000, 8000];
     let lastErr;
     for (let i = 0; i <= delays.length; i += 1) {
       try {
-        if (i > 0) console.log(`[auth] token retry ${i}/${delays.length} after ${delays[i - 1]}ms`);
-        return await requestTokenOnce();
+        if (i > 0) console.log(`[auth] silent refresh retry ${i}/${delays.length}`);
+        return await requestTokenOnce({ timeoutMs: 10000, prompt: '' });
       } catch (err) {
         lastErr = err;
         const code = err && err.oauthCode;
-        // OAuth-side terminal errors — server says this user is no longer
-        // valid. Force sign-out.
         if (code === 'invalid_grant' || code === 'unauthorized_client') {
           console.warn('[auth] terminal OAuth error', code, '— signing out');
           await hardSignOut();
@@ -258,7 +285,7 @@ window.Auth = (function () {
     pendingRefresh = (async () => {
       setTokenStatus('refreshing');
       try {
-        const { accessToken: t } = await requestToken();
+        const { accessToken: t } = await requestTokenWithRetries();
         return t;
       } catch (err) {
         // CRITICAL: do NOT clear user on refresh failure. A timeout, a
@@ -275,7 +302,14 @@ window.Auth = (function () {
   }
 
   async function signIn() {
-    return requestToken();
+    console.log('[auth] signIn() called');
+    // Single attempt with a generous 60-second budget — the user is
+    // actively interacting with the Google account picker, possibly
+    // typing a 2FA code, and we MUST NOT race them by firing a second
+    // requestAccessToken halfway through. No retries on this path.
+    // prompt:'select_account' forces the picker every time so the tech
+    // can switch accounts cleanly.
+    return requestTokenOnce({ timeoutMs: 60000, prompt: 'select_account' });
   }
 
   async function hardSignOut() {

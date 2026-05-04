@@ -270,8 +270,14 @@
 
   // ---------- Auth handlers ----------
   async function onSignInClick() {
+    console.log('[auth] sign-in button tapped');
+    const errEl = document.getElementById('login-error');
+    const btn = document.getElementById('signin-btn');
+    if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Signing in…'; }
     try {
       await window.Auth.signIn();
+      console.log('[auth] sign-in resolved — routing to home');
       state.user = window.Auth.getUser();
       state.view = 'home';
       scheduleRender();
@@ -280,7 +286,17 @@
       pumpQueue();
       ensureMediaPermissions();
     } catch (err) {
-      toast(err.message || 'Sign in failed', 'error', 6000);
+      console.error('[auth] signIn failed:', err);
+      const reason = (err && err.message === 'TOKEN_TIMEOUT')
+        ? 'Sign-in timed out — please try again'
+        : (err && err.message) || 'Sign-in failed';
+      if (errEl) {
+        errEl.hidden = false;
+        errEl.textContent = `${reason}. Tap to retry.`;
+      } else {
+        toast(`Sign-in failed: ${reason}`, 'error', 8000);
+      }
+      if (btn) { btn.disabled = false; btn.textContent = 'Sign in with Google'; }
     }
   }
   async function onSignOutClick() {
@@ -1748,6 +1764,7 @@
           <p class="brand-tag">Site Visit Logger</p>
         </div>
         <button id="signin-btn" class="btn-signin">Sign in with Google</button>
+        <div id="login-error" class="login-error" role="alert" hidden></div>
         <p class="login-fineprint">Only @${escapeHtml(window.CONFIG.HOSTED_DOMAIN)} accounts can sign in.</p>
       </div>
     `;
