@@ -35,6 +35,28 @@ window.Auth = (function () {
   const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
   const TOKEN_REFRESH_CUSHION_MS = 2 * 60 * 1000;
 
+  // ---- PWA / redirect-flow plumbing -----------------------------------
+  // iOS Safari isolates the OAuth popup from the installed PWA's window
+  // context, so postMessage never reaches us and requestAccessToken hangs
+  // until the safety timeout. In standalone mode we use a full-page
+  // redirect to accounts.google.com instead — the response comes back as
+  // an OAuth-fragment on the app URL and we consume it in init().
+  const IS_STANDALONE = window.matchMedia('(display-mode: standalone)').matches
+    || window.navigator.standalone === true;
+  const OAUTH_STATE_KEY = 'auth.oauth_state';
+
+  function getRedirectUri() {
+    // Strip the filename so we land on the app directory (matches what the
+    // user registers in Google Cloud Console as an Authorized redirect URI).
+    const { origin, pathname } = window.location;
+    return origin + pathname.replace(/[^/]*$/, '');
+  }
+  function generateNonce() {
+    const arr = new Uint8Array(16);
+    crypto.getRandomValues(arr);
+    return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
   function notifyChange() {
     onChangeListeners.forEach((fn) => {
       try { fn({ user, hasToken: !!accessToken, tokenStatus }); } catch (e) { console.warn(e); }
@@ -98,6 +120,17 @@ window.Auth = (function () {
   async function init() {
     if (window.CONFIG.CLIENT_ID.startsWith('__REPLACE')) {
       throw new Error('OAuth not configured: edit js/config.js and set CLIENT_ID. See README.');
+    }
+    console.log('[auth] standalone mode:', IS_STANDALONE);
+    // Redirect-flow callback (PWA path). If we landed here from Google's
+    // OAuth redirect, this consumes the hash, persists the token, and
+    // sets `user`. Returning early avoids re-running the cached-token
+    // restore on top of the freshly minted token.
+    try {
+      const cb = await consumeRedirectCallback();
+      if (cb && cb.signedIn) return;
+    } catch (e) {
+      console.warn('[auth] redirect callback handler threw:', e);
     }
     try {
       let cachedUser = await window.DB.kvGet('user');
@@ -303,13 +336,90 @@ window.Auth = (function () {
 
   async function signIn() {
     console.log('[auth] signIn() called');
-    // Single attempt with a generous 60-second budget — the user is
-    // actively interacting with the Google account picker, possibly
-    // typing a 2FA code, and we MUST NOT race them by firing a second
-    // requestAccessToken halfway through. No retries on this path.
+    console.log('[auth] using flow:', IS_STANDALONE ? 'redirect' : 'popup');
+    if (IS_STANDALONE) {
+      return signInViaRedirect();
+    }
+    // Browser path — single attempt with a generous 60-second budget.
+    // The user is actively interacting with the Google account picker,
+    // possibly typing a 2FA code, and we MUST NOT race them by firing
+    // a second requestAccessToken halfway through. No retries.
     // prompt:'select_account' forces the picker every time so the tech
     // can switch accounts cleanly.
     return requestTokenOnce({ timeoutMs: 60000, prompt: 'select_account' });
+  }
+
+  // Full-page redirect to Google. The returned promise intentionally never
+  // resolves — the page is navigating away. On return, init() picks up the
+  // hash via consumeRedirectCallback().
+  function signInViaRedirect() {
+    const nonce = generateNonce();
+    try {
+      localStorage.setItem(OAUTH_STATE_KEY, nonce);
+    } catch (e) {
+      console.warn('[auth] could not save oauth_state to localStorage:', e);
+      return Promise.reject(new Error('Could not save OAuth state — sign-in cannot proceed'));
+    }
+    const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+    url.searchParams.set('client_id', window.CONFIG.CLIENT_ID);
+    url.searchParams.set('redirect_uri', getRedirectUri());
+    url.searchParams.set('response_type', 'token');
+    url.searchParams.set('scope', window.CONFIG.SCOPES);
+    url.searchParams.set('state', nonce);
+    url.searchParams.set('prompt', 'select_account');
+    url.searchParams.set('hd', window.CONFIG.HOSTED_DOMAIN);
+    console.log('[auth] redirecting to OAuth URL');
+    window.location.href = url.toString();
+    return new Promise(() => {});
+  }
+
+  // Consume an OAuth redirect response sitting in window.location.hash.
+  // Returns { signedIn: true } on success; null otherwise. Always cleans
+  // the hash + nonce so a refresh can't re-trigger the flow.
+  async function consumeRedirectCallback() {
+    const hash = window.location.hash || '';
+    if (hash.length < 2) return null;
+    const params = new URLSearchParams(hash.slice(1));
+    const accessTok = params.get('access_token');
+    const errCode = params.get('error');
+    if (!accessTok && !errCode) return null;
+
+    const expectedState = lsGet(OAUTH_STATE_KEY);
+    const returnedState = params.get('state') || '';
+    // Always clear hash + nonce so a stale callback can't be replayed.
+    try {
+      history.replaceState(null, '', window.location.pathname + window.location.search);
+    } catch (_) {}
+    lsDelete(OAUTH_STATE_KEY);
+
+    if (errCode) {
+      console.warn('[auth] OAuth redirect returned error:', errCode, '-', params.get('error_description') || '');
+      return null;
+    }
+    if (!expectedState || returnedState !== expectedState) {
+      console.warn('[auth] state mismatch — possible CSRF, ignoring response');
+      return null;
+    }
+
+    console.log('[auth] token captured from URL hash');
+    accessToken = accessTok;
+    tokenIssuedAt = Date.now();
+    const expiresIn = Number(params.get('expires_in') || 3600);
+    tokenExpiresAt = tokenIssuedAt + (expiresIn - 60) * 1000;
+    try {
+      await fetchAndVerifyUser();
+      await persistToken();
+      setTokenStatus('valid');
+      console.log('[auth] token persisted, user signed in:', user?.email);
+      return { signedIn: true };
+    } catch (err) {
+      console.warn('[auth] post-redirect failure:', err.message);
+      accessToken = null;
+      tokenExpiresAt = 0;
+      tokenIssuedAt = 0;
+      await persistToken();
+      return null;
+    }
   }
 
   async function hardSignOut() {
