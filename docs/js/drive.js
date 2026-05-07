@@ -292,16 +292,25 @@ window.Drive = (function () {
     });
   }
 
-  // -------- Delete --------
+  // -------- Delete (move to trash) --------
+  // Switched from DELETE (permanent) to PATCH {trashed:true}. Trash is the
+  // standard Drive pattern, works reliably with `drive.file` scope, and
+  // gives a 30-day recovery window for accidental deletions. The
+  // `trashed=false` filter on listProjectFolders / listAllProjectMarkers /
+  // listFolderFiles already hides trashed items from the app.
   async function deleteFile(fileId) {
     return withRetry(async () => {
       const res = await authedFetch(`${API}/files/${fileId}?supportsAllDrives=true`, {
-        method: 'DELETE'
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trashed: true })
       });
       if (!res.ok && res.status !== 404) {
         const text = await res.text().catch(() => '');
+        console.warn(`[drive] trash failed for ${fileId}: status=${res.status} body=${text}`);
         throw new Error(`Delete failed (${res.status}): ${text || res.statusText}`);
       }
+      console.log(`[drive] trashed file ${fileId}: status=${res.status}`);
       return true;
     });
   }

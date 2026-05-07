@@ -1770,9 +1770,11 @@
     if (thumb.fileId) {
       try { await window.Drive.deleteFile(thumb.fileId); }
       catch (err) {
+        console.warn(`[delete] thumb FAILED in Drive: fileId=${thumb.fileId}, name=${thumb.name}, err=${err.message}`);
         toast(`Delete failed: ${err.message}`, 'error');
         return;
       }
+      console.log(`[delete] thumb deleted from Drive: fileId=${thumb.fileId}, name=${thumb.name}`);
       // Voice notes: also remove the matching _transcript.txt sibling
       // (if a transcript was ever generated). This mirrors the Drive
       // file pair so the office team doesn't see stale text.
