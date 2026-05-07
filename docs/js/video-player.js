@@ -15,6 +15,7 @@ window.VideoPlayer = (function () {
   let isOpen = false;
   let closing = false;
   let onCloseCb = null;
+  let onDeleteCb = null;
   let popstateListener = null;
   let touchStartY = 0;
   let touchStartT = 0;
@@ -23,14 +24,17 @@ window.VideoPlayer = (function () {
 
   function root() { return document.getElementById('overlay-root'); }
 
-  // open({ src?, fileId?, name, kind = 'video', onClose })
+  // open({ src?, fileId?, name, kind = 'video', onClose, onDelete? })
   // If `src` is provided we play it directly (e.g. current-session blob URL).
   // If `fileId` is provided we fetch the bytes from Drive ourselves.
+  // If `onDelete` is provided we render a trash button that confirms,
+  // closes the player, and invokes the callback (caller does the actual delete).
   function open(opts) {
     if (isOpen) close();
     isOpen = true;
     closing = false;
     onCloseCb = opts.onClose || null;
+    onDeleteCb = opts.onDelete || null;
 
     const isAudio = opts.kind === 'audio';
     document.body.classList.add('camera-fs-open');
@@ -44,6 +48,14 @@ window.VideoPlayer = (function () {
             <path d="M4 21h16"/>
           </svg>
         </button>
+        ${opts.onDelete ? `
+        <button class="vw-trash-btn" id="vp-del" aria-label="Delete" title="Delete">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 6h18"/>
+            <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+          </svg>
+        </button>` : ''}
         <div class="vplayer-stage" id="vp-stage">
           <div class="vplayer-loading" id="vp-loading">Loading…</div>
           <div class="vplayer-error" id="vp-error" hidden>
@@ -64,6 +76,13 @@ window.VideoPlayer = (function () {
     document.getElementById('vp-close').addEventListener('click', () => close());
     document.getElementById('vp-retry').addEventListener('click', () => loadAndPlay(opts));
     document.getElementById('vp-dl').addEventListener('click', () => downloadCurrent(opts));
+    document.getElementById('vp-del')?.addEventListener('click', () => {
+      if (!onDeleteCb) return;
+      if (!confirm('Delete this file?')) return;
+      const cb = onDeleteCb;
+      close();
+      try { cb(); } catch (e) { console.error('[vplayer] onDelete threw:', e); }
+    });
     const overlay = document.getElementById('vplayer');
     overlay.addEventListener('click', (ev) => {
       if (ev.target.id === 'vplayer' || ev.target.id === 'vp-stage') close();
@@ -253,6 +272,7 @@ window.VideoPlayer = (function () {
 
     const cb = onCloseCb;
     onCloseCb = null;
+    onDeleteCb = null;
     if (cb) { try { cb(); } catch (e) { console.error('[vplayer] onClose threw:', e); } }
   }
 

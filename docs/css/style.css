@@ -1129,6 +1129,22 @@ button.gps-chip { font: inherit; cursor: pointer; }
 .vw-download-btn svg { width: 18px; height: 18px; }
 .vw-download-btn:active { background: rgba(0,0,0,0.85); transform: scale(0.95); }
 .vplayer-overlay .vw-download-btn { bottom: calc(64px + env(safe-area-inset-bottom)); }
+
+/* Trash button — bottom-right corner of the player overlay (only when caller passes onDelete) */
+.vw-trash-btn {
+  position: absolute;
+  right: 14px;
+  bottom: calc(64px + env(safe-area-inset-bottom));
+  width: 40px; height: 40px;
+  border-radius: 50%;
+  background: rgba(220,38,38,0.78);
+  color: #fff;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid rgba(255,255,255,0.15);
+  z-index: 4;
+}
+.vw-trash-btn svg { width: 18px; height: 18px; }
+.vw-trash-btn:active { background: rgba(185,28,28,0.92); transform: scale(0.95); }
 .viewer-stage {
   flex: 1;
   display: flex; align-items: center; justify-content: center;
@@ -1509,4 +1525,51 @@ body.camera-fs-open #app { display: none; }
 /* ---------- Larger phones / tablets ---------- */
 @media (min-width: 720px) {
   .home-main, .gallery-main { max-width: 720px; margin: 0 auto; width: 100%; }
+}
+
+/* ---------- Multi-select (capture-screen thumbs + gallery cards) ---------- */
+.thumb-check {
+  position: absolute;
+  top: 4px; right: 4px;
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  background: var(--orange, #ea580c);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 0 0 2px rgba(255,255,255,0.9);
+  pointer-events: none;
+  z-index: 5;
+}
+.thumb.selected,
+.gallery-card.selected { outline: 2px solid var(--orange, #ea580c); outline-offset: -2px; }
+.thumb.selectable .thumb-check,
+.gallery-card.selectable .thumb-check {
+  background: rgba(255,255,255,0.85);
+  color: transparent;
+}
+.thumb-action-bar {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  background: var(--navy, #0d1b2a);
+  padding: 12px 16px calc(12px + env(safe-area-inset-bottom)) 16px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px;
+  z-index: 200;
+  border-top: 1px solid rgba(255,255,255,0.1);
+}
+.thumb-action-bar .sel-count {
+  color: #fff;
+  font-size: 14px;
+  flex: 1;
+}
+.thumb-action-bar .btn-ghost { color: #cbd5e1; }
+.thumb-action-bar .btn-primary {
+  background: #ea580c;
+  color: #fff;
+  border: 0;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-weight: 600;
 }

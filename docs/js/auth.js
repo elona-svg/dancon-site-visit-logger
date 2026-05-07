@@ -452,6 +452,66 @@ window.Auth = (function () {
   function getTokenStatus() { return tokenStatus; }
   function getLastAuthError() { return lastAuthError; }
 
+  // ---- GIS One Tap (PWA-only inline sign-in) -----------------------------
+  // The redirect flow opens Google in an SFSafariViewController-style sheet
+  // when used inside an installed iOS PWA; that sheet's cookie jar is
+  // isolated from the PWA's webview, which breaks 2FA. One Tap renders an
+  // inline iframe inside the PWA itself, sharing the PWA's cookie context.
+  // We then attempt a silent access-token grant via the existing GIS oauth2
+  // client. The silent grant may still fail in restricted contexts — in
+  // that case we roll back so we don't leave a half-signed-in state.
+  let oneTapInitialized = false;
+  function initOneTap() {
+    if (!IS_STANDALONE) return; // browser users keep popup/redirect
+    if (oneTapInitialized) return;
+    ensureTokenClient().then(() => {
+      if (!window.google?.accounts?.id) {
+        console.warn('[auth] One Tap unavailable: google.accounts.id missing');
+        return;
+      }
+      oneTapInitialized = true;
+      window.google.accounts.id.initialize({
+        client_id: window.CONFIG.CLIENT_ID,
+        callback: async (credentialResponse) => {
+          console.log('[auth] One Tap callback fired');
+          let candidateUser = null;
+          try {
+            const payload = JSON.parse(atob(credentialResponse.credential.split('.')[1]));
+            if (!payload.email || !payload.email.toLowerCase().endsWith('@' + window.CONFIG.HOSTED_DOMAIN)) {
+              throw new Error(`Only @${window.CONFIG.HOSTED_DOMAIN} accounts are allowed.`);
+            }
+            candidateUser = {
+              email: payload.email,
+              name: payload.name || payload.email,
+              firstName: (payload.given_name || (payload.name || '').split(' ')[0] || 'Tech').trim(),
+              picture: payload.picture || ''
+            };
+            user = candidateUser;
+            await persistUser();
+            // Silent access-token grant. May fail in restricted PWA
+            // contexts — if so, roll back so the app doesn't sit in a
+            // half-signed-in state with no Drive token.
+            await getAccessToken(true);
+            setTokenStatus('valid');
+            notifyChange();
+            console.log('[auth] One Tap signed in:', user.email);
+          } catch (err) {
+            console.warn('[auth] One Tap callback error:', err.message);
+            user = null;
+            await persistUser();
+            notifyChange();
+          }
+        },
+        hosted_domain: window.CONFIG.HOSTED_DOMAIN,
+        use_fedcm_for_prompt: true
+      });
+      try { window.google.accounts.id.prompt(); }
+      catch (e) { console.warn('[auth] One Tap prompt threw:', e.message); }
+    }).catch((err) => {
+      console.warn('[auth] One Tap init failed:', err && err.message);
+    });
+  }
+
   return {
     init,
     ensureTokenClient,
@@ -462,6 +522,7 @@ window.Auth = (function () {
     isSignedIn,
     onChange,
     getTokenStatus,
-    getLastAuthError
+    getLastAuthError,
+    initOneTap
   };
 })();

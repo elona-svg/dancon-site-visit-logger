@@ -1635,7 +1635,8 @@
       const opts = {
         kind,
         name: target.name,
-        onClose: () => {}
+        onClose: () => {},
+        onDelete: async () => { await deleteThumb(target); }
       };
       if (target.objectUrl && itemAlive(target)) {
         opts.src = target.objectUrl;
@@ -1808,7 +1809,7 @@
     state.view = 'gallery';
     state.galleryFiles = [];
     state.galleryLoading = true;
-    setGalleryLongPressed(null);
+    if (gallerySelectMode) exitGallerySelectMode();
     scheduleRender();
 
     try {
@@ -1947,6 +1948,14 @@
     if (copyBtn) copyBtn.addEventListener('click', onCopyDebugLog);
     const hideBtn = document.getElementById('login-debug-hide');
     if (hideBtn) hideBtn.addEventListener('click', onHideDebugLog);
+    // PWA-only: render the inline GIS One Tap prompt. iOS opens redirect
+    // OAuth in an isolated SFSafariViewController sheet that breaks 2FA;
+    // One Tap stays inside the PWA's own webview/cookie context.
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches
+      || window.navigator.standalone === true;
+    if (isStandalone && window.Auth && typeof window.Auth.initOneTap === 'function') {
+      try { window.Auth.initOneTap(); } catch (e) { console.warn('initOneTap threw:', e); }
+    }
   }
 
   function renderHome(app) {
@@ -2296,23 +2305,74 @@
     updateThumbsDOM();
   }
 
-  // -------- Long-press to reveal trash --------
-  let longPressedId = null;     // queueId or fileId of the currently "selected" thumb
+  // -------- Long-press → multi-select --------
+  // Long-pressing any thumb enters selection mode with that item auto-
+  // selected. Subsequent taps toggle selection. A floating action bar
+  // shows the count with Delete / Cancel buttons. Bulk delete fires the
+  // existing single-item deleteThumb() in parallel for each selection.
+  const thumbSelection = new Set();
+  let thumbSelectMode = false;
   let lpTimer = null;
   let lpSuppressClick = false;
+  let thumbsDocListenerAttached = false;
 
   function clearLongPress() {
     if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
   }
-  function setLongPressed(id) {
-    if (longPressedId === id) return;
-    longPressedId = id;
-    document.querySelectorAll('.thumb.show-trash').forEach((el) => el.classList.remove('show-trash'));
-    if (id != null) {
-      const el = document.querySelector(`[data-thumb-key="${CSS.escape(String(id))}"]`);
-      if (el) el.classList.add('show-trash');
-      if (navigator.vibrate) try { navigator.vibrate(20); } catch (e) { /* ignore */ }
+  function thumbKeyToIndex(key) {
+    return state.thumbs.findIndex((t) =>
+      String(t.queueId ?? t.fileId ?? '') === String(key));
+  }
+  function enterThumbSelectMode(initialKey) {
+    thumbSelectMode = true;
+    thumbSelection.clear();
+    if (initialKey) thumbSelection.add(String(initialKey));
+    if (navigator.vibrate) try { navigator.vibrate(20); } catch (e) { /* ignore */ }
+    updateThumbsDOM();
+    renderThumbActionBar();
+  }
+  function exitThumbSelectMode() {
+    thumbSelectMode = false;
+    thumbSelection.clear();
+    const bar = document.getElementById('thumb-action-bar');
+    if (bar) bar.remove();
+    updateThumbsDOM();
+  }
+  function toggleThumbSelection(key) {
+    const k = String(key);
+    if (thumbSelection.has(k)) thumbSelection.delete(k);
+    else thumbSelection.add(k);
+    if (thumbSelection.size === 0) { exitThumbSelectMode(); return; }
+    updateThumbsDOM();
+    renderThumbActionBar();
+  }
+  function renderThumbActionBar() {
+    let bar = document.getElementById('thumb-action-bar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'thumb-action-bar';
+      bar.className = 'thumb-action-bar';
+      document.body.appendChild(bar);
     }
+    bar.innerHTML = `
+      <span class="sel-count">${thumbSelection.size} selected</span>
+      <button type="button" class="btn-ghost" id="thumb-sel-cancel">Cancel</button>
+      <button type="button" class="btn-primary" id="thumb-sel-delete">Delete Selected</button>
+    `;
+    document.getElementById('thumb-sel-cancel').addEventListener('click', exitThumbSelectMode);
+    document.getElementById('thumb-sel-delete').addEventListener('click', bulkDeleteSelectedThumbs);
+  }
+  async function bulkDeleteSelectedThumbs() {
+    const n = thumbSelection.size;
+    if (n === 0) return;
+    if (!confirm(`Delete ${n} file${n === 1 ? '' : 's'}? This cannot be undone.`)) return;
+    const targets = Array.from(thumbSelection)
+      .map((k) => state.thumbs[thumbKeyToIndex(k)])
+      .filter(Boolean);
+    await Promise.all(targets.map((t) => deleteThumb(t).catch((e) => {
+      console.warn('[bulk-delete] thumb delete failed:', e && e.message);
+    })));
+    exitThumbSelectMode();
   }
 
   function attachThumbInteractions(strip) {
@@ -2322,19 +2382,23 @@
         clearLongPress();
         lpTimer = setTimeout(() => {
           lpSuppressClick = true;
-          setLongPressed(key);
+          if (!thumbSelectMode) enterThumbSelectMode(key);
         }, 500);
       });
       ['pointerup', 'pointercancel', 'pointerleave'].forEach((evt) => {
         thumbEl.addEventListener(evt, clearLongPress);
       });
     });
-    // Tap outside any thumb dismisses the long-press selection.
-    document.addEventListener('pointerdown', (ev) => {
-      if (longPressedId == null) return;
-      if (ev.target.closest('.thumb')) return;
-      setLongPressed(null);
-    }, { capture: true });
+    if (!thumbsDocListenerAttached) {
+      thumbsDocListenerAttached = true;
+      // Tap outside any thumb (and outside the action bar) cancels selection.
+      document.addEventListener('pointerdown', (ev) => {
+        if (!thumbSelectMode) return;
+        if (ev.target.closest('.thumb')) return;
+        if (ev.target.closest('#thumb-action-bar')) return;
+        exitThumbSelectMode();
+      }, { capture: true });
+    }
   }
 
   function parseTimeFromFilename(name) {
@@ -2379,21 +2443,20 @@
           return;
         }
         lpSuppressClick = false;
-        if (action === 'open') openViewerForThumb(idx);
-        else if (action === 'delete') {
-          if (confirm('Delete this file?')) deleteThumb(state.thumbs[idx]);
-          setLongPressed(null);
+        if (action === 'open') {
+          if (thumbSelectMode) {
+            const t = state.thumbs[idx];
+            const key = String(t.queueId ?? t.fileId ?? `thumb-${idx}`);
+            toggleThumbSelection(key);
+          } else {
+            openViewerForThumb(idx);
+          }
         }
         else if (action === 'retry') retryThumb(state.thumbs[idx].queueId);
       });
     });
 
     attachThumbInteractions(strip);
-    // Restore long-press highlight after re-render.
-    if (longPressedId != null) {
-      const el = strip.querySelector(`[data-thumb-key="${CSS.escape(String(longPressedId))}"]`);
-      if (el) el.classList.add('show-trash');
-    }
   }
 
   function thumbHtml(t, idx) {
@@ -2427,12 +2490,18 @@
     else if (t.status === 'queued') stateHtml = '<span class="thumb-state">Queued</span>';
     else if (t.status === 'uploading') stateHtml = `<span class="thumb-state">${pct}%</span>`;
 
+    const selected = thumbSelectMode && thumbSelection.has(String(key));
+    const selCls = thumbSelectMode ? (selected ? ' selected' : ' selectable') : '';
+    const checkHtml = thumbSelectMode
+      ? `<div class="thumb-check" aria-hidden="true">${selected ? '✓' : ''}</div>`
+      : '';
+
     return `
-      <div class="thumb ${cls} ${t.type}" data-thumb-action="open" data-thumb-idx="${idx}" data-thumb-key="${key}">
+      <div class="thumb ${cls} ${t.type}${selCls}" data-thumb-action="open" data-thumb-idx="${idx}" data-thumb-key="${key}">
         ${bgHtml}
         ${stateHtml}
         ${showProgress ? `<div class="thumb-progress"><div class="thumb-progress-bar" style="width:${pct}%"></div></div>` : ''}
-        <button class="thumb-trash" data-thumb-action="delete" data-thumb-idx="${idx}" aria-label="Delete">🗑</button>
+        ${checkHtml}
         ${t.status === 'failed'
           ? `<button class="thumb-retry" data-thumb-action="retry" data-thumb-idx="${idx}" aria-label="Retry">↻ Retry</button>`
           : ''}
@@ -2584,8 +2653,9 @@
     updateGalleryListDOM();
   }
 
-  // ---------- Gallery long-press (mirror of capture-screen pattern) ----------
-  let galleryLpId = null;
+  // ---------- Gallery long-press → multi-select (mirror of capture pattern) ----------
+  const gallerySelection = new Set();
+  let gallerySelectMode = false;
   let galleryLpTimer = null;
   let galleryLpSuppressClick = false;
   let galleryDocListenerAttached = false;
@@ -2593,15 +2663,57 @@
   function clearGalleryLongPress() {
     if (galleryLpTimer) { clearTimeout(galleryLpTimer); galleryLpTimer = null; }
   }
-  function setGalleryLongPressed(key) {
-    galleryLpId = key;
-    document.querySelectorAll('.thumb.gallery-thumb.show-trash, .gallery-card.show-trash')
-      .forEach((el) => el.classList.remove('show-trash'));
-    if (key != null) {
-      const el = document.querySelector(`[data-gallery-key="${CSS.escape(String(key))}"]`);
-      if (el) el.classList.add('show-trash');
-      if (navigator.vibrate) try { navigator.vibrate(20); } catch (e) { /* ignore */ }
+  function enterGallerySelectMode(initialKey) {
+    gallerySelectMode = true;
+    gallerySelection.clear();
+    if (initialKey) gallerySelection.add(String(initialKey));
+    if (navigator.vibrate) try { navigator.vibrate(20); } catch (e) { /* ignore */ }
+    updateGalleryListDOM();
+    renderGalleryActionBar();
+  }
+  function exitGallerySelectMode() {
+    gallerySelectMode = false;
+    gallerySelection.clear();
+    const bar = document.getElementById('gallery-action-bar');
+    if (bar) bar.remove();
+    updateGalleryListDOM();
+  }
+  function toggleGallerySelection(key) {
+    const k = String(key);
+    if (gallerySelection.has(k)) gallerySelection.delete(k);
+    else gallerySelection.add(k);
+    if (gallerySelection.size === 0) { exitGallerySelectMode(); return; }
+    updateGalleryListDOM();
+    renderGalleryActionBar();
+  }
+  function renderGalleryActionBar() {
+    let bar = document.getElementById('gallery-action-bar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'gallery-action-bar';
+      bar.className = 'thumb-action-bar';
+      document.body.appendChild(bar);
     }
+    bar.innerHTML = `
+      <span class="sel-count">${gallerySelection.size} selected</span>
+      <button type="button" class="btn-ghost" id="gallery-sel-cancel">Cancel</button>
+      <button type="button" class="btn-primary" id="gallery-sel-delete">Delete Selected</button>
+    `;
+    document.getElementById('gallery-sel-cancel').addEventListener('click', exitGallerySelectMode);
+    document.getElementById('gallery-sel-delete').addEventListener('click', bulkDeleteSelectedGallery);
+  }
+  async function bulkDeleteSelectedGallery() {
+    const n = gallerySelection.size;
+    if (n === 0) return;
+    if (!confirm(`Delete ${n} file${n === 1 ? '' : 's'}? This cannot be undone.`)) return;
+    const ids = Array.from(gallerySelection);
+    const files = ids
+      .map((id) => (state.galleryFiles || []).find((f) => f.id === id))
+      .filter(Boolean);
+    await Promise.all(files.map((f) => deleteGalleryFile(f).catch((e) => {
+      console.warn('[bulk-delete] gallery file failed:', e && e.message);
+    })));
+    exitGallerySelectMode();
   }
   function attachGalleryLongPress(root) {
     root.querySelectorAll('[data-gallery-key]').forEach((el) => {
@@ -2610,7 +2722,7 @@
         clearGalleryLongPress();
         galleryLpTimer = setTimeout(() => {
           galleryLpSuppressClick = true;
-          setGalleryLongPressed(key);
+          if (!gallerySelectMode) enterGallerySelectMode(key);
         }, 500);
       });
       ['pointerup', 'pointercancel', 'pointerleave'].forEach((evt) => {
@@ -2621,9 +2733,10 @@
       galleryDocListenerAttached = true;
       document.addEventListener('pointerdown', (ev) => {
         if (state.view !== 'gallery') return;
-        if (galleryLpId == null) return;
+        if (!gallerySelectMode) return;
         if (ev.target.closest('[data-gallery-key]')) return;
-        setGalleryLongPressed(null);
+        if (ev.target.closest('#gallery-action-bar')) return;
+        exitGallerySelectMode();
       }, { capture: true });
     }
   }
@@ -2675,7 +2788,6 @@
       }
     } catch (e) { /* ignore */ }
 
-    setGalleryLongPressed(null);
     updateGalleryListDOM();
     toast('Deleted', 'success');
   }
@@ -2707,15 +2819,21 @@
     const docs = files.filter((f) =>
       /\.txt$/i.test(f.name) && !(f.mimeType || '').startsWith('audio/'));
 
+    const cellSel = (id) => gallerySelectMode && gallerySelection.has(String(id));
+    const cellSelCls = (id) => gallerySelectMode ? (cellSel(id) ? ' selected' : ' selectable') : '';
+    const checkBadge = (id) => gallerySelectMode
+      ? `<div class="thumb-check" aria-hidden="true">${cellSel(id) ? '✓' : ''}</div>`
+      : '';
+
     const photoCellHtml = (f) => `
-      <div class="thumb gallery-thumb" data-gallery-key="${escapeHtml(f.id)}" data-gallery-id="${escapeHtml(f.id)}" data-gallery-mime="${escapeHtml(f.mimeType || '')}">
+      <div class="thumb gallery-thumb${cellSelCls(f.id)}" data-gallery-key="${escapeHtml(f.id)}" data-gallery-id="${escapeHtml(f.id)}" data-gallery-mime="${escapeHtml(f.mimeType || '')}">
         ${f.thumbnailLink ? `<img loading="lazy" alt="" src="${escapeHtml(upscaleDriveThumb(f.thumbnailLink))}" onerror="this.style.display='none'"/>` : ''}
         <span class="thumb-label">${escapeHtml(f.name)}</span>
-        <button class="thumb-trash" data-gallery-action="delete" aria-label="Delete">🗑</button>
+        ${checkBadge(f.id)}
       </div>`;
 
     const videoCardHtml = (f) => `
-      <div class="gallery-card video" data-gallery-key="${escapeHtml(f.id)}" data-gallery-id="${escapeHtml(f.id)}" data-gallery-mime="${escapeHtml(f.mimeType || '')}" data-gallery-name="${escapeHtml(f.name)}">
+      <div class="gallery-card video${cellSelCls(f.id)}" data-gallery-key="${escapeHtml(f.id)}" data-gallery-id="${escapeHtml(f.id)}" data-gallery-mime="${escapeHtml(f.mimeType || '')}" data-gallery-name="${escapeHtml(f.name)}">
         <div class="gallery-card-thumb">
           ${f.thumbnailLink ? `<img loading="lazy" alt="" src="${escapeHtml(upscaleDriveThumb(f.thumbnailLink))}" onerror="this.style.display='none'"/>` : ''}
           <div class="play-overlay">▶</div>
@@ -2724,17 +2842,17 @@
           <span class="gallery-card-name">${escapeHtml(f.name)}</span>
           <span class="gallery-card-size">${escapeHtml(fmtBytes(Number(f.size || 0)))}</span>
         </div>
-        <button class="gallery-card-trash" data-gallery-action="delete" aria-label="Delete">🗑</button>
+        ${checkBadge(f.id)}
       </div>`;
 
     const audioCardHtml = (f) => `
-      <div class="gallery-card audio" data-gallery-key="${escapeHtml(f.id)}" data-gallery-id="${escapeHtml(f.id)}" data-gallery-mime="${escapeHtml(f.mimeType || '')}" data-gallery-name="${escapeHtml(f.name)}">
+      <div class="gallery-card audio${cellSelCls(f.id)}" data-gallery-key="${escapeHtml(f.id)}" data-gallery-id="${escapeHtml(f.id)}" data-gallery-mime="${escapeHtml(f.mimeType || '')}" data-gallery-name="${escapeHtml(f.name)}">
         <div class="gallery-card-thumb"><span aria-hidden="true">🎙</span></div>
         <div class="gallery-card-meta">
           <span class="gallery-card-name">${escapeHtml(f.name)}</span>
           <span class="gallery-card-size">${escapeHtml(fmtBytes(Number(f.size || 0)))}</span>
         </div>
-        <button class="gallery-card-trash" data-gallery-action="delete" aria-label="Delete">🗑</button>
+        ${checkBadge(f.id)}
       </div>`;
 
     root.innerHTML = `
@@ -2765,45 +2883,37 @@
         </div>` : ''}
     `;
 
-    // Trash button click → confirm + delete.
-    root.querySelectorAll('[data-gallery-action="delete"]').forEach((btn) => {
-      btn.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        const card = btn.closest('[data-gallery-key]');
-        const id = card?.dataset.galleryId;
-        const file = files.find((f) => f.id === id);
-        if (!file) return;
-        const label = (file.mimeType || '').startsWith('audio/') ? 'voice recording'
-          : (file.mimeType || '').startsWith('video/') ? 'video'
-          : 'photo';
-        if (confirm(`Delete this ${label}?`)) deleteGalleryFile(file);
-        else setGalleryLongPressed(null);
-      });
-    });
-
-    // Card tap → photo viewer / video player / audio player.
+    // Card tap → toggle selection in select mode, otherwise open viewer.
     root.querySelectorAll('[data-gallery-key]').forEach((el) => {
       el.addEventListener('click', (ev) => {
-        if (ev.target.closest('[data-gallery-action="delete"]')) return;
         if (galleryLpSuppressClick) { galleryLpSuppressClick = false; return; }
-        if (galleryLpId != null) { setGalleryLongPressed(null); return; }
         const id = el.dataset.galleryId;
+        if (gallerySelectMode) {
+          toggleGallerySelection(id);
+          return;
+        }
         const mime = el.dataset.galleryMime || '';
         const name = el.dataset.galleryName || '';
         if (mime.startsWith('image/')) {
           annotateFromDrive(id);
         } else if (mime.startsWith('video/')) {
-          window.VideoPlayer.open({ fileId: id, name, kind: 'video', onClose: () => {} });
+          const file = files.find((f) => f.id === id);
+          window.VideoPlayer.open({
+            fileId: id, name, kind: 'video',
+            onClose: () => {},
+            onDelete: file ? async () => { await deleteGalleryFile(file); } : undefined
+          });
         } else if (mime.startsWith('audio/')) {
-          window.VideoPlayer.open({ fileId: id, name, kind: 'audio', onClose: () => {} });
+          const file = files.find((f) => f.id === id);
+          window.VideoPlayer.open({
+            fileId: id, name, kind: 'audio',
+            onClose: () => {},
+            onDelete: file ? async () => { await deleteGalleryFile(file); } : undefined
+          });
         }
       });
     });
 
     attachGalleryLongPress(root);
-    if (galleryLpId != null) {
-      const el = root.querySelector(`[data-gallery-key="${CSS.escape(String(galleryLpId))}"]`);
-      if (el) el.classList.add('show-trash');
-    }
   }
 })();
