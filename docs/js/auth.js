@@ -43,6 +43,14 @@ window.Auth = (function () {
   // an OAuth-fragment on the app URL and we consume it in init().
   const IS_STANDALONE = window.matchMedia('(display-mode: standalone)').matches
     || window.navigator.standalone === true;
+  // Safari (any context) blocks/strips the OAuth popup callback the same way
+  // an installed PWA does, so we route Safari through the redirect flow even
+  // when not in standalone mode. Desktop Chrome, Edge, etc. include "Safari"
+  // in their UA — the !Chrome guard excludes them. iOS Chrome uses CriOS
+  // (no "Chrome" token) and IS WebKit underneath, so it's correctly bucketed
+  // as Safari by this rule.
+  const IS_SAFARI_BROWSER = /Safari/.test(navigator.userAgent) && !/Chrome/.test(navigator.userAgent);
+  const USE_REDIRECT = IS_STANDALONE || IS_SAFARI_BROWSER;
   const OAUTH_STATE_KEY = 'auth.oauth_state';
 
   function getRedirectUri() {
@@ -121,7 +129,7 @@ window.Auth = (function () {
     if (window.CONFIG.CLIENT_ID.startsWith('__REPLACE')) {
       throw new Error('OAuth not configured: edit js/config.js and set CLIENT_ID. See README.');
     }
-    console.log('[auth] standalone mode:', IS_STANDALONE);
+    console.log('[auth] standalone mode:', IS_STANDALONE, '— safari browser:', IS_SAFARI_BROWSER);
     // Redirect-flow callback (PWA path). If we landed here from Google's
     // OAuth redirect, this consumes the hash, persists the token, and
     // sets `user`. Returning early avoids re-running the cached-token
@@ -336,8 +344,8 @@ window.Auth = (function () {
 
   async function signIn() {
     console.log('[auth] signIn() called');
-    console.log('[auth] using flow:', IS_STANDALONE ? 'redirect' : 'popup');
-    if (IS_STANDALONE) {
+    console.log('[auth] using flow:', USE_REDIRECT ? 'redirect' : 'popup');
+    if (USE_REDIRECT) {
       return signInViaRedirect();
     }
     // Browser path — single attempt with a generous 60-second budget.
