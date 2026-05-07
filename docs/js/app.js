@@ -535,6 +535,17 @@
       const skipped = allFolders.length - folders.length;
       if (skipped > 0) console.log(`[home] filtered ${skipped} unmarked folder(s)`);
 
+      // Explicit reconcile: drop any cached project whose ID is not in
+      // the live Drive response. listProjectFolders already filters
+      // trashed=false so a folder deleted directly in Drive won't appear
+      // here, and overwriting state.projects below carries the deletion
+      // through. This filter is defensive — surfacing the intent in code.
+      const freshIds = new Set(folders.map((f) => f.id));
+      const removed = state.projects.filter((p) => !freshIds.has(p.id));
+      if (removed.length > 0) {
+        console.log('[home] reconcile: dropping', removed.length, 'stale folder(s) from cache:',
+          removed.map((p) => p.name).join(', '));
+      }
       const changed = !projectsEqual(folders, state.projects);
       state.projects = folders;
       try {

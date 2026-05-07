@@ -31,6 +31,7 @@ window.VideoPlayer = (function () {
   // closes the player, and invokes the callback (caller does the actual delete).
   function open(opts) {
     if (isOpen) close();
+    console.log('[vplayer] onDelete provided:', !!opts.onDelete);
     isOpen = true;
     closing = false;
     onCloseCb = opts.onClose || null;
