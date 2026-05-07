@@ -1767,6 +1767,7 @@
       }
     });
 
+    let deletedTranscriptId = null;
     if (thumb.fileId) {
       try { await window.Drive.deleteFile(thumb.fileId); }
       catch (err) {
@@ -1782,7 +1783,7 @@
         const transcriptName = thumb.name.replace(/\.[^.]+$/, '_transcript.txt');
         try {
           const t = await window.Drive.findFileInFolder(state.currentProjectId, transcriptName);
-          if (t) await window.Drive.deleteFile(t.id);
+          if (t) { deletedTranscriptId = t.id; await window.Drive.deleteFile(t.id); }
         } catch (e) { /* best-effort */ }
       }
       // Audit trail in visit_log.txt — same pattern as soft-deleted notes.
@@ -1798,6 +1799,31 @@
     const idx = state.thumbs.indexOf(thumb);
     if (idx >= 0) state.thumbs.splice(idx, 1);
     revokeThumbBlob(thumb);
+
+    // Persistent cache: remove the deleted file (and its transcript, if
+    // any) from project.{folderId}.cache so the next cache-first paint
+    // doesn't re-show it. The cache shape is { files:[{id,...}], cachedAt };
+    // ignore the dead-code `cached.thumbs` branch the user's spec includes.
+    try {
+      const folderId = state.currentProjectId;
+      if (folderId && thumb.fileId) {
+        const cacheKey = projectCacheKey(folderId);
+        const cached = await window.DB.kvGet(cacheKey);
+        if (cached && Array.isArray(cached.files)) {
+          const dropIds = new Set([thumb.fileId]);
+          if (deletedTranscriptId) dropIds.add(deletedTranscriptId);
+          cached.files = cached.files.filter((f) => !dropIds.has(f.id));
+          cached.cachedAt = Date.now();
+          await window.DB.kvSet(cacheKey, cached);
+        }
+        // Gallery state may be loaded too — keep it in sync.
+        if (Array.isArray(state.galleryFiles)) {
+          state.galleryFiles = state.galleryFiles.filter((f) =>
+            f.id !== thumb.fileId && (!deletedTranscriptId || f.id !== deletedTranscriptId));
+        }
+      }
+    } catch (e) { console.warn('[delete] cache update failed:', e); }
+
     updateThumbsDOM();
     toast('Deleted', 'success');
   }
@@ -2382,10 +2408,31 @@
     const targets = Array.from(thumbSelection)
       .map((k) => state.thumbs[thumbKeyToIndex(k)])
       .filter(Boolean);
+    const deletedIds = new Set(targets.map((t) => t.fileId).filter(Boolean));
     await Promise.all(targets.map((t) => deleteThumb(t).catch((e) => {
       console.warn('[bulk-delete] thumb delete failed:', e && e.message);
     })));
+    // Concurrent per-thumb cache writes can race (read-modify-write). Do
+    // one consolidating rewrite at the end so the cache reflects every
+    // deletion regardless of interleaving.
+    await reconcileCacheAfterBulkDelete(deletedIds);
     exitThumbSelectMode();
+  }
+
+  async function reconcileCacheAfterBulkDelete(deletedIds) {
+    if (!deletedIds || deletedIds.size === 0) return;
+    const folderId = state.currentProjectId;
+    if (!folderId) return;
+    try {
+      const cacheKey = projectCacheKey(folderId);
+      const cached = await window.DB.kvGet(cacheKey);
+      if (cached && Array.isArray(cached.files)) {
+        cached.files = cached.files.filter((f) => !deletedIds.has(f.id));
+        cached.cachedAt = Date.now();
+        await window.DB.kvSet(cacheKey, cached);
+        console.log('[bulk-delete] cache reconciled:', deletedIds.size, 'IDs removed');
+      }
+    } catch (e) { console.warn('[bulk-delete] cache reconcile failed:', e); }
   }
 
   function attachThumbInteractions(strip) {
@@ -2723,9 +2770,13 @@
     const files = ids
       .map((id) => (state.galleryFiles || []).find((f) => f.id === id))
       .filter(Boolean);
+    const deletedIds = new Set(files.map((f) => f.id));
     await Promise.all(files.map((f) => deleteGalleryFile(f).catch((e) => {
       console.warn('[bulk-delete] gallery file failed:', e && e.message);
     })));
+    // Final consolidating cache write — fixes any read-modify-write race
+    // between per-file deleteGalleryFile cache updates running in parallel.
+    await reconcileCacheAfterBulkDelete(deletedIds);
     exitGallerySelectMode();
   }
   function attachGalleryLongPress(root) {
