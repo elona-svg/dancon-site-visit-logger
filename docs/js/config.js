@@ -3,6 +3,11 @@
 window.CONFIG = {
   CLIENT_ID: '266285578217-2gr3mn0ad7njl017ocfdk9otknhgu2a0.apps.googleusercontent.com',
 
+  // Cloudflare Worker that holds the OAuth client_secret server-side and
+  // proxies POSTs to oauth2.googleapis.com/token for the PKCE code flow
+  // and refresh_token grant. Keeping the secret out of this repo.
+  TOKEN_PROXY_URL: 'https://dancon-token-proxy.dancon-services.workers.dev',
+
   // Restrict the Google account chooser to a single Workspace domain.
   // Note: this is a UX hint — the email-domain check in auth.js is the real gate.
   HOSTED_DOMAIN: 'danconservices.com',

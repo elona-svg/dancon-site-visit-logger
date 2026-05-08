@@ -297,12 +297,11 @@ window.Auth = (function () {
     if (!rt) rt = lsGet(REFRESH_TOKEN_KEY);
     if (!rt) return null;
     try {
-      const resp = await fetch('https://oauth2.googleapis.com/token', {
+      const resp = await fetch(window.CONFIG.TOKEN_PROXY_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
           refresh_token: rt,
-          client_id: window.CONFIG.CLIENT_ID,
           grant_type: 'refresh_token'
         })
       });
@@ -508,18 +507,17 @@ window.Auth = (function () {
       return null;
     }
 
-    console.log('[auth] PKCE: code received, exchanging...');
+    console.log('[auth] PKCE: code received, exchanging via token proxy...');
     let tokens;
     try {
-      const resp = await fetch('https://oauth2.googleapis.com/token', {
+      const resp = await fetch(window.CONFIG.TOKEN_PROXY_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
           code,
-          client_id: window.CONFIG.CLIENT_ID,
+          code_verifier: verifier,
           redirect_uri: getRedirectUri(),
-          grant_type: 'authorization_code',
-          code_verifier: verifier
+          grant_type: 'authorization_code'
         })
       });
       tokens = await resp.json();
