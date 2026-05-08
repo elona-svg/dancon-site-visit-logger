@@ -337,6 +337,18 @@ window.Auth = (function () {
     const refreshed = await tryRefreshTokenGrant();
     if (refreshed) return refreshed;
 
+    // PWA cold start with no session: GIS iframe requestAccessToken() will
+    // time out 6x10s = 60s in the SFSafariViewController sandbox before
+    // giving up. There's no point — the user has to sign in interactively
+    // via the PKCE redirect anyway. Bail fast so the login screen stays
+    // responsive instead of grinding through dead retries.
+    if (USE_REDIRECT && !user && !lsGet(REFRESH_TOKEN_KEY)) {
+      console.log('[auth] PWA cold start, no refresh token — skipping GIS retries (sign in required)');
+      const err = new Error('SIGN_IN_REQUIRED');
+      err.signInRequired = true;
+      throw err;
+    }
+
     const delays = [500, 1000, 2000, 4000, 8000];
     let lastErr;
     for (let i = 0; i <= delays.length; i += 1) {
