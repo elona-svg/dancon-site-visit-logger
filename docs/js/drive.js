@@ -87,27 +87,52 @@ window.Drive = (function () {
   }
 
   // -------- Folders --------
+  // New projects get an MM-DD-YYYY date suffix appended to the folder
+  // name. This is preserved through rename — the suffix is part of the
+  // folder identity, not part of what techs edit. On reopen we look for
+  // exact-name (legacy projects without a date) OR `<name> MM-DD-YYYY`
+  // (current projects) to decide whether to reuse vs create.
+  const PROJECT_DATE_RE = /^\d{2}-\d{2}-\d{4}$/;
+  function todayDateStr() {
+    const d = new Date();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    const yyyy = d.getFullYear();
+    return `${mm}-${dd}-${yyyy}`;
+  }
   async function ensureProjectFolder(rawName) {
-    const name = sanitizeFolderName(rawName);
-    if (!name) throw new Error('Empty project name');
+    const baseName = sanitizeFolderName(rawName);
+    if (!baseName) throw new Error('Empty project name');
+    // Drive `name contains` is a substring match — we filter the results
+    // client-side to either exact (legacy) or `<baseName> MM-DD-YYYY`.
     const q = encodeURIComponent(
-      `name='${escapeQ(name)}' and ` +
       `'${window.CONFIG.SITE_VISITS_FOLDER_ID}' in parents and ` +
-      `mimeType='application/vnd.google-apps.folder' and trashed=false`
+      `mimeType='application/vnd.google-apps.folder' and trashed=false and ` +
+      `name contains '${escapeQ(baseName)}'`
     );
     const findRes = await authedFetch(
-      `${API}/files?q=${q}&fields=files(id,name,createdTime,modifiedTime)&pageSize=1&supportsAllDrives=true&includeItemsFromAllDrives=true`
+      `${API}/files?q=${q}&fields=files(id,name,createdTime,modifiedTime)&pageSize=20&supportsAllDrives=true&includeItemsFromAllDrives=true`
     );
     if (!findRes.ok) throw new Error(`Drive find folder failed: ${findRes.status}`);
     const data = await findRes.json();
-    if (data.files && data.files.length > 0) {
-      return { id: data.files[0].id, name: data.files[0].name, created: false };
+    const files = data.files || [];
+    const match = files.find((f) => {
+      if (f.name === baseName) return true; // legacy, no date
+      if (f.name.startsWith(baseName + ' ')) {
+        const tail = f.name.slice(baseName.length + 1);
+        return PROJECT_DATE_RE.test(tail);
+      }
+      return false;
+    });
+    if (match) {
+      return { id: match.id, name: match.name, created: false };
     }
+    const newName = `${baseName} ${todayDateStr()}`;
     const createRes = await authedFetch(`${API}/files?supportsAllDrives=true`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        name,
+        name: newName,
         mimeType: 'application/vnd.google-apps.folder',
         parents: [window.CONFIG.SITE_VISITS_FOLDER_ID]
       })
@@ -235,31 +260,86 @@ window.Drive = (function () {
     return big ? uploadResumable(opts) : uploadMultipart(opts);
   }
 
-  // -------- Project ownership marker --------
-  // The app marks every folder it creates with a `.dancon-project` JSON
-  // file inside it. The home list filters Drive subfolders to only those
-  // that contain such a marker, so manually-created Drive folders never
-  // appear in the app.
+  // -------- Project ownership marker + metadata folder --------
+  // Every project folder we create has a `_metadata` subfolder that holds
+  // the `.dancon-project` marker, `gps.txt`, and `visit_log.txt` — keeping
+  // those out of sight when office staff browse the project in Drive.
+  // `notes.txt` stays in the project root so it remains visible.
+  // Legacy projects (pre-2026-05-08) keep the marker + gps + log in the
+  // project root; we read from there as a fallback.
   const MARKER_FILENAME = '.dancon-project';
+  const METADATA_FOLDER_NAME = '_metadata';
 
   async function findProjectMarker(folderId) {
-    return findFileInFolder(folderId, MARKER_FILENAME);
+    // Check root first (legacy), then _metadata/.
+    const rootMarker = await findFileInFolder(folderId, MARKER_FILENAME);
+    if (rootMarker) return rootMarker;
+    const metaId = await findMetadataFolderId(folderId, { createIfMissing: false });
+    if (!metaId) return null;
+    return findFileInFolder(metaId, MARKER_FILENAME);
   }
 
   async function createProjectMarker(folderId, payload) {
     const text = JSON.stringify(payload || {}, null, 2);
+    // Marker for new projects lives inside _metadata/.
+    const metaId = await findMetadataFolderId(folderId, { createIfMissing: true });
     return uploadMultipart({
-      folderId,
+      folderId: metaId,
       fileName: MARKER_FILENAME,
       mimeType: 'application/json',
       blob: new Blob([text], { type: 'application/json' })
     });
   }
 
+  // Returns the `_metadata` subfolder ID for a project. With
+  // `createIfMissing: true` it creates the folder on first use.
+  async function findMetadataFolderId(projectId, { createIfMissing = false } = {}) {
+    const q = encodeURIComponent(
+      `'${projectId}' in parents and name='${escapeQ(METADATA_FOLDER_NAME)}' and ` +
+      `mimeType='application/vnd.google-apps.folder' and trashed=false`
+    );
+    const res = await authedFetch(
+      `${API}/files?q=${q}&fields=files(id,name)&pageSize=1&supportsAllDrives=true&includeItemsFromAllDrives=true`
+    );
+    if (res.ok) {
+      const data = await res.json();
+      if (data.files && data.files.length > 0) return data.files[0].id;
+    }
+    if (!createIfMissing) return null;
+    const createRes = await authedFetch(`${API}/files?supportsAllDrives=true&fields=id`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: METADATA_FOLDER_NAME,
+        mimeType: 'application/vnd.google-apps.folder',
+        parents: [projectId]
+      })
+    });
+    if (!createRes.ok) {
+      const text = await createRes.text().catch(() => '');
+      throw new Error(`Drive create _metadata failed: ${createRes.status} ${text}`);
+    }
+    const created = await createRes.json();
+    return created.id;
+  }
+
+  // Resolve a metadata file (.dancon-project / gps.txt / visit_log.txt) to
+  // its existing location: root (legacy) takes precedence over _metadata/.
+  // Returns { file, parentId } or null. Callers writing the file should
+  // reuse parentId so a legacy project keeps its root layout.
+  async function findMetadataFile(projectId, fileName) {
+    const rootFile = await findFileInFolder(projectId, fileName);
+    if (rootFile) return { file: rootFile, parentId: projectId };
+    const metaId = await findMetadataFolderId(projectId, { createIfMissing: false });
+    if (!metaId) return null;
+    const metaFile = await findFileInFolder(metaId, fileName);
+    if (metaFile) return { file: metaFile, parentId: metaId };
+    return null;
+  }
+
   // Returns every `.dancon-project` marker we own. Each entry has the
-  // marker's `id` plus a `parents` array — the parent is the project
-  // folder. We use this to filter the global subfolder list to just the
-  // app-owned ones.
+  // marker's `id` plus a `parents` array — the parent is either the
+  // project folder (legacy) or the project's _metadata/ folder (current).
   async function listAllProjectMarkers({ pageSize = 500 } = {}) {
     const q = encodeURIComponent(`name='${escapeQ(MARKER_FILENAME)}' and trashed=false`);
     const res = await authedFetch(
@@ -267,6 +347,24 @@ window.Drive = (function () {
       `&supportsAllDrives=true&includeItemsFromAllDrives=true`
     );
     if (!res.ok) throw new Error(`Drive list markers failed: ${res.status}`);
+    const data = await res.json();
+    return data.files || [];
+  }
+
+  // Returns every `_metadata` folder we own. The parent of each is the
+  // project folder ID — used for home discovery in tandem with the marker
+  // query so new projects (whose marker lives inside _metadata/) are
+  // recognized as ours.
+  async function listAllMetadataFolders({ pageSize = 500 } = {}) {
+    const q = encodeURIComponent(
+      `name='${escapeQ(METADATA_FOLDER_NAME)}' and ` +
+      `mimeType='application/vnd.google-apps.folder' and trashed=false`
+    );
+    const res = await authedFetch(
+      `${API}/files?q=${q}&fields=files(id,parents)&pageSize=${pageSize}` +
+      `&supportsAllDrives=true&includeItemsFromAllDrives=true`
+    );
+    if (!res.ok) throw new Error(`Drive list _metadata folders failed: ${res.status}`);
     const data = await res.json();
     return data.files || [];
   }
@@ -398,6 +496,9 @@ window.Drive = (function () {
     findProjectMarker,
     createProjectMarker,
     listAllProjectMarkers,
+    listAllMetadataFolders,
+    findMetadataFolderId,
+    findMetadataFile,
     downloadFileText,
     updateFileContent,
     appendToTextFile,

@@ -478,12 +478,17 @@
     } catch (e) { /* ignore */ }
     console.log('[marker-migration] starting');
     try {
-      const [allFolders, markers] = await Promise.all([
+      const [allFolders, markers, metaFolders] = await Promise.all([
         window.Drive.listProjectFolders({ pageSize: 500 }),
-        window.Drive.listAllProjectMarkers({ pageSize: 500 })
+        window.Drive.listAllProjectMarkers({ pageSize: 500 }),
+        window.Drive.listAllMetadataFolders({ pageSize: 500 })
       ]);
+      // A project is "already marked" if its ID is the parent of a marker
+      // (legacy: parent = project folder) OR if it has an `_metadata`
+      // subfolder (current: parent of `_metadata` = project folder).
       const alreadyMarked = new Set();
       markers.forEach((m) => (m.parents || []).forEach((p) => alreadyMarked.add(p)));
+      metaFolders.forEach((f) => (f.parents || []).forEach((p) => alreadyMarked.add(p)));
       const candidates = allFolders.filter((f) => !alreadyMarked.has(f.id));
       console.log(`[marker-migration] ${candidates.length} folder(s) without marker; checking contents`);
 
@@ -556,17 +561,26 @@
     updateHomeSyncIndicatorDOM();
 
     try {
-      // Two parallel queries: every subfolder of Site Visits, and every
-      // .dancon-project marker we own. We then keep only the folders
-      // whose IDs appear in some marker's `parents` array — i.e. the
-      // app-owned set. Manually-created Drive folders are excluded.
-      const [allFolders, markers] = await Promise.all([
+      // Three parallel queries:
+      //  - every subfolder of Site Visits
+      //  - every `.dancon-project` marker (parent = project folder for
+      //    legacy projects, parent = `_metadata/` folder for current)
+      //  - every `_metadata` folder (parent = project folder)
+      // Both marker-parents AND metadata-folder-parents are unioned into
+      // ownedIds so legacy projects (marker in root) and current ones
+      // (marker in _metadata/) are both recognized. We then keep only
+      // the Site-Visits subfolders whose IDs appear in ownedIds.
+      const [allFolders, markers, metaFolders] = await Promise.all([
         window.Drive.listProjectFolders({ pageSize: 500 }),
-        window.Drive.listAllProjectMarkers({ pageSize: 500 })
+        window.Drive.listAllProjectMarkers({ pageSize: 500 }),
+        window.Drive.listAllMetadataFolders({ pageSize: 500 })
       ]);
       const ownedIds = new Set();
       markers.forEach((m) => {
         (m.parents || []).forEach((p) => ownedIds.add(p));
+      });
+      metaFolders.forEach((f) => {
+        (f.parents || []).forEach((p) => ownedIds.add(p));
       });
       const folders = allFolders.filter((f) => ownedIds.has(f.id));
       const skipped = allFolders.length - folders.length;
@@ -798,11 +812,13 @@
       }
     } catch (e) { /* ignore */ }
 
-    // 2. Migration — look for an existing gps file in Drive. If we find
-    //    one, populate the cache so future opens are instant.
+    // 2. Migration — look for an existing gps file in Drive (root for
+    //    legacy projects, _metadata/ for current). If we find one,
+    //    populate the cache so future opens are instant.
     let existing = null;
     try {
-      existing = await window.Drive.findFileInFolder(folderId, 'gps.txt');
+      const found = await window.Drive.findMetadataFile(folderId, 'gps.txt');
+      if (found) existing = found.file;
     } catch (e) { /* ignore */ }
     if (!existing) {
       try { existing = await window.Drive.findFileInFolder(folderId, 'gps.html'); }
@@ -957,25 +973,31 @@
       });
     } catch (e) { /* ignore */ }
 
-    // Upgrade path: if a gps.txt already exists, rewrite it in place
-    // rather than creating a duplicate. Legacy gps.html files are left
-    // alone (Drive renders them as styled pages); the new .txt is added
-    // alongside.
+    // Upgrade path: if a gps.txt already exists (in root from a legacy
+    // project, or in _metadata/ from a current one), rewrite it in
+    // place rather than creating a duplicate. Legacy gps.html files are
+    // left alone (Drive renders them as styled pages); the new .txt is
+    // added alongside.
+    let gpsParentId = null;
     try {
-      const existingTxt = await window.Drive.findFileInFolder(folderId, 'gps.txt');
-      if (existingTxt && isUpgrade) {
+      const existing = await window.Drive.findMetadataFile(folderId, 'gps.txt');
+      if (existing && isUpgrade) {
         await window.Drive.updateFileContent(
-          existingTxt.id, new Blob([txt], { type: 'text/plain' }), 'text/plain'
+          existing.file.id, new Blob([txt], { type: 'text/plain' }), 'text/plain'
         );
         return;
       }
-      if (existingTxt && !isUpgrade) return; // stage-1 already wrote
+      if (existing && !isUpgrade) return; // stage-1 already wrote
+      gpsParentId = await window.Drive.findMetadataFolderId(folderId, { createIfMissing: true });
     } catch (err) {
-      console.warn('[gps] findFile failed, queuing upload anyway:', err.message);
+      console.warn('[gps] metadata lookup failed, queuing to project root:', err.message);
     }
     try {
       await window.DB.queueAdd({
         projectId: folderId,
+        // Upload destination — for new projects this is the _metadata/
+        // subfolder so gps.txt stays out of the project root view.
+        targetFolderId: gpsParentId || folderId,
         projectName: state.currentProjectName,
         fileName: 'gps.txt',
         mimeType: 'text/plain',
@@ -996,8 +1018,22 @@
     try {
       const cachedKey = `visitLogId:${folderId}`;
       const cached = await window.DB.kvGet(cachedKey);
+      // Resolve the parent folder for visit_log.txt:
+      //  - if a cached file id exists, appendToTextFile will use it
+      //    directly (parent doesn't matter)
+      //  - else find an existing copy in root (legacy) or _metadata/
+      //  - else use _metadata/ for new writes
+      let parentId = folderId;
+      if (!cached) {
+        const found = await window.Drive.findMetadataFile(folderId, 'visit_log.txt');
+        if (found) {
+          parentId = found.parentId;
+        } else {
+          parentId = await window.Drive.findMetadataFolderId(folderId, { createIfMissing: true });
+        }
+      }
       const result = await window.Drive.appendToTextFile({
-        folderId,
+        folderId: parentId,
         fileName: 'visit_log.txt',
         lineOrText: line,
         cachedFileId: cached || null
@@ -1383,7 +1419,7 @@
 
       try {
         const result = await window.Drive.uploadFile({
-          folderId: item.projectId,
+          folderId: item.targetFolderId || item.projectId,
           fileName: item.fileName,
           mimeType: item.mimeType,
           blob: item.blob,
@@ -2220,13 +2256,26 @@
     });
   }
 
+  // Project names get a ` MM-DD-YYYY` suffix at creation. The suffix is
+  // permanent identity — never editable. Returns {prefix, date|null}.
+  function parseProjectName(fullName) {
+    const m = (fullName || '').match(/^(.*) (\d{2}-\d{2}-\d{4})$/);
+    if (m) return { prefix: m[1], date: m[2] };
+    return { prefix: fullName || '', date: null };
+  }
+
   function updateProjectTitleDOM() {
     const region = document.getElementById('proj-title-region');
     if (!region) return;
     if (state.isRenaming) {
+      const parsed = parseProjectName(state.currentProjectName || '');
+      const dateLabel = parsed.date
+        ? `<span class="rename-date" aria-label="Project date (not editable)">${escapeHtml(parsed.date)}</span>`
+        : '';
       region.innerHTML = `
         <form class="rename-form" id="rename-form">
-          <input type="text" id="rename-input" value="${escapeHtml(state.currentProjectName || '')}" autocomplete="off" autocapitalize="words" />
+          <input type="text" id="rename-input" value="${escapeHtml(parsed.prefix)}" autocomplete="off" autocapitalize="words" />
+          ${dateLabel}
           <button type="submit" class="rename-ok" aria-label="Save">${state.renameSaving ? '…' : '✓'}</button>
           <button type="button" class="rename-cancel" id="rename-cancel" aria-label="Cancel">✕</button>
         </form>
@@ -2684,20 +2733,27 @@
     if (state.renameSaving) return;
     const input = document.getElementById('rename-input');
     if (!input) return;
-    const raw = input.value;
-    const sanitized = window.Drive.sanitizeFolderName(raw);
-    if (!sanitized || sanitized === state.currentProjectName) {
+    // Edited only the prefix portion. Reattach the original date suffix
+    // (if any) so it can never change regardless of how many times the
+    // project is renamed.
+    const parsed = parseProjectName(state.currentProjectName || '');
+    const sanitizedPrefix = window.Drive.sanitizeFolderName(input.value);
+    if (!sanitizedPrefix) { cancelRename(); return; }
+    const fullName = parsed.date
+      ? `${sanitizedPrefix} ${parsed.date}`
+      : sanitizedPrefix;
+    if (fullName === state.currentProjectName) {
       cancelRename();
       return;
     }
 
     // Conflict check — warn if another folder under Site Visits already has
-    // this name (case-insensitive match).
+    // this name (case-insensitive match on the full dated name).
     try {
       const existing = await window.Drive.listProjectFolders({ pageSize: 200 });
       const conflict = existing.find(
         (p) => p.id !== state.currentProjectId &&
-               p.name.toLowerCase() === sanitized.toLowerCase()
+               p.name.toLowerCase() === fullName.toLowerCase()
       );
       if (conflict) {
         const ok = confirm(
@@ -2712,8 +2768,8 @@
     state.renameSaving = true;
     updateProjectTitleDOM();
     try {
-      const updated = await window.Drive.renameFile(state.currentProjectId, sanitized);
-      state.currentProjectName = updated.name || sanitized;
+      const updated = await window.Drive.renameFile(state.currentProjectId, fullName);
+      state.currentProjectName = updated.name || fullName;
       // Update local projects cache so the home list reflects immediately.
       const cached = state.projects.find((p) => p.id === state.currentProjectId);
       if (cached) cached.name = state.currentProjectName;
@@ -2897,7 +2953,11 @@
   function updateGalleryListDOM() {
     const root = document.getElementById('gallery-main');
     if (!root) return;
-    const files = state.galleryFiles || [];
+    // Hide the `_metadata` subfolder from the gallery view so techs see
+    // only their captures + notes (the metadata files live inside it).
+    const allFiles = state.galleryFiles || [];
+    const files = allFiles.filter((f) =>
+      !(f.mimeType === 'application/vnd.google-apps.folder' && f.name === '_metadata'));
     const countEl = document.getElementById('gallery-count');
     if (countEl) countEl.textContent = `${files.length} files`;
 

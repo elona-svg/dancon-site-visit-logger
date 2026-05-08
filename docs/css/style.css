@@ -1273,6 +1273,17 @@ button.gps-chip { font: inherit; cursor: pointer; }
   flex-shrink: 0;
 }
 .rename-cancel { background: #fff; color: #111; border: 1px solid #d4d4d8; }
+/* Project creation date — shown next to the rename input but not editable.
+   Lives forever as part of the folder identity. */
+.rename-date {
+  flex-shrink: 0;
+  color: #94a3b8;
+  font-size: 13px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+  -webkit-user-select: none;
+}
 
 /* ---------- Open Camera button ---------- */
 .open-camera-btn {
