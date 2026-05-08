@@ -178,9 +178,15 @@
   let reconnectTimer = null;
   function startReconnectLoop() {
     if (reconnectTimer) return;
+    // Don't run reconnect attempts when there's no user — the only way
+    // to recover is interactive sign-in via the login screen, not a
+    // silent token grant. Gating here AND inside the interval handles
+    // the case where the user signs out mid-loop.
+    if (!window.Auth.isSignedIn()) return;
     console.log('[conn] starting 30s reconnect loop');
     reconnectTimer = setInterval(async () => {
       if (!state.isOnline) return;
+      if (!window.Auth.isSignedIn()) { stopReconnectLoop(); return; }
       if (window.Auth.getTokenStatus() === 'valid') {
         stopReconnectLoop();
         return;
@@ -1323,10 +1329,10 @@
     queueMicrotask(async () => {
       queuePumpScheduled = false;
       if (!state.isOnline) return;
-      if (!window.Auth.isSignedIn()) {
-        try { await window.Auth.getAccessToken(); }
-        catch (e) { return; }
-      }
+      // No user → nothing to upload; calling getAccessToken would only
+      // trigger a doomed silent-refresh against the GIS iframe in the
+      // PWA sandbox. The user will pumpQueue again after signing in.
+      if (!window.Auth.isSignedIn()) return;
       const pending = await window.DB.queuePending();
       const candidates = pending
         .filter((p) => !inflight.has(p.id))
