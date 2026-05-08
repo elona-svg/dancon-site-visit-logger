@@ -64,6 +64,23 @@ window.Auth = (function () {
     crypto.getRandomValues(arr);
     return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
   }
+  // PKCE (RFC 7636) helpers for the Authorization Code flow used by PWA
+  // and Safari users. The verifier is a random 64-byte string; the
+  // challenge is its SHA-256 hash, both base64url-encoded without padding.
+  function generateCodeVerifier() {
+    const arr = new Uint8Array(64);
+    crypto.getRandomValues(arr);
+    return btoa(String.fromCharCode(...arr))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  }
+  async function generateCodeChallenge(verifier) {
+    const data = new TextEncoder().encode(verifier);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    return btoa(String.fromCharCode(...new Uint8Array(digest)))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  }
+  const PKCE_VERIFIER_KEY = 'auth.pkce_verifier';
+  const REFRESH_TOKEN_KEY = 'auth.refresh_token';
 
   function notifyChange() {
     onChangeListeners.forEach((fn) => {
@@ -271,10 +288,56 @@ window.Auth = (function () {
     });
   }
 
+  // Try a refresh_token grant against Google's token endpoint. Only works
+  // for users who signed in via the PKCE flow with access_type=offline.
+  // Returns { accessToken, user } on success, null otherwise.
+  async function tryRefreshTokenGrant() {
+    let rt = null;
+    try { rt = await window.DB.kvGet(REFRESH_TOKEN_KEY); } catch (_) {}
+    if (!rt) rt = lsGet(REFRESH_TOKEN_KEY);
+    if (!rt) return null;
+    try {
+      const resp = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          refresh_token: rt,
+          client_id: window.CONFIG.CLIENT_ID,
+          grant_type: 'refresh_token'
+        })
+      });
+      const t = await resp.json();
+      if (t.error) {
+        console.warn('[auth] refresh_token grant failed:', t.error, '-', t.error_description || '');
+        // invalid_grant means the refresh token is dead — purge it so we
+        // don't keep retrying. The user will fall through to interactive
+        // sign-in on the next attempt.
+        if (t.error === 'invalid_grant') {
+          try { await window.DB.kvDelete(REFRESH_TOKEN_KEY); } catch (_) {}
+          lsDelete(REFRESH_TOKEN_KEY);
+        }
+        return null;
+      }
+      accessToken = t.access_token;
+      tokenIssuedAt = Date.now();
+      tokenExpiresAt = tokenIssuedAt + ((t.expires_in || 3600) - 60) * 1000;
+      await persistToken();
+      setTokenStatus('valid');
+      console.log('[auth] refresh_token grant success');
+      return { accessToken, user };
+    } catch (err) {
+      console.warn('[auth] refresh_token grant network error:', err && err.message);
+      return null;
+    }
+  }
+
   // Silent-refresh wrapper with backoff. Used by getAccessToken when the
-  // cached token is stale. SHORT timeout + retries are appropriate here —
-  // there's no user gesture in flight, just an iframe-driven refresh.
+  // cached token is stale. Tries refresh_token grant first (PKCE users),
+  // then falls back to GIS iframe-driven refresh with retries.
   async function requestTokenWithRetries() {
+    const refreshed = await tryRefreshTokenGrant();
+    if (refreshed) return refreshed;
+
     const delays = [500, 1000, 2000, 4000, 8000];
     let lastErr;
     for (let i = 0; i <= delays.length; i += 1) {
@@ -357,48 +420,155 @@ window.Auth = (function () {
     return requestTokenOnce({ timeoutMs: 60000, prompt: 'select_account' });
   }
 
-  // Full-page redirect to Google. The returned promise intentionally never
-  // resolves — the page is navigating away. On return, init() picks up the
-  // hash via consumeRedirectCallback().
-  function signInViaRedirect() {
+  // Full-page redirect to Google using PKCE Authorization Code flow.
+  // Implicit grant (response_type=token) was breaking 2FA inside the iOS
+  // PWA's SFSafariViewController sheet; PKCE works because the token
+  // exchange happens via fetch() POST from inside the PWA itself, with no
+  // dependency on the OAuth sheet's cookie context. The returned promise
+  // intentionally never resolves — the page is navigating away.
+  async function signInViaRedirect() {
     const nonce = generateNonce();
+    const verifier = generateCodeVerifier();
+    let challenge;
+    try {
+      challenge = await generateCodeChallenge(verifier);
+    } catch (e) {
+      console.warn('[auth] PKCE: code challenge generation failed:', e.message);
+      return Promise.reject(new Error('PKCE init failed — sign-in cannot proceed'));
+    }
     try {
       localStorage.setItem(OAUTH_STATE_KEY, nonce);
+      localStorage.setItem(PKCE_VERIFIER_KEY, verifier);
     } catch (e) {
-      console.warn('[auth] could not save oauth_state to localStorage:', e);
+      console.warn('[auth] could not save PKCE state to localStorage:', e);
       return Promise.reject(new Error('Could not save OAuth state — sign-in cannot proceed'));
     }
     const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');
     url.searchParams.set('client_id', window.CONFIG.CLIENT_ID);
     url.searchParams.set('redirect_uri', getRedirectUri());
-    url.searchParams.set('response_type', 'token');
+    url.searchParams.set('response_type', 'code');
     url.searchParams.set('scope', window.CONFIG.SCOPES);
     url.searchParams.set('state', nonce);
     url.searchParams.set('prompt', 'select_account');
     url.searchParams.set('hd', window.CONFIG.HOSTED_DOMAIN);
-    console.log('[auth] redirecting to OAuth URL');
+    url.searchParams.set('code_challenge', challenge);
+    url.searchParams.set('code_challenge_method', 'S256');
+    url.searchParams.set('access_type', 'offline');
+    console.log('[auth] redirecting to OAuth URL (PKCE code flow)');
     window.location.href = url.toString();
     return new Promise(() => {});
   }
 
-  // Consume an OAuth redirect response sitting in window.location.hash.
+  // Consume an OAuth redirect response. Two formats supported:
+  //   1. PKCE code flow: ?code=...&state=...   (current)
+  //   2. Legacy implicit:  #access_token=...   (kept as a fallback for any
+  //      in-flight redirects that started before the PKCE deploy)
   // Returns { signedIn: true } on success; null otherwise. Always cleans
-  // the hash + nonce so a refresh can't re-trigger the flow.
+  // the URL + state nonce so a refresh can't re-trigger the flow.
   async function consumeRedirectCallback() {
+    const search = window.location.search || '';
+    if (search.length > 1) {
+      const qp = new URLSearchParams(search.slice(1));
+      if (qp.has('code') || (qp.has('error') && qp.has('state'))) {
+        return await handleCodeFlow(qp);
+      }
+    }
     const hash = window.location.hash || '';
-    if (hash.length < 2) return null;
-    const params = new URLSearchParams(hash.slice(1));
-    const accessTok = params.get('access_token');
-    const errCode = params.get('error');
-    if (!accessTok && !errCode) return null;
+    if (hash.length > 1) {
+      const hp = new URLSearchParams(hash.slice(1));
+      if (hp.has('access_token') || hp.has('error')) {
+        return await handleImplicitFlow(hp);
+      }
+    }
+    return null;
+  }
 
+  async function handleCodeFlow(params) {
+    const code = params.get('code');
+    const errCode = params.get('error');
     const expectedState = lsGet(OAUTH_STATE_KEY);
     const returnedState = params.get('state') || '';
-    // Always clear hash + nonce so a stale callback can't be replayed.
+    const verifier = lsGet(PKCE_VERIFIER_KEY);
+
+    // Always strip the URL + state + verifier so nothing can be replayed.
+    try { history.replaceState(null, '', window.location.pathname); } catch (_) {}
+    lsDelete(OAUTH_STATE_KEY);
+    lsDelete(PKCE_VERIFIER_KEY);
+
+    if (errCode) {
+      console.warn('[auth] PKCE: OAuth returned error:', errCode, '-', params.get('error_description') || '');
+      return null;
+    }
+    if (!expectedState || returnedState !== expectedState) {
+      console.warn('[auth] state mismatch — possible CSRF, ignoring response');
+      return null;
+    }
+    if (!verifier) {
+      console.warn('[auth] PKCE: missing code_verifier in localStorage; ignoring response');
+      return null;
+    }
+
+    console.log('[auth] PKCE: code received, exchanging...');
+    let tokens;
+    try {
+      const resp = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          code,
+          client_id: window.CONFIG.CLIENT_ID,
+          redirect_uri: getRedirectUri(),
+          grant_type: 'authorization_code',
+          code_verifier: verifier
+        })
+      });
+      tokens = await resp.json();
+    } catch (err) {
+      console.error('[auth] PKCE: token exchange network error:', err && err.message);
+      return null;
+    }
+    if (tokens.error) {
+      console.error('[auth] PKCE: token exchange failed:', tokens.error, '-', tokens.error_description || '');
+      return null;
+    }
+    console.log('[auth] PKCE: token exchange success', tokens.refresh_token ? '(with refresh_token)' : '(no refresh_token)');
+
+    accessToken = tokens.access_token;
+    tokenIssuedAt = Date.now();
+    tokenExpiresAt = tokenIssuedAt + ((tokens.expires_in || 3600) - 60) * 1000;
+    if (tokens.refresh_token) {
+      try {
+        await window.DB.kvSet(REFRESH_TOKEN_KEY, tokens.refresh_token);
+        lsSet(REFRESH_TOKEN_KEY, tokens.refresh_token);
+      } catch (e) { /* best-effort */ }
+    }
+
+    try {
+      await fetchAndVerifyUser();
+      await persistToken();
+      setTokenStatus('valid');
+      console.log('[auth] token persisted, user signed in:', user?.email);
+      return { signedIn: true };
+    } catch (err) {
+      console.warn('[auth] post-redirect failure:', err.message);
+      accessToken = null;
+      tokenExpiresAt = 0;
+      tokenIssuedAt = 0;
+      await persistToken();
+      return null;
+    }
+  }
+
+  async function handleImplicitFlow(params) {
+    const accessTok = params.get('access_token');
+    const errCode = params.get('error');
+    const expectedState = lsGet(OAUTH_STATE_KEY);
+    const returnedState = params.get('state') || '';
     try {
       history.replaceState(null, '', window.location.pathname + window.location.search);
     } catch (_) {}
     lsDelete(OAUTH_STATE_KEY);
+    lsDelete(PKCE_VERIFIER_KEY);
 
     if (errCode) {
       console.warn('[auth] OAuth redirect returned error:', errCode, '-', params.get('error_description') || '');
@@ -409,7 +579,7 @@ window.Auth = (function () {
       return null;
     }
 
-    console.log('[auth] token captured from URL hash');
+    console.log('[auth] token captured from URL hash (legacy implicit flow)');
     accessToken = accessTok;
     tokenIssuedAt = Date.now();
     const expiresIn = Number(params.get('expires_in') || 3600);
@@ -434,6 +604,10 @@ window.Auth = (function () {
     if (accessToken && window.google?.accounts?.oauth2?.revoke) {
       try { window.google.accounts.oauth2.revoke(accessToken, () => {}); } catch (e) {}
     }
+    // Purge refresh_token too — otherwise a sign-out + reload would
+    // silently re-authenticate via the refresh grant.
+    try { await window.DB.kvDelete(REFRESH_TOKEN_KEY); } catch (_) {}
+    lsDelete(REFRESH_TOKEN_KEY);
     accessToken = null;
     tokenExpiresAt = 0;
     tokenIssuedAt = 0;
