@@ -281,7 +281,6 @@
   // changes; we only patch console to also append to a buffer + DOM.
   const DEBUG_BUFFER_MAX = 200;
   const debugLogBuffer = [];
-  let debugPanelDismissed = false;
 
   function fmtDebugTime() {
     const d = new Date();
@@ -302,12 +301,15 @@
     const line = `[${fmtDebugTime()}] ${level.padEnd(4)} ${body}`;
     debugLogBuffer.push(line);
     if (debugLogBuffer.length > DEBUG_BUFFER_MAX) debugLogBuffer.shift();
-    const bodyEl = document.getElementById('login-debug-log-body');
+    // Only update DOM if the panel is currently visible (revealed via the
+    // logo Easter egg). Buffering still happens regardless so a tech can
+    // reveal the panel mid-session and see backfill.
     const panelEl = document.getElementById('login-debug-log');
-    if (bodyEl && panelEl) {
+    if (!panelEl || panelEl.hidden) return;
+    const bodyEl = document.getElementById('login-debug-log-body');
+    if (bodyEl) {
       bodyEl.textContent = debugLogBuffer.join('\n');
       bodyEl.scrollTop = bodyEl.scrollHeight;
-      if (!debugPanelDismissed && panelEl.hidden) panelEl.hidden = false;
     }
   }
   (function patchConsoleForAuth() {
@@ -332,9 +334,38 @@
     }
   }
   function onHideDebugLog() {
-    debugPanelDismissed = true;
     const panel = document.getElementById('login-debug-log');
     if (panel) panel.hidden = true;
+  }
+  // Easter egg: 5 taps on the brand logo within 2s reveals the debug panel.
+  // Sliding window — keeps the last 5 timestamps and triggers when all are
+  // within range. Console.log output is unaffected; this only flips the
+  // on-screen panel visible.
+  const LOGO_TAP_WINDOW_MS = 2000;
+  const LOGO_TAP_TARGET = 5;
+  let logoTapTimes = [];
+  function onLogoTap() {
+    const now = Date.now();
+    logoTapTimes.push(now);
+    if (logoTapTimes.length > LOGO_TAP_TARGET) {
+      logoTapTimes = logoTapTimes.slice(-LOGO_TAP_TARGET);
+    }
+    if (logoTapTimes.length === LOGO_TAP_TARGET &&
+        (logoTapTimes[LOGO_TAP_TARGET - 1] - logoTapTimes[0]) <= LOGO_TAP_WINDOW_MS) {
+      revealDebugPanel();
+      logoTapTimes = [];
+    }
+  }
+  function revealDebugPanel() {
+    const panel = document.getElementById('login-debug-log');
+    if (!panel) return;
+    panel.hidden = false;
+    const bodyEl = document.getElementById('login-debug-log-body');
+    if (bodyEl) {
+      bodyEl.textContent = debugLogBuffer.join('\n');
+      bodyEl.scrollTop = bodyEl.scrollHeight;
+    }
+    if (navigator.vibrate) try { navigator.vibrate(20); } catch (e) { /* ignore */ }
   }
 
   // ---------- Auth handlers ----------
@@ -1966,7 +1997,6 @@
   }
 
   function renderLogin(app) {
-    const showPanel = !debugPanelDismissed && debugLogBuffer.length > 0;
     app.innerHTML = `
       <div class="screen login-screen">
         <div class="brand">
@@ -1976,7 +2006,7 @@
         <button id="signin-btn" class="btn-signin">Sign in with Google</button>
         <div id="login-error" class="login-error" role="alert" hidden></div>
         <p class="login-fineprint">Only @${escapeHtml(window.CONFIG.HOSTED_DOMAIN)} accounts can sign in.</p>
-        <div id="login-debug-log" class="login-debug-log"${showPanel ? '' : ' hidden'}>
+        <div id="login-debug-log" class="login-debug-log" hidden>
           <div class="login-debug-log-header">
             <span class="login-debug-log-title">Debug log</span>
             <button type="button" id="login-debug-copy" class="login-debug-btn">Copy log</button>
@@ -1987,12 +2017,14 @@
       </div>
     `;
     document.getElementById('signin-btn').addEventListener('click', onSignInClick);
-    const dbgBody = document.getElementById('login-debug-log-body');
-    if (dbgBody) dbgBody.textContent = debugLogBuffer.join('\n');
     const copyBtn = document.getElementById('login-debug-copy');
     if (copyBtn) copyBtn.addEventListener('click', onCopyDebugLog);
     const hideBtn = document.getElementById('login-debug-hide');
     if (hideBtn) hideBtn.addEventListener('click', onHideDebugLog);
+    // Easter egg: 5 quick taps on the brand logo reveal the debug panel.
+    // Console.log calls still output to the browser dev console regardless.
+    const logo = document.querySelector('.brand-logo');
+    if (logo) logo.addEventListener('click', onLogoTap);
     // PWA-only: render the inline GIS One Tap prompt. iOS opens redirect
     // OAuth in an isolated SFSafariViewController sheet that breaks 2FA;
     // One Tap stays inside the PWA's own webview/cookie context.
