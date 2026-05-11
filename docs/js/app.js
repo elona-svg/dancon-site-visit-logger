@@ -478,16 +478,29 @@
     } catch (e) { /* ignore */ }
     console.log('[marker-migration] starting');
     try {
-      const [allFolders, markers, metaFolders] = await Promise.all([
+      const [allFolders, markers, visitLogs, metaFolders] = await Promise.all([
         window.Drive.listProjectFolders({ pageSize: 500 }),
         window.Drive.listAllProjectMarkers({ pageSize: 500 }),
+        window.Drive.listAllVisitLogs({ pageSize: 500 }),
         window.Drive.listAllMetadataFolders({ pageSize: 500 })
       ]);
-      // A project is "already marked" if its ID is the parent of a marker
-      // (legacy: parent = project folder) OR if it has an `_metadata`
-      // subfolder (current: parent of `_metadata` = project folder).
+      // metaFolderId → projectId map so we can resolve markers/visit_logs
+      // whose parent is an `_metadata/` folder up to the actual project.
+      const metaToProject = new Map();
+      metaFolders.forEach((f) => {
+        const p = (f.parents || [])[0];
+        if (p) metaToProject.set(f.id, p);
+      });
+      const resolveParent = (parentId) => metaToProject.get(parentId) || parentId;
+      // A project is "already marked" if any of these point at it:
+      //  - a `.dancon-project` file (legacy or v37/v38)
+      //  - a `visit_log.txt` file (v39+ ownership marker, or any legacy
+      //    log that happens to exist)
+      //  - an `_metadata/` subfolder (defensive: covers an interrupted
+      //    creation where the folder exists but no log yet)
       const alreadyMarked = new Set();
-      markers.forEach((m) => (m.parents || []).forEach((p) => alreadyMarked.add(p)));
+      markers.forEach((m) => (m.parents || []).forEach((p) => alreadyMarked.add(resolveParent(p))));
+      visitLogs.forEach((v) => (v.parents || []).forEach((p) => alreadyMarked.add(resolveParent(p))));
       metaFolders.forEach((f) => (f.parents || []).forEach((p) => alreadyMarked.add(p)));
       const candidates = allFolders.filter((f) => !alreadyMarked.has(f.id));
       console.log(`[marker-migration] ${candidates.length} folder(s) without marker; checking contents`);
@@ -503,7 +516,7 @@
           await window.Drive.createProjectMarker(folder.id, {
             createdAt: new Date().toISOString(),
             createdBy: state.user?.email || 'migration',
-            appVersion: 'v20',
+            appVersion: 'v39',
             projectId: `migrated-${folder.id}`,
             migrated: true
           });
@@ -561,23 +574,34 @@
     updateHomeSyncIndicatorDOM();
 
     try {
-      // Three parallel queries:
+      // Four parallel queries:
       //  - every subfolder of Site Visits
-      //  - every `.dancon-project` marker (parent = project folder for
-      //    legacy projects, parent = `_metadata/` folder for current)
-      //  - every `_metadata` folder (parent = project folder)
-      // Both marker-parents AND metadata-folder-parents are unioned into
-      // ownedIds so legacy projects (marker in root) and current ones
-      // (marker in _metadata/) are both recognized. We then keep only
-      // the Site-Visits subfolders whose IDs appear in ownedIds.
-      const [allFolders, markers, metaFolders] = await Promise.all([
+      //  - every `.dancon-project` marker (legacy ownership marker)
+      //  - every `visit_log.txt` file (v39+ ownership marker, also
+      //    catches legacy projects that have a root log)
+      //  - every `_metadata/` subfolder (defensive: catches a
+      //    half-initialized project that has the folder but no log yet)
+      // We resolve any parent that's a `_metadata/` folder up to the
+      // actual project ID via the metaToProject map, then union all
+      // resolved parents into ownedIds.
+      const [allFolders, markers, visitLogs, metaFolders] = await Promise.all([
         window.Drive.listProjectFolders({ pageSize: 500 }),
         window.Drive.listAllProjectMarkers({ pageSize: 500 }),
+        window.Drive.listAllVisitLogs({ pageSize: 500 }),
         window.Drive.listAllMetadataFolders({ pageSize: 500 })
       ]);
+      const metaToProject = new Map();
+      metaFolders.forEach((f) => {
+        const p = (f.parents || [])[0];
+        if (p) metaToProject.set(f.id, p);
+      });
+      const resolveParent = (parentId) => metaToProject.get(parentId) || parentId;
       const ownedIds = new Set();
       markers.forEach((m) => {
-        (m.parents || []).forEach((p) => ownedIds.add(p));
+        (m.parents || []).forEach((p) => ownedIds.add(resolveParent(p)));
+      });
+      visitLogs.forEach((v) => {
+        (v.parents || []).forEach((p) => ownedIds.add(resolveParent(p)));
       });
       metaFolders.forEach((f) => {
         (f.parents || []).forEach((p) => ownedIds.add(p));
@@ -646,7 +670,7 @@
           await window.Drive.createProjectMarker(id, {
             createdAt: new Date().toISOString(),
             createdBy: state.user?.email || 'unknown',
-            appVersion: 'v20',
+            appVersion: 'v39',
             projectId: (window.crypto?.randomUUID && window.crypto.randomUUID()) || `proj-${Date.now()}`
           });
           console.log('[marker] stamped new project', id);

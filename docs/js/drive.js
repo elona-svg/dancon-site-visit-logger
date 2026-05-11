@@ -307,37 +307,85 @@ window.Drive = (function () {
   }
 
   // -------- Project ownership marker + metadata folder --------
-  // Every project folder we create has a `_metadata` subfolder that holds
-  // the `.dancon-project` marker, `gps.txt`, and `visit_log.txt` — keeping
-  // those out of sight when office staff browse the project in Drive.
-  // `notes.txt` stays in the project root so it remains visible.
-  // Legacy projects (pre-2026-05-08) keep the marker + gps + log in the
-  // project root; we read from there as a fallback.
+  // Project layout:
+  //   <project>/
+  //     notes.txt                  (visible to office staff)
+  //     _metadata/
+  //       gps.txt                  (pinned location)
+  //       visit_log.txt            (audit trail + project metadata header)
+  //
+  // v39+: project metadata (createdAt, createdBy, project ID) is the
+  // header block at the top of visit_log.txt. The presence of visit_log.txt
+  // IS the project-ownership marker.
+  // Legacy projects:
+  //   pre-v37: `.dancon-project` + gps.txt + visit_log.txt in root
+  //   v37/v38: `.dancon-project` + gps.txt + visit_log.txt in _metadata/
+  //   v39+: visit_log.txt (with metadata header) + gps.txt in _metadata/
+  // Old `.dancon-project` files are still recognized as markers and never
+  // touched — we just stop creating new ones.
   const MARKER_FILENAME = '.dancon-project';
   const METADATA_FOLDER_NAME = '_metadata';
+  const VISIT_LOG_FILENAME = 'visit_log.txt';
 
+  // True if the project has been initialized by the app: any of
+  // `.dancon-project` (legacy) or `visit_log.txt` (v39+) in either the
+  // project root or the `_metadata/` subfolder.
   async function findProjectMarker(folderId) {
-    // Check root first (legacy), then _metadata/.
-    const rootMarker = await findFileInFolder(folderId, MARKER_FILENAME);
-    if (rootMarker) return rootMarker;
+    const rootDancon = await findFileInFolder(folderId, MARKER_FILENAME);
+    if (rootDancon) return rootDancon;
+    const rootVisitLog = await findFileInFolder(folderId, VISIT_LOG_FILENAME);
+    if (rootVisitLog) return rootVisitLog;
     const metaId = await findMetadataFolderId(folderId, { createIfMissing: false });
     if (!metaId) return null;
-    return findFileInFolder(metaId, MARKER_FILENAME);
+    const metaDancon = await findFileInFolder(metaId, MARKER_FILENAME);
+    if (metaDancon) return metaDancon;
+    return findFileInFolder(metaId, VISIT_LOG_FILENAME);
   }
 
+  function fmtMetadataTime(d) {
+    const date = d ? new Date(d) : new Date();
+    if (isNaN(date.getTime())) return String(d);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+           `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  // v39+: writes the project metadata as the header block at the top of
+  // `visit_log.txt` instead of creating a separate `.dancon-project`
+  // file. Idempotent — if visit_log.txt already exists, leaves it
+  // alone (the existing log entries must NOT be clobbered).
   async function createProjectMarker(folderId, payload) {
-    const text = JSON.stringify(payload || {}, null, 2);
-    // Marker for new projects lives inside _metadata/. Use the singleton
-    // upsert path so a concurrent caller (e.g. the migration sweep
-    // running in parallel with openOrCreateProject) can't produce a
-    // duplicate marker file — the second caller will see the first
-    // caller's just-created id and PATCH instead of creating.
     const metaId = await findMetadataFolderId(folderId, { createIfMissing: true });
-    return upsertSingletonFile({
-      folderId: metaId,
-      fileName: MARKER_FILENAME,
-      mimeType: 'application/json',
-      blob: new Blob([text], { type: 'application/json' })
+    return withSingletonLock(metaId, VISIT_LOG_FILENAME, async () => {
+      const key = singletonKey(metaId, VISIT_LOG_FILENAME);
+      // If visit_log.txt already exists (created by a peer in this lock
+      // chain, or by a prior run), return it untouched — never clobber.
+      const cachedId = singletonIdCache.get(key);
+      if (cachedId) {
+        try { return { id: cachedId, created: false }; }
+        catch (e) { singletonIdCache.delete(key); }
+      }
+      const existing = await findFileInFolder(metaId, VISIT_LOG_FILENAME);
+      if (existing) {
+        singletonIdCache.set(key, existing.id);
+        return existing;
+      }
+      const header =
+        '=== PROJECT METADATA ===\n' +
+        `Created: ${fmtMetadataTime(payload?.createdAt)}\n` +
+        `Created by: ${payload?.createdBy || 'unknown'}\n` +
+        `App version: ${payload?.appVersion || 'unknown'}\n` +
+        `Project ID: ${payload?.projectId || 'unknown'}\n` +
+        '============================\n\n';
+      const blob = new Blob([header], { type: 'text/plain' });
+      const created = await uploadMultipart({
+        folderId: metaId,
+        fileName: VISIT_LOG_FILENAME,
+        mimeType: 'text/plain',
+        blob
+      });
+      if (created?.id) singletonIdCache.set(key, created.id);
+      return created;
     });
   }
 
@@ -415,6 +463,22 @@ window.Drive = (function () {
       `&supportsAllDrives=true&includeItemsFromAllDrives=true`
     );
     if (!res.ok) throw new Error(`Drive list markers failed: ${res.status}`);
+    const data = await res.json();
+    return data.files || [];
+  }
+
+  // Returns every `visit_log.txt` we own. v39+ uses visit_log.txt as the
+  // project-ownership marker (the metadata header is embedded as the
+  // first lines). Each entry has parents that are either the project
+  // folder (legacy root-layout) or the project's `_metadata/` folder
+  // (current layout); discovery resolves both via the metaFolders map.
+  async function listAllVisitLogs({ pageSize = 500 } = {}) {
+    const q = encodeURIComponent(`name='${escapeQ(VISIT_LOG_FILENAME)}' and trashed=false`);
+    const res = await authedFetch(
+      `${API}/files?q=${q}&fields=files(id,parents)&pageSize=${pageSize}` +
+      `&supportsAllDrives=true&includeItemsFromAllDrives=true`
+    );
+    if (!res.ok) throw new Error(`Drive list visit_log files failed: ${res.status}`);
     const data = await res.json();
     return data.files || [];
   }
@@ -564,6 +628,7 @@ window.Drive = (function () {
     findProjectMarker,
     createProjectMarker,
     listAllProjectMarkers,
+    listAllVisitLogs,
     listAllMetadataFolders,
     findMetadataFolderId,
     findMetadataFile,
