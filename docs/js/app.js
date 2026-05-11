@@ -1319,11 +1319,18 @@
     if (saveBtn) saveBtn.disabled = true;
 
     try {
-      // Append-only: edits + new notes both append a new block. The
-      // edit path uses (EDITED) so the office team can tell. Previous
-      // entries are never modified or removed.
-      const kind = state.editingNoteIdx != null ? 'EDITED' : 'NOTE';
-      const block = buildNoteBlock(kind, stamp, tech, text);
+      // Append-only: edits + new notes both append a new block. For
+      // edits we also append a `=== NOTE (DELETED) ===` tombstone
+      // targeting the original's ts, so the UI shows only the edited
+      // version going forward while both entries remain in the file
+      // for the audit trail.
+      const editIdx = state.editingNoteIdx;
+      const original = editIdx != null ? state.notesEntries[editIdx] : null;
+      const kind = original ? 'EDITED' : 'NOTE';
+      let block = buildNoteBlock(kind, stamp, tech, text);
+      if (original) {
+        block += buildNoteBlock('DELETED', stamp, tech, `Original: ${original.ts}`);
+      }
       const result = await window.Drive.appendToTextFile({
         folderId,
         fileName: 'notes.txt',
@@ -1333,13 +1340,17 @@
       state.notesFileId = result.id;
       await window.DB.kvSet(`notesFileId:${folderId}`, result.id);
       ta.value = '';
+      // Local state: replace the original card with the edited one, OR
+      // prepend a fresh card for a new note.
+      if (original) {
+        state.notesEntries.splice(editIdx, 1);
+      }
       state.notesEntries.unshift({ ts: stamp, tech, body: text, kind });
-      const wasEdit = state.editingNoteIdx != null;
       state.editingNoteIdx = null;
       updateNotesHistoryDOM();
       updateNotesEditUIDOM();
-      toast(wasEdit ? 'Note updated' : 'Note saved', 'success');
-      appendVisitLog(folderId, wasEdit ? 'edited text note' : 'added text note').catch(() => {});
+      toast(original ? 'Note updated' : 'Note saved', 'success');
+      appendVisitLog(folderId, original ? 'edited text note' : 'added text note').catch(() => {});
     } catch (err) {
       toast(`Note save failed: ${err.message}`, 'error', 6000);
     } finally {
