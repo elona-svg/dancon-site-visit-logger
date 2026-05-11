@@ -979,14 +979,25 @@
           enableHighAccuracy: true, timeout: 20000, maximumAge: 0
         });
         if (state.currentProjectId !== folderId) return null;
-        // Only commit if stage 2 actually came back with a better fix.
-        const s1Acc = stage1Pos?.coords?.accuracy ?? Infinity;
-        const s2Acc = p.coords.accuracy ?? Infinity;
-        if (s2Acc < s1Acc) {
-          console.log(`[gps] stage2 upgrade: ${s1Acc.toFixed(0)}m -> ${s2Acc.toFixed(0)}m`);
+        if (!stage1Pos) {
+          // Stage 1 failed — stage 2 is the only capture, write it as
+          // the initial block.
+          await applyGpsResult(folderId, p, /* isUpgrade */ false);
+          return p;
+        }
+        // Only refine if stage 2's coordinates moved meaningfully from
+        // stage 1. ~0.0001 degrees ≈ 10m. Otherwise the visible
+        // === LOCATION UPDATED === block would be misleading — same
+        // spot, just measured slightly more precisely.
+        const dLat = Math.abs(p.coords.latitude - stage1Pos.coords.latitude);
+        const dLng = Math.abs(p.coords.longitude - stage1Pos.coords.longitude);
+        if (dLat > 0.0001 || dLng > 0.0001) {
+          const s1Acc = stage1Pos?.coords?.accuracy ?? Infinity;
+          const s2Acc = p.coords.accuracy ?? Infinity;
+          console.log(`[gps] stage2 refine: Δlat=${dLat.toFixed(6)} Δlng=${dLng.toFixed(6)} acc ${s1Acc.toFixed(0)}m→${s2Acc.toFixed(0)}m`);
           await applyGpsResult(folderId, p, /* isUpgrade */ true);
         } else {
-          console.log('[gps] stage2 no better than stage1; skipping upgrade');
+          console.log('[gps] stage2 coordinates ~unchanged; skipping refine');
         }
         return p;
       } catch (err) {
@@ -1043,7 +1054,14 @@
         catch (e) { /* treat as empty, will re-create */ }
       }
       const hasPriorBlock = /^=== [^=\n]+ ===$/m.test(existingText);
-      const headerType = hasPriorBlock ? 'LOCATION UPDATED' : 'ORIGINAL LOCATION';
+      // Legacy gps.txt from before v40 has no `=== … ===` headers — just
+      // raw key/value lines. Wrap it with an ORIGINAL LOCATION header so
+      // the first entry in the file always has the canonical header,
+      // regardless of which app version wrote it.
+      const hasLegacyContent = !hasPriorBlock && existingText.trim().length > 0;
+      const headerType = (hasPriorBlock || hasLegacyContent)
+        ? 'LOCATION UPDATED'
+        : 'ORIGINAL LOCATION';
       const newBlock = buildGpsBlock({
         header: headerType,
         lat: latitude, lng: longitude, accuracy, tech, stamp, link
@@ -1063,6 +1081,13 @@
           lat: latitude, lng: longitude, accuracy, tech, stamp, link
         });
         newText = existingText.slice(0, lastHeaderOffset) + replacementBlock;
+      } else if (hasLegacyContent) {
+        // One-time migration of the file: prepend an ORIGINAL LOCATION
+        // header to the legacy body, then append the new UPDATED block.
+        // We don't reformat the legacy lines — preserve them verbatim
+        // so prior captures remain auditable in their original form.
+        const wrapped = `=== ORIGINAL LOCATION ===\n${existingText.replace(/^\n+|\n+$/g, '')}\n`;
+        newText = wrapped + '\n' + newBlock;
       } else {
         newText = existingText
           ? existingText.replace(/\n*$/, '\n') + newBlock
