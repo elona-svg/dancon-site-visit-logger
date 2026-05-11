@@ -713,6 +713,17 @@
     refreshProjectMedia();
     refreshProjectNotes();
     loadPinnedLocation(id);
+
+    // Auto-capture GPS on Start Visit so the original location is recorded
+    // immediately. iOS will prompt for permission on the first
+    // getCurrentPosition call. If the tech denies or it times out, the
+    // captureLocationExplicit error path handles it silently — they can
+    // still capture manually later via the GPS chip.
+    if (created) {
+      captureLocationExplicit(id, { isUpdate: false }).catch((err) => {
+        console.warn('[gps] auto-capture on Start Visit failed:', err && err.message);
+      });
+    }
   }
 
   function leaveProject() {
@@ -745,10 +756,16 @@
     return tz ? `${date} ${time} ${tz}` : `${date} ${time}`;
   }
 
-  function buildGpsTxt({ lat, lng, accuracy, tech, stamp, link }) {
+  // Build a block for the append-only gps.txt log. `header` is one of
+  // 'ORIGINAL LOCATION' (first capture) or 'LOCATION UPDATED' (subsequent).
+  // First line after the header is "<verb>: <ts>" — verb matches the
+  // header type so the file reads naturally.
+  function buildGpsBlock({ header, lat, lng, accuracy, tech, stamp, link }) {
     const accStr = accuracy != null ? `±${Math.round(accuracy)}m` : 'unknown';
+    const verb = header === 'ORIGINAL LOCATION' ? 'Captured' : 'Updated';
     return [
-      `Location captured: ${stamp}`,
+      `=== ${header} ===`,
+      `${verb}: ${stamp}`,
       `Tech: ${tech}`,
       `Latitude: ${Number(lat).toFixed(6)}`,
       `Longitude: ${Number(lng).toFixed(6)}`,
@@ -756,6 +773,19 @@
       `Google Maps: ${link}`,
       ''
     ].join('\n');
+  }
+
+  // Find the byte offset of the last `=== ... ===` header line in `text`,
+  // or -1 if none. Used by the stage-2 GPS upgrade to overwrite the last
+  // block in place (one user gesture = one block) without disturbing the
+  // append-only log of prior captures.
+  function findLastSectionHeaderOffset(text) {
+    if (!text) return -1;
+    const re = /^=== [^=\n]+ ===$/gm;
+    let last = -1;
+    let m;
+    while ((m = re.exec(text)) !== null) last = m.index;
+    return last;
   }
 
   // Legacy: kept so we still write the previously-shipped HTML if any
@@ -981,7 +1011,6 @@
     const tech = state.user?.name || 'unknown';
     const capturedAt = Date.now();
     const stamp = fmtGpsTimestamp(new Date(capturedAt));
-    const txt = buildGpsTxt({ lat: latitude, lng: longitude, accuracy, tech, stamp, link });
 
     state.gps = {
       lat: latitude, lng: longitude, accuracy,
@@ -997,48 +1026,64 @@
       });
     } catch (e) { /* ignore */ }
 
-    // Upgrade path: if a gps.txt already exists (in root from a legacy
-    // project, or in _metadata/ from a current one), rewrite it in
-    // place rather than creating a duplicate. Legacy gps.html files are
-    // left alone (Drive renders them as styled pages); the new .txt is
-    // added alongside.
-    let gpsParentId = null;
-    try {
-      const existing = await window.Drive.findMetadataFile(folderId, 'gps.txt');
-      if (existing && isUpgrade) {
-        await window.Drive.updateFileContent(
-          existing.file.id, new Blob([txt], { type: 'text/plain' }), 'text/plain'
-        );
-        return;
+    // Append-only gps.txt: each user "Capture/Update Location" gesture
+    // adds one block to the file. The two-stage GPS strategy (fast then
+    // accurate) produces ONE block per gesture — stage 1 appends, stage 2
+    // (if better) replaces the last block in place with the upgraded
+    // coordinates. Prior captures from earlier gestures are preserved.
+    const metaId = await window.Drive.findMetadataFolderId(folderId, { createIfMissing: true });
+    return window.Drive.withSingletonLock(metaId, 'gps.txt', async () => {
+      // Prefer a file already in `_metadata/`; legacy projects may have
+      // one in the project root — leave it alone and create a new
+      // append-only log in `_metadata/`.
+      const found = await window.Drive.findFileInFolder(metaId, 'gps.txt');
+      let existingText = '';
+      if (found) {
+        try { existingText = await window.Drive.downloadFileText(found.id); }
+        catch (e) { /* treat as empty, will re-create */ }
       }
-      if (existing && !isUpgrade) return; // stage-1 already wrote
-      gpsParentId = await window.Drive.findMetadataFolderId(folderId, { createIfMissing: true });
-    } catch (err) {
-      console.warn('[gps] metadata lookup failed, queuing to project root:', err.message);
-    }
-    try {
-      await window.DB.queueAdd({
-        projectId: folderId,
-        // Upload destination — for new projects this is the _metadata/
-        // subfolder so gps.txt stays out of the project root view.
-        targetFolderId: gpsParentId || folderId,
-        projectName: state.currentProjectName,
-        fileName: 'gps.txt',
-        // Singleton: stage-1 and stage-2 of GPS capture can both queue
-        // an upload before the first lands on Drive's index; the upsert
-        // path serializes them and PATCHes the existing file instead of
-        // creating a duplicate.
-        singleton: true,
-        mimeType: 'text/plain',
-        blob: new Blob([txt], { type: 'text/plain' }),
-        kind: 'gps',
-        status: 'pending',
-        attempts: 0
+      const hasPriorBlock = /^=== [^=\n]+ ===$/m.test(existingText);
+      const headerType = hasPriorBlock ? 'LOCATION UPDATED' : 'ORIGINAL LOCATION';
+      const newBlock = buildGpsBlock({
+        header: headerType,
+        lat: latitude, lng: longitude, accuracy, tech, stamp, link
       });
-      pumpQueue();
-    } catch (err) {
-      console.warn('[gps] queue add failed:', err.message);
-    }
+
+      let newText;
+      if (isUpgrade && hasPriorBlock) {
+        // Stage-2 upgrade: replace the LAST block in the file with the
+        // better-accuracy block. Keep the existing header type (don't
+        // promote an ORIGINAL to UPDATED — we're refining the same
+        // capture event, not creating a new one).
+        const lastHeaderOffset = findLastSectionHeaderOffset(existingText);
+        const lastHeaderLine = existingText.slice(lastHeaderOffset).split('\n', 1)[0];
+        const lastHeaderType = (lastHeaderLine.match(/^=== ([^=\n]+) ===$/) || [])[1] || headerType;
+        const replacementBlock = buildGpsBlock({
+          header: lastHeaderType,
+          lat: latitude, lng: longitude, accuracy, tech, stamp, link
+        });
+        newText = existingText.slice(0, lastHeaderOffset) + replacementBlock;
+      } else {
+        newText = existingText
+          ? existingText.replace(/\n*$/, '\n') + newBlock
+          : newBlock;
+      }
+
+      const blob = new Blob([newText], { type: 'text/plain' });
+      try {
+        if (found) {
+          await window.Drive.updateFileContent(found.id, blob, 'text/plain');
+        } else {
+          await window.Drive.uploadMultipart({
+            folderId: metaId, fileName: 'gps.txt', mimeType: 'text/plain', blob
+          });
+        }
+        appendVisitLog(folderId, isUpgrade ? 'refined GPS' : 'captured GPS').catch(() => {});
+      } catch (err) {
+        console.warn('[gps] file write failed:', err.message);
+        toast(`GPS save failed: ${err.message}`, 'error', 4000);
+      }
+    });
   }
 
   // ---------- Visit log + filenames ----------
@@ -1274,53 +1319,27 @@
     if (saveBtn) saveBtn.disabled = true;
 
     try {
-      if (state.editingNoteIdx != null) {
-        // EDIT path: replace existing entry in notes.txt
-        const original = state.notesEntries[state.editingNoteIdx];
-        if (!original) throw new Error('Original note not found');
-        if (!state.notesFileId) throw new Error('Notes file not loaded yet');
-
-        const editedBody = `${text}\n_(edited ${stamp})_`;
-        const updatedEntry = { ts: original.ts, tech: original.tech, body: editedBody };
-
-        // parseNotesAll preserves soft-deleted entries so editing one note
-        // doesn't inadvertently drop the audit trail.
-        const fileText = await window.Drive.downloadFileText(state.notesFileId);
-        const all = parseNotesAll(fileText);
-        const matchIdx = all.findIndex(
-          (e) => e.ts === original.ts && e.tech === original.tech && e.body === original.body
-        );
-        if (matchIdx >= 0) all[matchIdx] = updatedEntry;
-        else all.unshift(updatedEntry); // safety: prepend if not found
-
-        const newText = serializeNotes(all);
-        const blob = new Blob([newText], { type: 'text/plain' });
-        await window.Drive.updateFileContent(state.notesFileId, blob, 'text/plain');
-
-        state.notesEntries[state.editingNoteIdx] = updatedEntry;
-        state.editingNoteIdx = null;
-        ta.value = '';
-        updateNotesHistoryDOM();
-        updateNotesEditUIDOM();
-        toast('Note updated', 'success');
-        appendVisitLog(folderId, 'edited text note').catch(() => {});
-      } else {
-        // APPEND path: new note
-        const block = `\n--- ${stamp} — ${tech} ---\n${text}\n`;
-        const result = await window.Drive.appendToTextFile({
-          folderId,
-          fileName: 'notes.txt',
-          lineOrText: block,
-          cachedFileId: state.notesFileId
-        });
-        state.notesFileId = result.id;
-        await window.DB.kvSet(`notesFileId:${folderId}`, result.id);
-        ta.value = '';
-        state.notesEntries.unshift({ ts: stamp, tech, body: text });
-        updateNotesHistoryDOM();
-        toast('Note saved', 'success');
-        appendVisitLog(folderId, 'added text note').catch(() => {});
-      }
+      // Append-only: edits + new notes both append a new block. The
+      // edit path uses (EDITED) so the office team can tell. Previous
+      // entries are never modified or removed.
+      const kind = state.editingNoteIdx != null ? 'EDITED' : 'NOTE';
+      const block = buildNoteBlock(kind, stamp, tech, text);
+      const result = await window.Drive.appendToTextFile({
+        folderId,
+        fileName: 'notes.txt',
+        lineOrText: block,
+        cachedFileId: state.notesFileId
+      });
+      state.notesFileId = result.id;
+      await window.DB.kvSet(`notesFileId:${folderId}`, result.id);
+      ta.value = '';
+      state.notesEntries.unshift({ ts: stamp, tech, body: text, kind });
+      const wasEdit = state.editingNoteIdx != null;
+      state.editingNoteIdx = null;
+      updateNotesHistoryDOM();
+      updateNotesEditUIDOM();
+      toast(wasEdit ? 'Note updated' : 'Note saved', 'success');
+      appendVisitLog(folderId, wasEdit ? 'edited text note' : 'added text note').catch(() => {});
     } catch (err) {
       toast(`Note save failed: ${err.message}`, 'error', 6000);
     } finally {
@@ -1663,52 +1682,102 @@
   }
 
   // Returns ALL parsed entries (visible + soft-deleted), newest-first.
+  // Append-only notes.txt log. New entries use one of three section
+  // headers:
+  //   === NOTE ===            new note
+  //   === NOTE (EDITED) ===   amendment to a prior note (own entry,
+  //                           does not replace the original)
+  //   === NOTE (DELETED) ===  tombstone whose body contains
+  //                           `Original: <ts>` to identify which entry
+  //                           to hide from the UI.
+  // Legacy entries (--- ts — tech ---) are still parsed for backward
+  // compatibility; legacy soft-deletes use the `[DELETED ...]` body
+  // prefix.
   function parseNotesAll(text) {
     if (!text) return [];
-    const re = /^---\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+—\s+(.+?)\s+---$/gm;
-    const matches = [];
-    let m;
-    while ((m = re.exec(text)) !== null) {
-      matches.push({ index: m.index, end: re.lastIndex, ts: m[1], tech: m[2] });
-    }
-    if (matches.length === 0) return [];
     const out = [];
-    for (let i = 0; i < matches.length; i += 1) {
-      const start = matches[i].end;
-      const stop = i + 1 < matches.length ? matches[i + 1].index : text.length;
-      const body = text.slice(start, stop).replace(/^\s+|\s+$/g, '');
-      out.push({ ts: matches[i].ts, tech: matches[i].tech, body });
+
+    // New format: === NOTE === / (EDITED) === / (DELETED) ===
+    const sectionRe = /^=== NOTE(?:\s+\((EDITED|DELETED)\))? ===$/gm;
+    const sections = [];
+    let m;
+    while ((m = sectionRe.exec(text)) !== null) {
+      sections.push({ index: m.index, end: m.index + m[0].length, kind: m[1] || 'NOTE' });
     }
-    return out.reverse();
+    for (let i = 0; i < sections.length; i += 1) {
+      const block = text.slice(sections[i].end, i + 1 < sections.length ? sections[i + 1].index : text.length);
+      const lines = block.replace(/^\n+/, '').replace(/\n+$/, '').split('\n');
+      if (lines.length === 0) continue;
+      const head = lines[0].match(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+—\s+(.+)$/);
+      if (!head) continue;
+      const entry = {
+        ts: head[1],
+        tech: head[2],
+        body: lines.slice(1).join('\n').replace(/^\s+|\s+$/g, ''),
+        kind: sections[i].kind
+      };
+      if (entry.kind === 'DELETED') {
+        const origMatch = entry.body.match(/^Original:\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\b/);
+        if (origMatch) entry.targetTs = origMatch[1];
+      }
+      out.push(entry);
+    }
+
+    // Legacy format: --- ts — tech ---
+    const legacyRe = /^---\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+—\s+(.+?)\s+---$/gm;
+    const legacyMatches = [];
+    while ((m = legacyRe.exec(text)) !== null) {
+      legacyMatches.push({ index: m.index, end: legacyRe.lastIndex, ts: m[1], tech: m[2] });
+    }
+    for (let i = 0; i < legacyMatches.length; i += 1) {
+      const start = legacyMatches[i].end;
+      // Stop at the next legacy delimiter OR the first new-format section,
+      // so a mixed-format file doesn't bleed bodies across boundaries.
+      let stop = i + 1 < legacyMatches.length ? legacyMatches[i + 1].index : text.length;
+      for (const s of sections) {
+        if (s.index > start && s.index < stop) stop = s.index;
+      }
+      const body = text.slice(start, stop).replace(/^\s+|\s+$/g, '');
+      out.push({ ts: legacyMatches[i].ts, tech: legacyMatches[i].tech, body, kind: 'NOTE' });
+    }
+
+    // Newest-first ordering — same as before; ties broken by file order
+    // (later in file wins among same-ts entries).
+    out.sort((a, b) => (a.ts < b.ts ? 1 : (a.ts > b.ts ? -1 : 0)));
+    return out;
   }
 
-  // A note marked as deleted starts its body with "[DELETED ts — tech]".
-  // We keep these in the Drive file forever (audit trail) but hide them
-  // from the in-app list.
-  function isDeletedNote(entry) {
+  // Legacy soft-delete marker: body starts with "[DELETED ts — tech]".
+  function isLegacyDeletedNote(entry) {
     return /^\[DELETED\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+—\s+.+?\]/.test(entry?.body || '');
   }
 
-  // Public visible-only parser — used for the in-app list.
+  // Visible entries for the UI: skip DELETED tombstones, skip any entry
+  // whose ts is targeted by a tombstone, and skip legacy-soft-deleted
+  // entries (the `[DELETED …]` body-prefix style).
   function parseNotes(text) {
-    return parseNotesAll(text).filter((e) => !isDeletedNote(e));
+    const all = parseNotesAll(text);
+    const deletedTargets = new Set();
+    for (const e of all) {
+      if (e.kind === 'DELETED' && e.targetTs) deletedTargets.add(e.targetTs);
+    }
+    return all.filter((e) =>
+      e.kind !== 'DELETED' &&
+      !isLegacyDeletedNote(e) &&
+      !deletedTargets.has(e.ts));
   }
 
-  // Inverse of parseNotes — entries are newest-first; file is chronological.
-  function serializeNotes(entries) {
-    const ascending = [...entries].reverse();
-    return ascending.map((e) => `\n--- ${e.ts} — ${e.tech} ---\n${e.body}\n`).join('');
+  function buildNoteBlock(kind, ts, tech, body) {
+    const header = kind === 'EDITED' ? '=== NOTE (EDITED) ==='
+      : kind === 'DELETED' ? '=== NOTE (DELETED) ==='
+      : '=== NOTE ===';
+    return `\n${header}\n${ts} — ${tech}\n${body}\n`;
   }
 
   async function deleteNoteAt(idx) {
     const note = state.notesEntries[idx];
     if (!note) return;
     if (!confirm('Delete this note?')) return;
-
-    if (!state.notesFileId) {
-      toast('Notes file not loaded yet', 'warn');
-      return;
-    }
 
     // Optimistic UI update — restore from server if the write fails.
     const removed = state.notesEntries.splice(idx, 1)[0];
@@ -1717,22 +1786,17 @@
     try {
       const stamp = fmtDateTime();
       const tech = state.user?.name || 'unknown';
-      // Soft delete: prepend a "[DELETED ts — tech]" marker to the original
-      // body. The block stays in notes.txt forever — never shrinks.
-      const text = await window.Drive.downloadFileText(state.notesFileId);
-      const all = parseNotesAll(text);
-      const matchIdx = all.findIndex(
-        (e) => e.ts === removed.ts && e.tech === removed.tech && e.body === removed.body
-      );
-      if (matchIdx >= 0) {
-        all[matchIdx] = {
-          ...all[matchIdx],
-          body: `[DELETED ${stamp} — ${tech}] ${all[matchIdx].body}`
-        };
-      }
-      const newText = serializeNotes(all);
-      const blob = new Blob([newText], { type: 'text/plain' });
-      await window.Drive.updateFileContent(state.notesFileId, blob, 'text/plain');
+      // Append-only soft delete: write a `=== NOTE (DELETED) ===` block
+      // whose body references the original by timestamp. Never modifies
+      // or removes the original entry from the file.
+      const block = buildNoteBlock('DELETED', stamp, tech, `Original: ${removed.ts}`);
+      const result = await window.Drive.appendToTextFile({
+        folderId: state.currentProjectId,
+        fileName: 'notes.txt',
+        lineOrText: block,
+        cachedFileId: state.notesFileId
+      });
+      state.notesFileId = result.id;
       toast('Note deleted', 'success');
       appendVisitLog(state.currentProjectId, 'deleted text note (soft)').catch(() => {});
     } catch (err) {
