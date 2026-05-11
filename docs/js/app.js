@@ -1000,6 +1000,11 @@
         targetFolderId: gpsParentId || folderId,
         projectName: state.currentProjectName,
         fileName: 'gps.txt',
+        // Singleton: stage-1 and stage-2 of GPS capture can both queue
+        // an upload before the first lands on Drive's index; the upsert
+        // path serializes them and PATCHes the existing file instead of
+        // creating a duplicate.
+        singleton: true,
         mimeType: 'text/plain',
         blob: new Blob([txt], { type: 'text/plain' }),
         kind: 'gps',
@@ -1015,35 +1020,41 @@
   // ---------- Visit log + filenames ----------
   async function appendVisitLog(folderId, summary) {
     const line = `${fmtDateTime()} — ${state.user?.name || 'unknown'} — ${summary}\n`;
-    try {
-      const cachedKey = `visitLogId:${folderId}`;
-      const cached = await window.DB.kvGet(cachedKey);
-      // Resolve the parent folder for visit_log.txt:
-      //  - if a cached file id exists, appendToTextFile will use it
-      //    directly (parent doesn't matter)
-      //  - else find an existing copy in root (legacy) or _metadata/
-      //  - else use _metadata/ for new writes
-      let parentId = folderId;
-      if (!cached) {
-        const found = await window.Drive.findMetadataFile(folderId, 'visit_log.txt');
-        if (found) {
-          parentId = found.parentId;
-        } else {
-          parentId = await window.Drive.findMetadataFolderId(folderId, { createIfMissing: true });
+    // Serialize all visit_log writes per project. Two concurrent
+    // callers (e.g. a photo upload finishing while the user adds a
+    // note) would each do search-then-create and miss each other's
+    // writes, producing duplicate files. The lock + kv id cache
+    // collapses them to a single file with one append per call.
+    return window.Drive.withSingletonLock(folderId, 'visit_log.txt', async () => {
+      try {
+        const cachedKey = `visitLogId:${folderId}`;
+        const cached = await window.DB.kvGet(cachedKey);
+        // Resolve the parent folder for visit_log.txt:
+        //  - if a cached file id exists, appendToTextFile uses it directly
+        //  - else find an existing copy in root (legacy) or _metadata/
+        //  - else use _metadata/ for new writes
+        let parentId = folderId;
+        if (!cached) {
+          const found = await window.Drive.findMetadataFile(folderId, 'visit_log.txt');
+          if (found) {
+            parentId = found.parentId;
+          } else {
+            parentId = await window.Drive.findMetadataFolderId(folderId, { createIfMissing: true });
+          }
         }
+        const result = await window.Drive.appendToTextFile({
+          folderId: parentId,
+          fileName: 'visit_log.txt',
+          lineOrText: line,
+          cachedFileId: cached || null
+        });
+        if (result?.id && result.id !== cached) {
+          await window.DB.kvSet(cachedKey, result.id);
+        }
+      } catch (err) {
+        console.warn('visit_log append failed:', err.message);
       }
-      const result = await window.Drive.appendToTextFile({
-        folderId: parentId,
-        fileName: 'visit_log.txt',
-        lineOrText: line,
-        cachedFileId: cached || null
-      });
-      if (result?.id && result.id !== cached) {
-        await window.DB.kvSet(cachedKey, result.id);
-      }
-    } catch (err) {
-      console.warn('visit_log append failed:', err.message);
-    }
+    });
   }
 
   function pad2(n) { return String(n).padStart(2, '0'); }
@@ -1418,13 +1429,16 @@
       patchThumbByQueueId(item.id, { status: 'uploading', progress: 0 });
 
       try {
-        const result = await window.Drive.uploadFile({
+        const uploadArgs = {
           folderId: item.targetFolderId || item.projectId,
           fileName: item.fileName,
           mimeType: item.mimeType,
           blob: item.blob,
           onProgress: (p) => patchThumbByQueueId(item.id, { progress: p })
-        });
+        };
+        const result = item.singleton
+          ? await window.Drive.upsertSingletonFile(uploadArgs)
+          : await window.Drive.uploadFile(uploadArgs);
         console.log('[upload] success id=', item.id, 'driveFileId=', result?.id);
         await window.DB.queueDelete(item.id);
         patchThumbByQueueId(item.id, {

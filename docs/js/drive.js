@@ -260,6 +260,52 @@ window.Drive = (function () {
     return big ? uploadResumable(opts) : uploadMultipart(opts);
   }
 
+  // -------- Singleton metadata writes (mutex + upsert) --------
+  // Some files inside a project are "singletons" — only one copy must
+  // ever exist (.dancon-project, gps.txt, visit_log.txt, the _metadata
+  // folder itself). Concurrent writers + Drive's eventually-consistent
+  // index lag have produced duplicates in the past. This serializes
+  // writes per (folderId, fileName) so a second writer never runs its
+  // existence-check until the first writer's create has fully landed,
+  // and tracks the just-created file ID in memory so a second writer
+  // can update by id even when Drive's name search hasn't indexed yet.
+  const singletonLocks = new Map();
+  const singletonIdCache = new Map();
+  function singletonKey(folderId, fileName) { return `${folderId}::${fileName}`; }
+
+  function withSingletonLock(folderId, fileName, fn) {
+    const key = singletonKey(folderId, fileName);
+    const prev = singletonLocks.get(key) || Promise.resolve();
+    const next = prev.then(fn, fn); // run fn regardless of prev's outcome
+    singletonLocks.set(key, next.catch(() => {}));
+    return next;
+  }
+
+  async function upsertSingletonFile({ folderId, fileName, mimeType, blob, onProgress }) {
+    return withSingletonLock(folderId, fileName, async () => {
+      const key = singletonKey(folderId, fileName);
+      // In-memory id cache — survives Drive index lag from a recent
+      // create in this same locked chain.
+      const cachedId = singletonIdCache.get(key);
+      if (cachedId) {
+        try {
+          return await updateFileContent(cachedId, blob, mimeType);
+        } catch (err) {
+          if (!isNotFound(err)) throw err;
+          singletonIdCache.delete(key); // dead id, fall through to re-find
+        }
+      }
+      const existing = await findFileInFolder(folderId, fileName);
+      if (existing) {
+        singletonIdCache.set(key, existing.id);
+        return updateFileContent(existing.id, blob, mimeType);
+      }
+      const created = await uploadMultipart({ folderId, fileName, mimeType, blob, onProgress });
+      if (created?.id) singletonIdCache.set(key, created.id);
+      return created;
+    });
+  }
+
   // -------- Project ownership marker + metadata folder --------
   // Every project folder we create has a `_metadata` subfolder that holds
   // the `.dancon-project` marker, `gps.txt`, and `visit_log.txt` — keeping
@@ -281,9 +327,13 @@ window.Drive = (function () {
 
   async function createProjectMarker(folderId, payload) {
     const text = JSON.stringify(payload || {}, null, 2);
-    // Marker for new projects lives inside _metadata/.
+    // Marker for new projects lives inside _metadata/. Use the singleton
+    // upsert path so a concurrent caller (e.g. the migration sweep
+    // running in parallel with openOrCreateProject) can't produce a
+    // duplicate marker file — the second caller will see the first
+    // caller's just-created id and PATCH instead of creating.
     const metaId = await findMetadataFolderId(folderId, { createIfMissing: true });
-    return uploadMultipart({
+    return upsertSingletonFile({
       folderId: metaId,
       fileName: MARKER_FILENAME,
       mimeType: 'application/json',
@@ -292,35 +342,53 @@ window.Drive = (function () {
   }
 
   // Returns the `_metadata` subfolder ID for a project. With
-  // `createIfMissing: true` it creates the folder on first use.
+  // `createIfMissing: true` the create-path is serialized via the
+  // singleton lock + re-checked inside the lock, so two parallel
+  // callers can never both create the folder.
   async function findMetadataFolderId(projectId, { createIfMissing = false } = {}) {
-    const q = encodeURIComponent(
-      `'${projectId}' in parents and name='${escapeQ(METADATA_FOLDER_NAME)}' and ` +
-      `mimeType='application/vnd.google-apps.folder' and trashed=false`
-    );
-    const res = await authedFetch(
-      `${API}/files?q=${q}&fields=files(id,name)&pageSize=1&supportsAllDrives=true&includeItemsFromAllDrives=true`
-    );
-    if (res.ok) {
+    async function lookup() {
+      const q = encodeURIComponent(
+        `'${projectId}' in parents and name='${escapeQ(METADATA_FOLDER_NAME)}' and ` +
+        `mimeType='application/vnd.google-apps.folder' and trashed=false`
+      );
+      const res = await authedFetch(
+        `${API}/files?q=${q}&fields=files(id,name)&pageSize=1&supportsAllDrives=true&includeItemsFromAllDrives=true`
+      );
+      if (!res.ok) return null;
       const data = await res.json();
-      if (data.files && data.files.length > 0) return data.files[0].id;
+      return data.files && data.files.length > 0 ? data.files[0].id : null;
     }
+    // Fast path: in-memory cache hit from a recent create in this session.
+    const cacheKey = singletonKey(projectId, METADATA_FOLDER_NAME);
+    const cachedId = singletonIdCache.get(cacheKey);
+    if (cachedId) return cachedId;
+    let id = await lookup();
+    if (id) { singletonIdCache.set(cacheKey, id); return id; }
     if (!createIfMissing) return null;
-    const createRes = await authedFetch(`${API}/files?supportsAllDrives=true&fields=id`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: METADATA_FOLDER_NAME,
-        mimeType: 'application/vnd.google-apps.folder',
-        parents: [projectId]
-      })
+    return withSingletonLock(projectId, METADATA_FOLDER_NAME, async () => {
+      // Re-check inside the lock — a peer in the same lock chain may
+      // have just created it.
+      const cachedId2 = singletonIdCache.get(cacheKey);
+      if (cachedId2) return cachedId2;
+      const found = await lookup();
+      if (found) { singletonIdCache.set(cacheKey, found); return found; }
+      const createRes = await authedFetch(`${API}/files?supportsAllDrives=true&fields=id`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: METADATA_FOLDER_NAME,
+          mimeType: 'application/vnd.google-apps.folder',
+          parents: [projectId]
+        })
+      });
+      if (!createRes.ok) {
+        const text = await createRes.text().catch(() => '');
+        throw new Error(`Drive create _metadata failed: ${createRes.status} ${text}`);
+      }
+      const created = await createRes.json();
+      singletonIdCache.set(cacheKey, created.id);
+      return created.id;
     });
-    if (!createRes.ok) {
-      const text = await createRes.text().catch(() => '');
-      throw new Error(`Drive create _metadata failed: ${createRes.status} ${text}`);
-    }
-    const created = await createRes.json();
-    return created.id;
   }
 
   // Resolve a metadata file (.dancon-project / gps.txt / visit_log.txt) to
@@ -499,6 +567,8 @@ window.Drive = (function () {
     listAllMetadataFolders,
     findMetadataFolderId,
     findMetadataFile,
+    upsertSingletonFile,
+    withSingletonLock,
     downloadFileText,
     updateFileContent,
     appendToTextFile,
