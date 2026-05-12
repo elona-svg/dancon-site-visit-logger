@@ -656,13 +656,39 @@
     return msg;
   }
 
+  // Guard against double-taps. Drive's folder-create API takes 2-5 s,
+  // and a second tap during that window used to mint a duplicate folder.
+  let creatingProject = false;
+
   async function openOrCreateProject(rawName) {
+    if (creatingProject) {
+      console.log('[project] open already in flight — ignoring tap');
+      return;
+    }
     const name = window.Drive.sanitizeFolderName(rawName);
     if (!name) { toast('Type a project name', 'warn'); return; }
+
+    creatingProject = true;
+    const btn = document.getElementById('start-visit-btn');
+    const originalLabel = btn?.textContent;
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+      btn.textContent = 'Creating…';
+    }
+    // Immediate user feedback — the actual Drive call hasn't started yet,
+    // but the tech needs to see that the tap registered.
+    toast('Creating project…', 'info', 4000);
+
     try {
+      // ensureProjectFolder already returns { created: false } when a
+      // folder with the same name already exists — that's the "open
+      // existing instead of duplicating" path baked into Drive.js.
       const { id, name: actualName, created } = await window.Drive.ensureProjectFolder(name);
-      // Stamp every newly-created folder with the .dancon-project marker
-      // so the home list (and any other device) recognizes it as ours.
+      if (!created) {
+        console.log('[project] reusing existing folder', id);
+      }
+      // Stamp newly-created folders with the .dancon-project marker.
       // If the folder already had one (re-open path), this is a no-op.
       try {
         const existingMarker = await window.Drive.findProjectMarker(id);
@@ -670,7 +696,7 @@
           await window.Drive.createProjectMarker(id, {
             createdAt: new Date().toISOString(),
             createdBy: state.user?.email || 'unknown',
-            appVersion: 'v39',
+            appVersion: 'v44',
             projectId: (window.crypto?.randomUUID && window.crypto.randomUUID()) || `proj-${Date.now()}`
           });
           console.log('[marker] stamped new project', id);
@@ -678,10 +704,22 @@
       } catch (e) {
         console.warn('[marker] could not stamp project:', e.message);
       }
+      // Success — enterProject swaps the view to the capture screen, so
+      // the Start Visit button is unmounted. We leave creatingProject
+      // true until the navigation completes.
       enterProject(id, actualName, { created });
+      creatingProject = false;
     } catch (err) {
       console.error(err);
       toast(`Could not open project: ${friendlyErrorMessage(err)}`, 'error', 6000);
+      // Restore the button only on failure — on success the home screen
+      // is gone and there's no button left to restore.
+      if (btn) {
+        btn.disabled = false;
+        btn.classList.remove('is-loading');
+        btn.textContent = originalLabel || 'Start Visit';
+      }
+      creatingProject = false;
     }
   }
 
