@@ -1,5 +1,5 @@
 // Bump CACHE_VERSION on every release to invalidate stale shells.
-const CACHE_VERSION = 'dancon-svl-v45';
+const CACHE_VERSION = 'dancon-svl-v46';
 const APP_SHELL = [
   './',
   './index.html',
