@@ -72,5 +72,35 @@ window.UI = (function () {
     }, 1000);
   }
 
-  return { escapeHtml, fmtTimestampForFilename, fmtDateTime, fmtBytes, fmtRelative, toast, downloadBlob };
+  // Fixed banner pinned to the top of the viewport announcing a new
+  // service-worker version. Tap → reload. Dismiss → hides until next
+  // update cycle. Idempotent — calling twice doesn't stack banners.
+  function showUpdateBanner(message) {
+    if (document.getElementById('sw-update-banner')) return;
+    const el = document.createElement('div');
+    el.id = 'sw-update-banner';
+    el.className = 'sw-update-banner';
+    el.innerHTML = `
+      <span class="sw-update-text">${message || 'App updated — tap to refresh'}</span>
+      <button class="sw-update-refresh" type="button">Refresh</button>
+      <button class="sw-update-dismiss" type="button" aria-label="Dismiss">✕</button>
+    `;
+    document.body.appendChild(el);
+    requestAnimationFrame(() => el.classList.add('show'));
+    el.querySelector('.sw-update-refresh').addEventListener('click', () => {
+      window.location.reload();
+    });
+    // Tapping anywhere on the banner (outside dismiss) also reloads.
+    el.addEventListener('click', (ev) => {
+      if (ev.target.classList.contains('sw-update-dismiss')) return;
+      window.location.reload();
+    });
+    el.querySelector('.sw-update-dismiss').addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      el.classList.remove('show');
+      setTimeout(() => el.remove(), 250);
+    });
+  }
+
+  return { escapeHtml, fmtTimestampForFilename, fmtDateTime, fmtBytes, fmtRelative, toast, downloadBlob, showUpdateBanner };
 })();

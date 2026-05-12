@@ -1,5 +1,5 @@
 // Bump CACHE_VERSION on every release to invalidate stale shells.
-const CACHE_VERSION = 'dancon-svl-v44';
+const CACHE_VERSION = 'dancon-svl-v45';
 const APP_SHELL = [
   './',
   './index.html',
@@ -27,24 +27,29 @@ const APP_SHELL = [
 // Cache shell on install but DO NOT block install on a single 404 — addAll
 // rejects atomically. Use Promise.all + per-URL catches so a transient miss
 // doesn't kill the whole install (which has bitten iOS Safari before).
+//
+// skipWaiting runs FIRST so a new SW takes over the moment it's parsed —
+// we no longer wait for the shell to finish caching before promoting.
 self.addEventListener('install', (event) => {
+  self.skipWaiting();
   event.waitUntil(
     caches.open(CACHE_VERSION).then((cache) =>
       Promise.all(APP_SHELL.map((url) =>
         cache.add(url).catch((err) => console.warn('SW skip', url, err.message))
       ))
-    ).then(() => self.skipWaiting())
+    )
   );
 });
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys()
-      .then((keys) => Promise.all(
-        keys.filter((k) => k !== CACHE_VERSION).map((k) => caches.delete(k))
-      ))
-      .then(() => self.clients.claim())
-  );
+  // Claim immediately so already-open clients use the new SW without a
+  // navigation. The clients then receive the controllerchange event and
+  // the in-page registration listener surfaces the update banner.
+  event.waitUntil((async () => {
+    await self.clients.claim();
+    const keys = await caches.keys();
+    await Promise.all(keys.filter((k) => k !== CACHE_VERSION).map((k) => caches.delete(k)));
+  })());
 });
 
 // Network-first for same-origin GETs so updates ship fast; cache fallback
