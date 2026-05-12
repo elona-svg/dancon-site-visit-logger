@@ -1423,6 +1423,41 @@
   }
 
   // ---------- Capture queue ----------
+  // Photo-library import: routes each selected file through the same
+  // enqueueCapture pipeline as the live camera. Filename is generated
+  // from import-time (now), not the photo's EXIF date — keeps the
+  // sequence number per-project per-day consistent with camera captures.
+  async function onUploadPhotosChange(ev) {
+    const input = ev?.target;
+    const files = input && input.files ? Array.from(input.files) : [];
+    if (files.length === 0) return;
+    if (!state.currentProjectId) {
+      toast('No project — import discarded', 'error');
+      input.value = '';
+      return;
+    }
+    toast(`Importing ${files.length} ${files.length === 1 ? 'file' : 'files'}…`, 'info', 2500);
+    for (const file of files) {
+      const mime = file.type || '';
+      const kind = mime.startsWith('image/') ? 'photo'
+        : mime.startsWith('video/') ? 'video'
+        : null;
+      if (!kind) {
+        console.warn('[import] skipping unsupported mime:', mime, file.name);
+        continue;
+      }
+      try {
+        await enqueueCapture(file, mime, kind);
+        toast(`Imported ${file.name}`, 'success', 1500);
+      } catch (err) {
+        console.warn('[import] enqueue failed for', file.name, err && err.message);
+        toast(`Could not import ${file.name}`, 'error', 4000);
+      }
+    }
+    // Reset so re-picking the same file fires the change event again.
+    input.value = '';
+  }
+
   async function enqueueCapture(blob, mime, kind, opts = {}) {
     console.log('[capture] enqueueCapture kind=', kind, 'mime=', mime, 'size=', blob?.size, 'project=', state.currentProjectId);
     const folderId = state.currentProjectId;
@@ -2345,6 +2380,21 @@
             <span>Open Camera</span>
           </button>
 
+          <button class="upload-photos-btn" id="upload-photos-btn" type="button">
+            <svg class="open-camera-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="5" width="18" height="14" rx="2"/>
+              <circle cx="9" cy="11" r="2"/>
+              <path d="M21 17l-5.5-5.5a1 1 0 0 0-1.4 0L3 22"/>
+            </svg>
+            <span>Upload from Photos</span>
+          </button>
+          <input type="file" id="upload-photos-input"
+                 accept="image/*,video/*" multiple
+                 style="display:none" aria-hidden="true" />
+          <input type="file" id="open-cam-fallback-input"
+                 accept="image/*,video/*" capture="environment"
+                 style="display:none" aria-hidden="true" />
+
           <section class="thumb-section">
             <div class="section-row">
               <h3 class="section-h">Captured</h3>
@@ -2382,6 +2432,12 @@
     document.getElementById('back-btn').addEventListener('click', leaveProject);
     document.getElementById('drive-btn').addEventListener('click', openGallery);
     document.getElementById('open-cam-btn').addEventListener('click', () => openCamera({ mode: 'multi' }));
+    const uploadBtn = document.getElementById('upload-photos-btn');
+    const uploadInput = document.getElementById('upload-photos-input');
+    if (uploadBtn && uploadInput) {
+      uploadBtn.addEventListener('click', () => uploadInput.click());
+      uploadInput.addEventListener('change', onUploadPhotosChange);
+    }
     document.getElementById('voice-btn').addEventListener('click', startVoiceNote);
     document.getElementById('save-note-btn').addEventListener('click', saveNote);
     document.getElementById('cancel-edit-btn').addEventListener('click', cancelEditNote);
