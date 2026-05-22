@@ -43,6 +43,9 @@ window.Auth = (function () {
   // an OAuth-fragment on the app URL and we consume it in init().
   const IS_STANDALONE = window.matchMedia('(display-mode: standalone)').matches
     || window.navigator.standalone === true;
+  const IS_SAFARI_BROWSER = /Safari/.test(window.navigator.userAgent)
+    && !/CriOS|FxiOS|EdgiOS|OPiOS/.test(window.navigator.userAgent);
+
   // Always use full-page redirect for OAuth to avoid popup blockers on iOS
   // and other restrictive browser contexts. The redirect response is handled
   // in init() via `consumeRedirectCallback()`.
