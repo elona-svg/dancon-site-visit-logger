@@ -1547,7 +1547,9 @@
     const thumb = {
       type: kind,
       src,
-      objectUrl: src && kind !== 'video' ? src : null,
+      objectUrl: kind === 'video'
+        ? URL.createObjectURL(blob)
+        : src,
       name: fileName,
       mime,
       size: blob.size,
@@ -1761,13 +1763,15 @@
         return {
           type: item.kind,
           src,
-          objectUrl: item.kind === 'photo' ? src : null,
+          objectUrl: item.kind === 'video'
+            ? URL.createObjectURL(item.blob)
+            : item.kind === 'photo'
+              ? src
+              : null,
           name: item.fileName,
           mime: item.mimeType,
           size: item.blob.size || 0,
-          status: item.status === 'queued' || item.status === 'pending' || item.status === 'error' || item.status === 'uploading'
-            ? 'pending'
-            : item.status,
+          status: item.status === 'pending' ? 'pending' : item.status,
           progress: 0,
           queueId: item.id,
           addedAt: item.createdAt || Date.now(),

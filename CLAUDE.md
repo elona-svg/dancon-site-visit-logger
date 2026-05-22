@@ -34,7 +34,8 @@ to Google Drive organized by job site.
    when making any changes so iOS picks up the update
 5. Always update PROGRESS.md after every session
 6. Never expose the OAuth client_secret in client code
-7. Test for JS errors before declaring anything done
+7. Never modify auth.js without running a full boot path check on all dependent files before pushing. A syntax error in auth.js crashes the entire app.
+8. Test for JS errors before declaring anything done
 
 > Reminder: after every session, commit and push changes with:
 > `git add -A && git commit -m "description" && git push origin main`
