@@ -36,6 +36,9 @@ to Google Drive organized by job site.
 6. Never expose the OAuth client_secret in client code
 7. Test for JS errors before declaring anything done
 
+> Reminder: after every session, commit and push changes with:
+> `git add -A && git commit -m "description" && git push origin main`
+
 ## Never Break These
 - PKCE auth flow — if this breaks nobody can log in
 - IndexedDB persistence — this is the offline backup
