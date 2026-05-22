@@ -245,16 +245,42 @@ window.Viewer = (function () {
     img.onload = () => {
       img.hidden = false;
       if (loading) loading.style.display = 'none';
+      preloadAdjacentImages();
     };
     img.onerror = () => {
       if (loading) loading.textContent = 'Could not load image';
+      preloadAdjacentImages();
     };
     img.src = url;
     // If the browser cached it, onload may not fire late — show now.
     if (img.complete && img.naturalWidth > 0) {
       img.hidden = false;
       if (loading) loading.style.display = 'none';
+      preloadAdjacentImages();
     }
+  }
+
+  async function preloadDriveImage(index, item) {
+    if (index < 0 || index >= items.length || !item || resolvedSrc.has(index) || item.objectUrl || !item.fileId) return;
+    try {
+      const token = await window.Auth.getAccessToken();
+      const res = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${item.fileId}?alt=media&supportsAllDrives=true`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      if (!resolvedSrc.has(index)) resolvedSrc.set(index, url);
+      else try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+    } catch (err) {
+      // ignore preload failures
+    }
+  }
+
+  function preloadAdjacentImages() {
+    preloadDriveImage(idx - 1, items[idx - 1]).catch(() => {});
+    preloadDriveImage(idx + 1, items[idx + 1]).catch(() => {});
   }
 
   async function downloadCurrent() {

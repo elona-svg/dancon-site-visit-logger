@@ -2936,12 +2936,22 @@
   function attachThumbInteractions(strip) {
     strip.querySelectorAll('.thumb').forEach((thumbEl) => {
       const key = thumbEl.dataset.thumbKey;
-      thumbEl.addEventListener('pointerdown', () => {
+      let startX = 0;
+      let startY = 0;
+      thumbEl.addEventListener('pointerdown', (ev) => {
         clearLongPress();
+        startX = ev.clientX;
+        startY = ev.clientY;
         lpTimer = setTimeout(() => {
           lpSuppressClick = true;
           if (!thumbSelectMode) enterThumbSelectMode(key);
         }, 500);
+      });
+      thumbEl.addEventListener('pointermove', (ev) => {
+        if (!lpTimer) return;
+        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) > 10) {
+          clearLongPress();
+        }
       });
       ['pointerup', 'pointercancel', 'pointerleave'].forEach((evt) => {
         thumbEl.addEventListener(evt, clearLongPress);

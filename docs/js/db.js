@@ -91,7 +91,7 @@ window.DB = (function () {
     const all = await queueAll();
     const now = Date.now();
     return all.filter((i) =>
-      (i.status === 'pending' || i.status === 'error') &&
+      (i.status === 'pending' || i.status === 'queued' || i.status === 'error') &&
       (!i.nextAttemptAt || i.nextAttemptAt <= now)
     );
   }
