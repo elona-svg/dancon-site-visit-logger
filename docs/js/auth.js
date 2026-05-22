@@ -102,7 +102,6 @@ window.Auth = (function () {
     const expiresIn = tokenExpiresAt - now;
     return expiresIn > TOKEN_REFRESH_CUSHION_MS;
   }
-  }
 
   // ---- Persistence ------------------------------------------------------
   function lsGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
