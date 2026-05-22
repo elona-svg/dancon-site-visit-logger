@@ -8,6 +8,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Site Visit">
   <meta name="application-name" content="Site Visit">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta name="theme-color" content="#1a1a2e">
   <link rel="manifest" href="manifest.json">
   <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
@@ -40,24 +41,29 @@
   <script>
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('service-worker.js').then((reg) => {
-          // Detect when a new SW finishes installing/activating in the
-          // background and surface a tap-to-refresh banner. The new SW
-          // uses skipWaiting + clients.claim so by the time `activated`
-          // fires it's already controlling this page.
+        const swUrl = 'service-worker.js?v=v49';
+        navigator.serviceWorker.register(swUrl).then((reg) => {
+          const notifyUpdate = () => {
+            if (window.UI && typeof window.UI.showUpdateBanner === 'function') {
+              window.UI.showUpdateBanner('App updated — tap to refresh');
+            }
+          };
           const watch = (worker) => {
             if (!worker) return;
+            if (worker.state === 'activated' && navigator.serviceWorker.controller) notifyUpdate();
             worker.addEventListener('statechange', () => {
               console.log('[sw] new worker state →', worker.state);
-              if (worker.state === 'activated' && navigator.serviceWorker.controller) {
-                if (window.UI && typeof window.UI.showUpdateBanner === 'function') {
-                  window.UI.showUpdateBanner();
-                }
-              }
+              if (worker.state === 'activated' && navigator.serviceWorker.controller) notifyUpdate();
             });
           };
           if (reg.waiting) watch(reg.waiting);
           reg.addEventListener('updatefound', () => watch(reg.installing));
+          navigator.serviceWorker.addEventListener('controllerchange', () => {
+            notifyUpdate();
+          });
+          // Actively check for a new SW on every launch so CACHE_VERSION bumps
+          // are discovered immediately instead of waiting passively.
+          reg.update().catch(() => {});
           // Poll every 30 min while the app stays open — covers techs
           // who keep the PWA running all day.
           setInterval(() => { reg.update().catch(() => {}); }, 30 * 60 * 1000);

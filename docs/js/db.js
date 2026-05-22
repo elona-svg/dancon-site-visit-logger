@@ -54,13 +54,14 @@ window.DB = (function () {
   // ---- Upload queue ----
   // Item shape: { id, projectId, projectName, fileName, mimeType, blob,
   //               status: 'pending'|'uploading'|'success'|'error',
-  //               attempts, lastError, createdAt, kind, meta }
+  //               attempts, lastError, nextAttemptAt, createdAt, kind, meta }
   async function queueAdd(item) {
     const store = await tx('uploadQueue', 'readwrite');
     const toSave = {
       ...item,
       status: item.status || 'pending',
       attempts: item.attempts || 0,
+      nextAttemptAt: item.nextAttemptAt || 0,
       createdAt: item.createdAt || Date.now()
     };
     const id = await reqToPromise(store.add(toSave));
@@ -88,7 +89,11 @@ window.DB = (function () {
 
   async function queuePending() {
     const all = await queueAll();
-    return all.filter((i) => i.status === 'pending' || i.status === 'error');
+    const now = Date.now();
+    return all.filter((i) =>
+      (i.status === 'pending' || i.status === 'error') &&
+      (!i.nextAttemptAt || i.nextAttemptAt <= now)
+    );
   }
 
   async function queueClearSuccess() {

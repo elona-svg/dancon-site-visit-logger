@@ -22,7 +22,7 @@
 
   const { escapeHtml, fmtTimestampForFilename, fmtDateTime, fmtBytes, fmtRelative, toast } = UI;
 
-  const MAX_CONCURRENT_UPLOADS = 3;
+  const MAX_CONCURRENT_UPLOADS = 1;
 
   const state = {
     user: null,
@@ -744,6 +744,10 @@
       const cached = await window.DB.kvGet(`notesFileId:${id}`);
       if (cached) state.notesFileId = cached;
     } catch { /* ignore */ }
+
+    // Load any locally saved pending uploads from IndexedDB before the
+    // Drive fetch so pending captures persist across restarts.
+    await loadPendingQueueThumbs(id);
 
     // Cache-first project page: paint thumbs from IDB before kicking off
     // the live Drive fetch. The first-paint target is <200ms.
@@ -1521,17 +1525,29 @@
       blob,
       kind,
       status: 'pending',
-      attempts: 0
+      attempts: 0,
+      nextAttemptAt: 0
     });
     console.log('[capture] queued id=', item.id);
 
-    const previewUrl = (kind === 'photo' || kind === 'video' || kind === 'audio')
-      ? URL.createObjectURL(blob)
-      : null;
+    const src = kind === 'video'
+      ? await createVideoThumbnail(blob)
+      : URL.createObjectURL(blob);
+    if (kind === 'photo' && window.UI?.saveBlobLocally) {
+      window.UI.saveBlobLocally(blob, fileName).catch((err) => {
+        console.warn('[capture] local backup failed:', err);
+      });
+    }
+    if (kind === 'video') {
+      window.UI.saveBlobLocally(blob, fileName).catch((err) => {
+        console.warn('[capture] local backup failed:', err);
+      });
+    }
+
     const thumb = {
       type: kind,
-      src: previewUrl,
-      objectUrl: previewUrl,
+      src,
+      objectUrl: src && kind !== 'video' ? src : null,
       name: fileName,
       mime,
       size: blob.size,
@@ -1551,6 +1567,103 @@
     if (!t) return;
     Object.assign(t, patch);
     updateThumbsDOM();
+  }
+
+  function computeRetryDelay(attempts) {
+    const base = window.CONFIG.RETRY_BASE_DELAY || 2000;
+    const maxDelay = window.CONFIG.RETRY_MAX_DELAY || 60000;
+    return Math.min(maxDelay, base * 2 ** Math.max(0, attempts - 1));
+  }
+
+  async function createVideoThumbnail(blob) {
+    if (!blob) return null;
+    const url = URL.createObjectURL(blob);
+    const video = document.createElement('video');
+    video.style.position = 'fixed';
+    video.style.left = '-9999px';
+    video.style.width = '1px';
+    video.style.height = '1px';
+    video.preload = 'metadata';
+    video.muted = true;
+    video.playsInline = true;
+    video.setAttribute('playsinline', '');
+    video.setAttribute('webkit-playsinline', '');
+    document.body.appendChild(video);
+
+    const cleanupVideo = () => {
+      try { video.remove(); } catch (e) { /* ignore */ }
+      try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+    };
+
+    try {
+      await new Promise((resolve, reject) => {
+        const onLoadedMetadata = () => resolve();
+        const onError = () => reject(new Error('Video load failed'));
+        video.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
+        video.addEventListener('error', onError, { once: true });
+        video.src = url;
+        video.load();
+      });
+
+      const duration = Number.isFinite(video.duration) && video.duration > 0
+        ? Math.min(1, Math.max(0.1, video.duration - 0.1))
+        : 0.1;
+      const seekSucceeded = await new Promise((resolve) => {
+        let resolved = false;
+        const onSeeked = () => { resolved = true; cleanup(); resolve(true); };
+        const onError = () => { resolved = true; cleanup(); resolve(false); };
+        const timeout = setTimeout(() => { if (!resolved) { cleanup(); resolve(false); } }, 4000);
+        function cleanup() {
+          clearTimeout(timeout);
+          video.removeEventListener('seeked', onSeeked);
+          video.removeEventListener('error', onError);
+        }
+        video.addEventListener('seeked', onSeeked, { once: true });
+        video.addEventListener('error', onError, { once: true });
+        try { video.currentTime = duration; } catch (e) { cleanup(); resolve(false); }
+      });
+
+      if (!seekSucceeded) {
+        console.warn('[thumb] video seek failed, falling back to play/pause');
+        await new Promise((resolve, reject) => {
+          const onLoadedData = async () => {
+            try {
+              await video.play();
+              video.pause();
+              resolve();
+            } catch (err) {
+              reject(err);
+            }
+          };
+          const onError = () => reject(new Error('Video play fallback failed'));
+          const timeout = setTimeout(() => reject(new Error('Video play fallback timed out')), 5000);
+          function cleanup() {
+            clearTimeout(timeout);
+            video.removeEventListener('loadeddata', onLoadedData);
+            video.removeEventListener('error', onError);
+          }
+          video.addEventListener('loadeddata', onLoadedData, { once: true });
+          video.addEventListener('error', onError, { once: true });
+          if (video.readyState >= 2) onLoadedData();
+        });
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(320, video.videoWidth || 320);
+      canvas.height = Math.max(180, video.videoHeight || 180);
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
+      return canvas.toDataURL('image/jpeg', 0.8);
+    } catch (err) {
+      console.warn('[thumb] video preview failed:', err);
+      return null;
+    } finally {
+      cleanupVideo();
+    }
   }
 
   async function pumpQueue() {
@@ -1605,12 +1718,19 @@
       } catch (err) {
         console.error('[upload] failed id=', item.id, err);
         const attempts = (item.attempts || 0) + 1;
+        const delay = computeRetryDelay(attempts);
         await window.DB.queueUpdate(item.id, {
           status: 'error',
           attempts,
-          lastError: err.message || String(err)
+          lastError: err.message || String(err),
+          nextAttemptAt: Date.now() + delay
         });
-        patchThumbByQueueId(item.id, { status: 'failed', error: err.message || String(err) });
+        patchThumbByQueueId(item.id, {
+          status: 'pending',
+          error: err.message || String(err),
+          nextAttemptAt: Date.now() + delay
+        });
+        toast('Upload failed, will retry automatically when possible', 'warn', 5000);
       }
     })().finally(() => {
       inflight.delete(item.id);
@@ -1621,9 +1741,46 @@
 
   async function retryThumb(queueId) {
     if (inflight.has(queueId)) return;
-    await window.DB.queueUpdate(queueId, { status: 'pending', attempts: 0, lastError: null });
-    patchThumbByQueueId(queueId, { status: 'queued', progress: 0, error: null });
+    await window.DB.queueUpdate(queueId, { status: 'pending', attempts: 0, lastError: null, nextAttemptAt: 0 });
+    patchThumbByQueueId(queueId, { status: 'queued', progress: 0, error: null, nextAttemptAt: 0 });
     pumpQueue();
+  }
+
+  async function loadPendingQueueThumbs(folderId) {
+    try {
+      const all = await window.DB.queueAll();
+      const pending = all.filter((item) => item.projectId === folderId);
+      if (pending.length === 0) return;
+      const thumbs = await Promise.all(pending.map(async (item) => {
+        if (!item.blob) return null;
+        const src = item.kind === 'photo'
+          ? URL.createObjectURL(item.blob)
+          : item.kind === 'video'
+            ? await createVideoThumbnail(item.blob)
+            : null;
+        return {
+          type: item.kind,
+          src,
+          objectUrl: item.kind === 'photo' ? src : null,
+          name: item.fileName,
+          mime: item.mimeType,
+          size: item.blob.size || 0,
+          status: item.status === 'queued' || item.status === 'pending' || item.status === 'error' || item.status === 'uploading'
+            ? 'pending'
+            : item.status,
+          progress: 0,
+          queueId: item.id,
+          addedAt: item.createdAt || Date.now(),
+          durationMs: item.durationMs || null,
+          error: item.lastError || null,
+          nextAttemptAt: item.nextAttemptAt || 0
+        };
+      }));
+      state.thumbs = [...thumbs.filter(Boolean), ...state.thumbs];
+      updateThumbsDOM();
+    } catch (err) {
+      console.warn('[queue] load pending thumbs failed:', err);
+    }
   }
 
   // ---------- Project media (thumbs + notes) ----------
@@ -2037,7 +2194,7 @@
     });
   }
 
-  async function deleteThumb(thumb) {
+  async function deleteThumb(thumb, { suppressToast = false } = {}) {
     if (!thumb) return;
     // If a voice/video is currently playing through VideoPlayer or any
     // <audio> element holds this blob, stop it before deleting so the
@@ -2083,6 +2240,7 @@
     const idx = state.thumbs.indexOf(thumb);
     if (idx >= 0) state.thumbs.splice(idx, 1);
     revokeThumbBlob(thumb);
+    if (!suppressToast) toast('Deleted', 'success');
 
     // Persistent cache: remove the deleted file (and its transcript, if
     // any) from project.{folderId}.cache so the next cache-first paint
@@ -2253,6 +2411,7 @@
         <button id="signin-btn" class="btn-signin">Sign in with Google</button>
         <div id="login-error" class="login-error" role="alert" hidden></div>
         <p class="login-fineprint">Only @${escapeHtml(window.CONFIG.HOSTED_DOMAIN)} accounts can sign in.</p>
+        <p class="login-hint">If you are already signed in to Google, this should be a one-tap sign-in without typing your email.</p>
         <div id="login-debug-log" class="login-debug-log" hidden>
           <div class="login-debug-log-header">
             <span class="login-debug-log-title">Debug log</span>
@@ -2409,6 +2568,7 @@
 
         <main class="capture-main">
           <div class="gps-row" id="gps-row"></div>
+          <div class="queue-row" id="local-queue-indicator"></div>
 
           <button class="open-camera-btn" id="open-cam-btn">
             <svg class="open-camera-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -2439,6 +2599,7 @@
               <span id="thumbs-sync" class="sync-dot" hidden aria-label="Syncing"></span>
               <div class="sort-wrap">
                 <button class="sort-btn" id="sort-btn" type="button" aria-haspopup="true">↕ ${escapeHtml(sortLabel())}</button>
+                <button class="btn-ghost" id="retry-all-btn" type="button" hidden>Retry All Failed</button>
                 <div class="sort-popover" id="sort-popover" hidden>
                   <button data-sort="date" type="button">Date (newest first)</button>
                   <button data-sort="type" type="button">Type</button>
@@ -2476,6 +2637,8 @@
       uploadBtn.addEventListener('click', () => uploadInput.click());
       uploadInput.addEventListener('change', onUploadPhotosChange);
     }
+    const retryAll = document.getElementById('retry-all-btn');
+    if (retryAll) retryAll.addEventListener('click', retryAllFailed);
     document.getElementById('voice-btn').addEventListener('click', startVoiceNote);
     document.getElementById('save-note-btn').addEventListener('click', saveNote);
     document.getElementById('cancel-edit-btn').addEventListener('click', cancelEditNote);
@@ -2541,8 +2704,19 @@
   }
   function updateCaptureTopbar() {
     const off = document.getElementById('cap-offline');
-    if (!off) return;
-    off.innerHTML = state.isOnline ? '' : '<span class="badge offline">offline</span>';
+    if (off) off.innerHTML = state.isOnline ? '' : '<span class="badge offline">offline</span>';
+    updateLocalQueueIndicatorDOM();
+  }
+
+  function updateLocalQueueIndicatorDOM() {
+    const el = document.getElementById('local-queue-indicator');
+    if (!el) return;
+    const pending = state.thumbs.filter((t) => t.status === 'pending' || t.status === 'failed' || t.status === 'queued').length;
+    if (pending === 0) {
+      el.innerHTML = '';
+      return;
+    }
+    el.innerHTML = `<span class="badge">${pending} local capture${pending === 1 ? '' : 's'} pending upload</span>`;
   }
   function updateOnlineBadges() {
     if (renderedFlag === 'home') updateHomeTopbar();
@@ -2728,7 +2902,7 @@
       .map((k) => state.thumbs[thumbKeyToIndex(k)])
       .filter(Boolean);
     const deletedIds = new Set(targets.map((t) => t.fileId).filter(Boolean));
-    await Promise.all(targets.map((t) => deleteThumb(t).catch((e) => {
+    await Promise.all(targets.map((t) => deleteThumb(t, { suppressToast: true }).catch((e) => {
       console.warn('[bulk-delete] thumb delete failed:', e && e.message);
     })));
     // Concurrent per-thumb cache writes can race (read-modify-write). Do
@@ -2736,6 +2910,7 @@
     // deletion regardless of interleaving.
     await reconcileCacheAfterBulkDelete(deletedIds);
     exitThumbSelectMode();
+    toast(`Deleted ${targets.length} file${targets.length === 1 ? '' : 's'}`, 'success');
   }
 
   async function reconcileCacheAfterBulkDelete(deletedIds) {
@@ -2836,10 +3011,31 @@
     });
 
     attachThumbInteractions(strip);
+    updateRetryAllButtonDOM();
+    updateLocalQueueIndicatorDOM();
+  }
+
+  function updateRetryAllButtonDOM() {
+    const btn = document.getElementById('retry-all-btn');
+    if (!btn) return;
+    const hasPending = state.thumbs.some((t) => t.status === 'pending' || t.status === 'failed');
+    btn.hidden = !hasPending;
+  }
+
+  async function retryAllFailed() {
+    const targets = state.thumbs.filter((t) => t.status === 'pending' || t.status === 'failed');
+    if (targets.length === 0) return;
+    await Promise.all(targets.map(async (t) => {
+      if (!t.queueId) return;
+      await retryThumb(t.queueId).catch((err) => {
+        console.warn('[retry-all] failed to reset', t.queueId, err);
+      });
+    }));
+    toast(`Retrying ${targets.length} upload${targets.length === 1 ? '' : 's'}`, 'info', 3000);
   }
 
   function thumbHtml(t, idx) {
-    const cls = t.status === 'success' ? '' : (t.status === 'failed' ? 'failed' : 'queued');
+    const cls = t.status === 'success' ? '' : (t.status === 'pending' || t.status === 'failed' ? 'pending' : 'queued');
     const showProgress = t.status === 'uploading' || t.status === 'queued';
     const pct = Math.round((t.progress || 0) * 100);
     const key = escapeHtml(String(t.queueId ?? t.fileId ?? `thumb-${idx}`));
@@ -2851,7 +3047,9 @@
         ? `<img loading="lazy" alt="" src="${escapeHtml(t.src)}" onerror="this.style.display='none'"/>`
         : '';
     } else if (t.type === 'video') {
-      bgHtml = `<div class="thumb-icon">▶</div>`;
+      bgHtml = t.src
+        ? `<div class="thumb-video-bg"><img loading="lazy" alt="Video preview" src="${escapeHtml(t.src)}" onerror="this.style.display='none'"/><div class="thumb-icon">▶</div></div>`
+        : `<div class="thumb-icon">▶</div>`;
     } else if (t.type === 'audio') {
       const time = parseTimeFromFilename(t.name);
       const dur = formatDuration(t.durationMs);
@@ -2865,7 +3063,8 @@
     }
 
     let stateHtml = '';
-    if (t.status === 'failed') stateHtml = '<span class="thumb-state">Failed</span>';
+    if (t.status === 'failed') stateHtml = '<span class="thumb-state">Pending upload</span>';
+    else if (t.status === 'pending') stateHtml = '<span class="thumb-state">Pending upload</span>';
     else if (t.status === 'queued') stateHtml = '<span class="thumb-state">Queued</span>';
     else if (t.status === 'uploading') stateHtml = `<span class="thumb-state">${pct}%</span>`;
 

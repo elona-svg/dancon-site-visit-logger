@@ -1,5 +1,6 @@
 // Bump CACHE_VERSION on every release to invalidate stale shells.
-const CACHE_VERSION = 'dancon-svl-v46';
+// This file is versioned on registration to avoid stale GitHub Pages cache.
+const CACHE_VERSION = 'dancon-svl-v49';
 const APP_SHELL = [
   './',
   './index.html',
@@ -72,7 +73,6 @@ async function handleFetch(req) {
   try {
     const res = await fetch(req);
     if (res && res.ok) {
-      // Best-effort cache refresh.
       try {
         const cache = await caches.open(CACHE_VERSION);
         cache.put(req, res.clone());
@@ -83,8 +83,10 @@ async function handleFetch(req) {
     const cached = await caches.match(req);
     if (cached) return cached;
     if (req.mode === 'navigate' || req.destination === 'document') {
-      const shell = await caches.match('./index.html');
-      if (shell) return shell;
+      try {
+        const shell = await caches.match('./index.html');
+        if (shell) return shell;
+      } catch (e) { /* ignore */ }
     }
     return new Response(
       'Offline and not cached.',

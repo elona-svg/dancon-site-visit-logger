@@ -43,14 +43,10 @@ window.Auth = (function () {
   // an OAuth-fragment on the app URL and we consume it in init().
   const IS_STANDALONE = window.matchMedia('(display-mode: standalone)').matches
     || window.navigator.standalone === true;
-  // Safari (any context) blocks/strips the OAuth popup callback the same way
-  // an installed PWA does, so we route Safari through the redirect flow even
-  // when not in standalone mode. Desktop Chrome, Edge, etc. include "Safari"
-  // in their UA — the !Chrome guard excludes them. iOS Chrome uses CriOS
-  // (no "Chrome" token) and IS WebKit underneath, so it's correctly bucketed
-  // as Safari by this rule.
-  const IS_SAFARI_BROWSER = /Safari/.test(navigator.userAgent) && !/Chrome/.test(navigator.userAgent);
-  const USE_REDIRECT = IS_STANDALONE || IS_SAFARI_BROWSER;
+  // Always use full-page redirect for OAuth to avoid popup blockers on iOS
+  // and other restrictive browser contexts. The redirect response is handled
+  // in init() via `consumeRedirectCallback()`.
+  const USE_REDIRECT = true;
   const OAUTH_STATE_KEY = 'auth.oauth_state';
 
   function getRedirectUri() {
@@ -98,6 +94,14 @@ window.Auth = (function () {
     lastAuthError = err || null;
     console.log('[auth] tokenStatus →', s, err ? `(${err.message || err})` : '');
     notifyChange();
+  }
+
+  function shouldSkipGisInit() {
+    if (!accessToken) return false;
+    const now = Date.now();
+    const expiresIn = tokenExpiresAt - now;
+    return expiresIn > TOKEN_REFRESH_CUSHION_MS;
+  }
   }
 
   // ---- Persistence ------------------------------------------------------
@@ -206,7 +210,10 @@ window.Auth = (function () {
     if (tokenClient) return tokenClient;
     if (tokenClientReadyPromise) return tokenClientReadyPromise;
     tokenClientReadyPromise = (async () => {
-      // Wait for the GIS script to load (up to 8s — same as before).
+      if (shouldSkipGisInit()) {
+        console.log('[auth] skipping GIS init — valid token in storage');
+        return null;
+      }
       const start = Date.now();
       while (!window.google?.accounts?.oauth2) {
         if (Date.now() - start > 8000) throw new Error('Google Identity Services failed to load');
@@ -646,7 +653,6 @@ window.Auth = (function () {
   // that case we roll back so we don't leave a half-signed-in state.
   let oneTapInitialized = false;
   function initOneTap() {
-    if (!IS_STANDALONE) return; // browser users keep popup/redirect
     if (oneTapInitialized) return;
     ensureTokenClient().then(() => {
       if (!window.google?.accounts?.id) {
@@ -654,6 +660,7 @@ window.Auth = (function () {
         return;
       }
       oneTapInitialized = true;
+      const promptParent = document.getElementById('signin-btn');
       window.google.accounts.id.initialize({
         client_id: window.CONFIG.CLIENT_ID,
         callback: async (credentialResponse) => {
@@ -672,9 +679,6 @@ window.Auth = (function () {
             };
             user = candidateUser;
             await persistUser();
-            // Silent access-token grant. May fail in restricted PWA
-            // contexts — if so, roll back so the app doesn't sit in a
-            // half-signed-in state with no Drive token.
             await getAccessToken(true);
             setTokenStatus('valid');
             notifyChange();
@@ -687,7 +691,10 @@ window.Auth = (function () {
           }
         },
         hosted_domain: window.CONFIG.HOSTED_DOMAIN,
-        use_fedcm_for_prompt: true
+        use_fedcm_for_prompt: true,
+        auto_select: true,
+        cancel_on_tap_outside: false,
+        prompt_parent_id: promptParent ? 'signin-btn' : undefined
       });
       try { window.google.accounts.id.prompt(); }
       catch (e) { console.warn('[auth] One Tap prompt threw:', e.message); }

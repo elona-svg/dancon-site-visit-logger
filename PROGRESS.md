@@ -8,7 +8,7 @@
 Update this file at the end of every working session so the next session
 can pick up exactly where this one stopped.
 
-## Current state (2026-05-02)
+## Current state (2026-05-22)
 
 - Mobile-first PWA, installable to iPhone home screen.
 - Google OAuth (GIS implicit flow), `@danconservices.com` only.
@@ -32,8 +32,9 @@ can pick up exactly where this one stopped.
   the mic). Verbose `[voice]` logging in the console for debugging.
 
 ### Uploads
-- IndexedDB-backed queue. Up to 3 parallel uploads with per-thumb
-  progress + percentage, retry button on failure.
+- Offline-first indexedDB-backed local queue. Captured photos/videos are saved locally immediately and persist across app restarts.
+- Sequential single-file upload pipeline with per-thumb progress; items are only removed from local storage after confirmed Drive upload success.
+- Auto-retry on reconnect, with pending/queued status shown instead of a hard "Failed" state.
 - Multipart + resumable both XHR-based for upload progress; 401 mid-
   upload triggers a silent token refresh + single retry inside the
   helper.
@@ -61,6 +62,33 @@ can pick up exactly where this one stopped.
 - Permission preflight: camera + mic asked **once** at first sign-in
   via a friendly card → single `getUserMedia({video,audio})` call;
   result cached in IDB so we never re-ask.
+- Login now uses a redirect-based Google OAuth flow instead of a popup,
+  avoiding iOS popup blocker prompts and returning to the app via PKCE.
+
+### Recently shipped — Offline-first reliability (SW v48)
+- **Video thumbnail frames**. Fixed frame extraction by explicitly waiting
+  for seeked events before canvas draw, with black fill background for
+  safety. Extracts frame at up to 1 second instead of blurry black.
+- **Offline app load**. Service worker now properly caches and serves
+  `index.html` for navigation requests so the app loads completely offline.
+- **Auth skips GIS when token valid**. `ensureTokenClient()` now checks if
+  a cached token is fresh (>2min remaining) and skips loading GIS entirely,
+  saving ~3s on startup when user is already logged in with a valid token.
+- **Camera reconnect prompt once-per-session**. The "Camera needs to reconnect"
+  message now only shows once per app open, preventing spam if the tech
+  tries to open the camera multiple times. It no longer resets when the
+  camera overlay closes, so it only appears for the actual iOS wake-from-idle bug.
+- **Bulk delete toast consolidation**. Deleting multiple files now shows a
+  single "X files deleted" success toast instead of one toast per file.
+- **Update banner is the only refresh action needed**. The SW update
+  banner now clearly says "App updated — tap to refresh" and reloads the app
+  when tapped.
+- **GitHub Pages cache-busting**. `index.html` now includes a no-cache
+  meta tag, and the service worker is registered with a versioned URL so
+  `service-worker.js` avoids stale GitHub Pages caching.
+- **Deploy process**. After code changes in VS Code, commit and push to
+  `main`; GitHub Pages serves `docs/` from the repo root, so every push to
+  `main` updates the live site after GitHub Pages rebuilds.
 
 ## Known follow-ups / nice-to-haves
 - (none open at the moment — see git log for the most recent changes)

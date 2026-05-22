@@ -72,6 +72,20 @@ window.UI = (function () {
     }, 1000);
   }
 
+  async function saveBlobLocally(blob, filename) {
+    if (!blob) return;
+    const file = new File([blob], filename || 'backup', { type: blob.type || 'application/octet-stream' });
+    if (navigator.canShare?.({ files: [file] }) && navigator.share) {
+      try {
+        await navigator.share({ files: [file], title: 'Save backup', text: 'Save this capture to your device.' });
+        return;
+      } catch (err) {
+        console.warn('[ui] share fallback failed:', err);
+      }
+    }
+    downloadBlob(blob, filename);
+  }
+
   // Fixed banner pinned to the top of the viewport announcing a new
   // service-worker version. Tap → reload. Dismiss → hides until next
   // update cycle. Idempotent — calling twice doesn't stack banners.

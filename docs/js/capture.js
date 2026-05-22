@@ -22,6 +22,7 @@ window.Camera = (function () {
   let onCloseCb = null;
   let popstateListener = null;
   let singleShot = false;
+  let wakeBugShownInSession = false;
 
   function root() { return document.getElementById('overlay-root'); }
 
@@ -77,7 +78,7 @@ window.Camera = (function () {
 
   // releaseStream is exposed for backwards-compat; with no cache this is
   // a no-op. The local stream is stopped inside close().
-  function releaseStream() { /* no-op — no cached stream to release */ }
+  function releaseStream() { /* keep the per-session wake-bug flag intact */ }
 
   async function open(opts = {}) {
     if (isOpen) return;
@@ -353,8 +354,14 @@ window.Camera = (function () {
   // Distinct from showDenied — used when navigator.permissions.query said
   // 'granted' but getUserMedia still threw NotAllowedError. That's the
   // known iOS Safari wake-from-idle bug; no settings change will fix it,
-  // closing and reopening the app does.
+  // closing and reopening the app does. Only show once per session.
   function showWakeBug() {
+    if (wakeBugShownInSession) {
+      console.log('[camera] wake bug already shown in session, skipping');
+      close();
+      return;
+    }
+    wakeBugShownInSession = true;
     const errBox = document.getElementById('cam-fs-error');
     if (!errBox) return;
     errBox.hidden = false;
