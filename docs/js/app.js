@@ -144,6 +144,83 @@
     }
   }
 
+  // Best-effort re-encode of a video Blob using captureStream + MediaRecorder.
+  // Returns { blob, mime } on success or null on failure. This is a
+  // heuristic fallback — if the browser cannot capture/record we return null.
+  async function reencodeVideoBlob(srcBlob) {
+    if (!srcBlob || !window.MediaRecorder) return null;
+    const MAX_REENCODE_BYTES = 150 * 1024 * 1024; // avoid huge transcodes
+    try {
+      if (srcBlob.size && srcBlob.size > MAX_REENCODE_BYTES) return null;
+      const url = URL.createObjectURL(srcBlob);
+      const video = document.createElement('video');
+      video.style.position = 'fixed';
+      video.style.left = '-9999px';
+      video.preload = 'metadata';
+      video.muted = true;
+      video.playsInline = true;
+      video.setAttribute('playsinline', '');
+      video.src = url;
+      document.body.appendChild(video);
+
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('reencode: metadata timeout')), 5000);
+        video.addEventListener('loadedmetadata', () => { clearTimeout(t); resolve(); }, { once: true });
+        video.addEventListener('error', () => { clearTimeout(t); reject(new Error('reencode: video load error')); }, { once: true });
+      });
+
+      const duration = Number.isFinite(video.duration) ? video.duration : 0;
+      if (duration > 600) { // skip very long videos
+        try { video.remove(); } catch (e) {} try { URL.revokeObjectURL(url); } catch (e) {}
+        return null;
+      }
+
+      const stream = video.captureStream ? video.captureStream() : null;
+      if (!stream) {
+        try { video.remove(); } catch (e) {} try { URL.revokeObjectURL(url); } catch (e) {}
+        return null;
+      }
+
+      let mime = '';
+      if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/mp4')) mime = 'video/mp4';
+      else if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) mime = 'video/webm;codecs=vp9';
+      else if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm')) mime = 'video/webm';
+      else mime = '';
+      if (!mime) {
+        try { video.remove(); } catch (e) {} try { URL.revokeObjectURL(url); } catch (e) {}
+        return null;
+      }
+
+      const recorder = new MediaRecorder(stream, { mimeType: mime });
+      const chunks = [];
+      recorder.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+
+      const stopped = new Promise((resolve) => { recorder.onstop = resolve; });
+
+      recorder.start(1000);
+      try { await video.play(); } catch (e) { /* continue; playback may be auto-blocked but capture may still run */ }
+
+      // Wait for video to end or timeout (duration + 5s)
+      await Promise.race([
+        new Promise((res) => video.addEventListener('ended', res, { once: true })),
+        new Promise((res, rej) => setTimeout(() => rej(new Error('reencode: timeout')), Math.max(20000, (duration + 5) * 1000)))
+      ]).catch((e) => {
+        // stop recorder if timeout
+      });
+
+      try { recorder.stop(); } catch (e) {}
+      await stopped;
+      const outBlob = new Blob(chunks, { type: mime });
+      try { video.remove(); } catch (e) {}
+      try { URL.revokeObjectURL(url); } catch (e) {}
+      if (outBlob.size === 0) return null;
+      return { blob: outBlob, mime };
+    } catch (err) {
+      console.warn('[reencode] failed:', err && err.message);
+      return null;
+    }
+  }
+
   // Network / lifecycle
   window.addEventListener('online', () => {
     state.isOnline = true;
@@ -1214,6 +1291,8 @@
     if (mime.startsWith('image/')) return mime.split('/')[1].split(';')[0] || 'img';
     if (mime.startsWith('video/mp4')) return 'mp4';
     if (mime.startsWith('video/webm')) return 'webm';
+    if (mime.startsWith('video/quicktime')) return 'mov';
+    if (mime.startsWith('video/3gpp')) return '3gp';
     if (mime.startsWith('audio/mp4')) return 'm4a';
     if (mime.startsWith('audio/webm')) return 'webm';
     if (mime.startsWith('audio/')) return mime.split('/')[1].split(';')[0] || 'aud';
@@ -1480,13 +1559,26 @@
     }
     toast(`Importing ${files.length} ${files.length === 1 ? 'file' : 'files'}…`, 'info', 2500);
     for (const file of files) {
-      const mime = file.type || '';
-      const kind = mime.startsWith('image/') ? 'photo'
+      let mime = file.type || '';
+      let kind = mime.startsWith('image/') ? 'photo'
         : mime.startsWith('video/') ? 'video'
         : null;
+      const ext = (file.name || '').split('.').pop()?.toLowerCase() || '';
       if (!kind) {
-        console.warn('[import] skipping unsupported mime:', mime, file.name);
+        if (['mov', 'mp4', 'm4v', '3gp', 'avi', 'hevc', 'heif'].includes(ext)) {
+          kind = 'video';
+          if (!mime) mime = ext === 'mov' ? 'video/quicktime' : `video/${ext}`;
+        } else if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic'].includes(ext)) {
+          kind = 'photo';
+          if (!mime) mime = `image/${ext === 'jpg' ? 'jpeg' : ext}`;
+        }
+      }
+      if (!kind) {
+        console.warn('[import] skipping unsupported mime/extension:', mime, file.name);
         continue;
+      }
+      if (!mime) {
+        mime = kind === 'video' ? 'video/mp4' : 'image/jpeg';
       }
       try {
         await enqueueCapture(file, mime, kind);
@@ -1514,15 +1606,31 @@
       toast('Empty capture — try again', 'error');
       return;
     }
-    const ext = extFromMime(mime);
+    // For videos, attempt a best-effort re-encode to a widely supported
+    // container if the browser can produce one (MediaRecorder via
+    // captureStream). This improves cross-device playback compatibility.
+    let queuedBlob = blob;
+    let queuedMime = mime;
+    if (kind === 'video' && window.MediaRecorder && blob.size && blob.size < (100 * 1024 * 1024)) {
+      try {
+        const re = await reencodeVideoBlob(blob);
+        if (re && re.blob) {
+          queuedBlob = re.blob;
+          queuedMime = re.mime || queuedMime;
+          console.log('[capture] re-encoded video; original size=', blob.size, 'new=', queuedBlob.size);
+        }
+      } catch (e) { console.warn('[capture] re-encode failed:', e); }
+    }
+
+    const ext = extFromMime(queuedMime);
     const fileName = await nextFileName(folderId, ext);
     console.log('[capture] generated fileName=', fileName, 'ext=', ext);
     const item = await window.DB.queueAdd({
       projectId: folderId,
       projectName: folderName,
       fileName,
-      mimeType: mime,
-      blob,
+      mimeType: queuedMime,
+      blob: queuedBlob,
       kind,
       status: 'pending',
       attempts: 0,
@@ -1530,9 +1638,13 @@
     });
     console.log('[capture] queued id=', item.id);
 
-    const src = kind === 'video'
-      ? await createVideoThumbnail(blob)
-      : URL.createObjectURL(blob);
+    let src;
+    if (kind === 'video') {
+      src = await createVideoThumbnail(queuedBlob);
+      if (!src) src = URL.createObjectURL(queuedBlob);
+    } else {
+      src = URL.createObjectURL(queuedBlob);
+    }
     if (kind === 'photo' && window.UI?.saveBlobLocally) {
       window.UI.saveBlobLocally(blob, fileName).catch((err) => {
         console.warn('[capture] local backup failed:', err);
@@ -1548,11 +1660,11 @@
       type: kind,
       src,
       objectUrl: kind === 'video'
-        ? URL.createObjectURL(blob)
+        ? URL.createObjectURL(queuedBlob)
         : src,
       name: fileName,
-      mime,
-      size: blob.size,
+      mime: queuedMime,
+      size: queuedBlob.size,
       status: 'queued',
       progress: 0,
       queueId: item.id,
@@ -2083,28 +2195,31 @@
     if (!target) return;
 
     if (target.type === 'video' || target.type === 'audio') {
-      const kind = target.type;
-      // For files captured in this session we hand over the live blob URL
-      // directly. For everything else we let VideoPlayer fetch from Drive
-      // by fileId — that's the only reliable cross-browser path for
-      // auth'd Drive content.
-      const opts = {
-        kind,
-        name: target.name,
-        onClose: () => {},
-        onDelete: async () => { await deleteThumb(target); }
-      };
-      if (target.objectUrl && itemAlive(target)) {
-        opts.src = target.objectUrl;
-      } else if (target.fileId) {
-        opts.fileId = target.fileId;
-      } else {
-        toast(target.status === 'failed'
-          ? 'Upload failed — tap retry on the thumbnail'
-          : 'Wait for upload to finish', 'warn');
-        return;
-      }
-      window.VideoPlayer.open(opts);
+      // Build a navigation list of all video/audio items so the player
+      // can offer prev/next navigation. Each item may supply a local
+      // `objectUrl` or we try to recover the stored blob from IndexedDB.
+      const media = state.thumbs.filter((t) => t.type === 'video' || t.type === 'audio');
+      const startIndex = media.findIndex((m) => m === target);
+      const items = await Promise.all(media.map(async (t) => {
+        const it = {
+          kind: t.type,
+          name: t.name,
+          fileId: t.fileId || null,
+          src: t.objectUrl || null,
+          queueId: t.queueId || null,
+          thumbRef: t
+        };
+        if (!it.src && it.queueId) {
+          try {
+            const all = await window.DB.queueAll();
+            const q = all.find((i) => i.id === it.queueId);
+            if (q && q.blob) it.src = URL.createObjectURL(q.blob);
+          } catch (e) { /* ignore */ }
+        }
+        return it;
+      }));
+      if (startIndex < 0) return;
+      window.VideoPlayer.open({ items, startIndex, onDelete: async (item) => { await deleteThumb(item.thumbRef); } });
       return;
     }
 
@@ -2591,7 +2706,7 @@
             <span>Upload from Photos</span>
           </button>
           <input type="file" id="upload-photos-input"
-                 accept="image/*,video/*" multiple
+                 accept="image/*,video/*,.mov" multiple
                  style="display:none" aria-hidden="true" />
           <input type="file" id="open-cam-fallback-input"
                  accept="image/*,video/*" capture="environment"

@@ -16,6 +16,8 @@ window.VideoPlayer = (function () {
   let closing = false;
   let onCloseCb = null;
   let onDeleteCb = null;
+  let items = null;
+  let idx = 0;
   let popstateListener = null;
   let touchStartY = 0;
   let touchStartT = 0;
@@ -31,16 +33,20 @@ window.VideoPlayer = (function () {
   // closes the player, and invokes the callback (caller does the actual delete).
   function open(opts) {
     if (isOpen) close();
-    console.log('[vplayer] onDelete provided:', !!opts.onDelete);
     isOpen = true;
     closing = false;
+    // Support either a single `opts` or an `items` list + startIndex
+    items = opts.items || (opts ? [opts] : []);
+    idx = Number.isFinite(opts.startIndex) ? opts.startIndex : 0;
     onCloseCb = opts.onClose || null;
     onDeleteCb = opts.onDelete || null;
 
-    const isAudio = opts.kind === 'audio';
+    const isAudio = items && items[idx] && items[idx].kind === 'audio';
     document.body.classList.add('camera-fs-open');
     root().innerHTML = `
       <div class="vplayer-overlay ${isAudio ? 'audio' : ''}" id="vplayer">
+        <button class="viewer-arrow left vplayer-prev" id="vp-prev" aria-label="Previous">‹</button>
+        <button class="viewer-arrow right vplayer-next" id="vp-next" aria-label="Next">›</button>
         <button class="cam-fs-icon vplayer-close" id="vp-close" aria-label="Close">✕</button>
         <button class="vw-download-btn" id="vp-dl" aria-label="Save to device" title="Save to device">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -66,7 +72,7 @@ window.VideoPlayer = (function () {
           </div>
           <div class="vplayer-media-wrap" id="vp-media-wrap" hidden></div>
         </div>
-        <div class="vplayer-name">${escapeHtml(opts.name || '')}</div>
+        <div class="vplayer-name" id="vp-name">${escapeHtml((items && items[idx] && items[idx].name) || '')}</div>
       </div>
     `;
 
@@ -75,15 +81,17 @@ window.VideoPlayer = (function () {
     window.addEventListener('popstate', popstateListener);
 
     document.getElementById('vp-close').addEventListener('click', () => close());
-    document.getElementById('vp-retry').addEventListener('click', () => loadAndPlay(opts));
-    document.getElementById('vp-dl').addEventListener('click', () => downloadCurrent(opts));
+    document.getElementById('vp-retry').addEventListener('click', () => loadAndPlay(getCurrentOpts()));
+    document.getElementById('vp-dl').addEventListener('click', () => downloadCurrent(getCurrentOpts()));
     document.getElementById('vp-del')?.addEventListener('click', () => {
       if (!onDeleteCb) return;
       if (!confirm('Delete this file?')) return;
       const cb = onDeleteCb;
       close();
-      try { cb(); } catch (e) { console.error('[vplayer] onDelete threw:', e); }
+      try { cb(items && items[idx]); } catch (e) { console.error('[vplayer] onDelete threw:', e); }
     });
+    document.getElementById('vp-prev')?.addEventListener('click', () => { navigate(-1); });
+    document.getElementById('vp-next')?.addEventListener('click', () => { navigate(1); });
     const overlay = document.getElementById('vplayer');
     overlay.addEventListener('click', (ev) => {
       if (ev.target.id === 'vplayer' || ev.target.id === 'vp-stage') close();
@@ -92,7 +100,25 @@ window.VideoPlayer = (function () {
     stage.addEventListener('touchstart', onTouchStart, { passive: true });
     stage.addEventListener('touchend', onTouchEnd, { passive: true });
 
-    loadAndPlay(opts);
+    loadAndPlay(getCurrentOpts());
+  }
+
+  function getCurrentOpts() {
+    if (!items || !items[idx]) return {};
+    const it = items[idx];
+    return { src: it.src || null, fileId: it.fileId || null, name: it.name, kind: it.kind || 'video' };
+  }
+
+  function navigate(delta) {
+    if (!items) return;
+    const next = idx + delta;
+    if (next < 0 || next >= items.length) return;
+    idx = next;
+    const nameEl = document.getElementById('vp-name');
+    if (nameEl) nameEl.textContent = items[idx].name || '';
+    // Clear any previous streamed blob
+    revokeBlob();
+    loadAndPlay(getCurrentOpts());
   }
 
   async function loadAndPlay(opts) {
@@ -259,6 +285,10 @@ window.VideoPlayer = (function () {
     }
     if (activeFetch) { try { activeFetch.abort(); } catch (e) {} activeFetch = null; }
     revokeBlob();
+
+    // clear navigation state
+    items = null;
+    idx = 0;
 
     if (popstateListener) {
       window.removeEventListener('popstate', popstateListener);
