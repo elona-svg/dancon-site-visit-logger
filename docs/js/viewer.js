@@ -16,6 +16,7 @@ window.Viewer = (function () {
   let onCloseCb = null;
   let popstateListener = null;
   let closing = false;
+  let closeCaptureListener = null;
 
   // Per-index blob-URL cache — avoids refetching when nav back-and-forth.
   const resolvedSrc = new Map(); // idx -> URL
@@ -69,6 +70,10 @@ window.Viewer = (function () {
     if (popstateListener) {
       window.removeEventListener('popstate', popstateListener);
       popstateListener = null;
+    }
+    if (closeCaptureListener) {
+      try { document.removeEventListener('pointerdown', closeCaptureListener, { capture: true }); } catch (e) { document.removeEventListener('pointerdown', closeCaptureListener); }
+      closeCaptureListener = null;
     }
     if (!opts.fromPop) {
       try { history.back(); } catch (e) { /* ignore */ }
@@ -156,7 +161,24 @@ window.Viewer = (function () {
       </div>
     `;
 
-    document.getElementById('vw-close').addEventListener('click', () => close());
+    document.getElementById('vw-close').addEventListener('click', (ev) => { ev.stopPropagation(); close(); });
+    // Robust close: capture pointerdown anywhere and if it intersects the
+    // close button bounds, close immediately. This ensures the X always
+    // works even if other overlays or toasts are present.
+    closeCaptureListener = (ev) => {
+      try {
+        const btn = document.getElementById('vw-close');
+        if (!btn) return;
+        const r = btn.getBoundingClientRect();
+        const clientX = (ev.clientX != null) ? ev.clientX : (ev.touches && ev.touches[0] && ev.touches[0].clientX);
+        const clientY = (ev.clientY != null) ? ev.clientY : (ev.touches && ev.touches[0] && ev.touches[0].clientY);
+        if (clientX == null || clientY == null) return;
+        if (clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom) {
+          ev.stopPropagation(); ev.preventDefault(); close();
+        }
+      } catch (e) { /* ignore */ }
+    };
+    document.addEventListener('pointerdown', closeCaptureListener, { capture: true });
     document.getElementById('vw-prev')?.addEventListener('click', prev);
     document.getElementById('vw-next')?.addEventListener('click', next);
     document.getElementById('vw-ann')?.addEventListener('click', () => {

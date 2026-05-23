@@ -1397,6 +1397,14 @@ button.gps-chip { font: inherit; cursor: pointer; }
 }
 .viewer-tag.failed { color: #fecaca; }
 
+/* Ensure status labels inside the viewer are non-interactive so they
+  never capture touch/clicks that should reach viewer controls. */
+.viewer-tag { pointer-events: none; }
+
+/* Toasts must not capture pointer events — always allow interaction
+  to pass through to underlying overlays like the viewer. */
+.toast { pointer-events: none; }
+
 /* ---------- Annotate tool divider ---------- */
 .tool-divider {
   width: 1px;
