@@ -389,6 +389,86 @@
       bodyEl.scrollTop = bodyEl.scrollHeight;
     }
   }
+
+  const UPLOAD_LOG_BUFFER_MAX = 50;
+  const uploadLogBuffer = [];
+  const uploadProgressTracker = new Map();
+
+  function formatUploadLogEntry(entry) {
+    const parts = [
+      entry.time || fmtDebugTime(),
+      entry.status || 'unknown',
+      entry.step || '',
+      entry.fileName || '',
+      entry.kind || '',
+      entry.mimeType || '',
+      entry.size != null ? fmtBytes(entry.size) : '',
+      entry.message || '',
+      entry.authStatus ? `auth=${entry.authStatus}` : '',
+      entry.authError ? `authErr=${entry.authError}` : ''
+    ].filter(Boolean);
+    return parts.join(' | ');
+  }
+
+  function appendUploadLogEntry(entry) {
+    const line = {
+      time: fmtDebugTime(),
+      status: entry.status || 'pending',
+      step: entry.step || '',
+      fileName: entry.fileName || '',
+      kind: entry.kind || '',
+      mimeType: entry.mimeType || '',
+      size: entry.size != null ? entry.size : null,
+      message: entry.message || '',
+      authStatus: entry.authStatus || '',
+      authError: entry.authError || ''
+    };
+    uploadLogBuffer.push(line);
+    if (uploadLogBuffer.length > UPLOAD_LOG_BUFFER_MAX) uploadLogBuffer.shift();
+    refreshUploadLogPanel();
+  }
+
+  function getUploadLogText() {
+    return uploadLogBuffer.map(formatUploadLogEntry).join('\n');
+  }
+
+  function refreshUploadLogPanel() {
+    const panel = document.getElementById('upload-log-panel');
+    if (!panel || panel.hidden) return;
+    const bodyEl = document.getElementById('upload-log-body');
+    if (!bodyEl) return;
+    bodyEl.textContent = getUploadLogText();
+    bodyEl.scrollTop = bodyEl.scrollHeight;
+  }
+
+  async function onCopyUploadLog() {
+    const text = getUploadLogText();
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('Upload logs copied to clipboard', 'success', 2000);
+    } catch (e) {
+      toast('Copy failed: ' + (e && e.message || e), 'error', 4000);
+    }
+  }
+
+  function clearUploadLogs() {
+    uploadLogBuffer.length = 0;
+    refreshUploadLogPanel();
+  }
+
+  function showUploadLogs() {
+    const panel = document.getElementById('upload-log-panel');
+    if (!panel) return;
+    panel.hidden = false;
+    refreshUploadLogPanel();
+  }
+
+  function hideUploadLogs() {
+    const panel = document.getElementById('upload-log-panel');
+    if (!panel) return;
+    panel.hidden = true;
+  }
+
   (function patchConsoleForAuth() {
     const levels = [['log', 'LOG'], ['warn', 'WARN'], ['error', 'ERR']];
     for (const [name, label] of levels) {
@@ -1636,6 +1716,17 @@
       attempts: 0,
       nextAttemptAt: 0
     });
+    appendUploadLogEntry({
+      status: 'queued',
+      step: 'queued',
+      fileName,
+      kind,
+      mimeType: queuedMime,
+      size: queuedBlob.size,
+      message: 'Added to upload queue',
+      authStatus: window.Auth.getTokenStatus(),
+      authError: window.Auth.getLastAuthError && window.Auth.getLastAuthError()
+    });
     console.log('[capture] queued id=', item.id);
 
     let src;
@@ -1805,6 +1896,8 @@
 
   function startUpload(item) {
     try {
+      const authStatus = window.Auth.getTokenStatus();
+      const authError = window.Auth.getLastAuthError && window.Auth.getLastAuthError();
       console.log('[upload] starting', {
         id: item.id,
         name: item.fileName,
@@ -1812,9 +1905,21 @@
         mime: item.mimeType,
         size: item.blob && item.blob.size,
         projectId: item.projectId,
-        queueStatus: item.status
+        queueStatus: item.status,
+        authStatus,
+        authError
       });
-      console.log('[upload] authStatus=', window.Auth.getTokenStatus(), 'lastAuthErr=', window.Auth.getLastAuthError && window.Auth.getLastAuthError());
+      appendUploadLogEntry({
+        status: 'starting',
+        step: 'starting',
+        fileName: item.fileName,
+        kind: item.kind,
+        mimeType: item.mimeType,
+        size: item.blob && item.blob.size,
+        message: 'Starting upload',
+        authStatus,
+        authError
+      });
     } catch (e) {}
     const promise = (async () => {
       try {
@@ -1830,7 +1935,27 @@
           fileName: item.fileName,
           mimeType: item.mimeType,
           blob: item.blob,
-          onProgress: (p) => patchThumbByQueueId(item.id, { progress: p })
+          onProgress: (p) => {
+            patchThumbByQueueId(item.id, { progress: p });
+            try {
+              const threshold = Math.min(3, Math.floor(p * 4));
+              const lastThreshold = uploadProgressTracker.get(item.id) || 0;
+              if (threshold > lastThreshold) {
+                uploadProgressTracker.set(item.id, threshold);
+                appendUploadLogEntry({
+                  status: 'uploading',
+                  step: 'uploading',
+                  fileName: item.fileName,
+                  kind: item.kind,
+                  mimeType: item.mimeType,
+                  size: item.blob && item.blob.size,
+                  message: `Uploading ${Math.round(p * 100)}%`,
+                  authStatus: window.Auth.getTokenStatus(),
+                  authError: window.Auth.getLastAuthError && window.Auth.getLastAuthError()
+                });
+              }
+            } catch (e) {}
+          }
         };
         let result;
         try {
@@ -1845,6 +1970,18 @@
           throw driveErr;
         }
         console.log('[upload] success id=', item.id, 'driveFileId=', result?.id);
+        uploadProgressTracker.delete(item.id);
+        appendUploadLogEntry({
+          status: 'success',
+          step: 'success',
+          fileName: item.fileName,
+          kind: item.kind,
+          mimeType: item.mimeType,
+          size: item.blob && item.blob.size,
+          message: 'Upload completed',
+          authStatus: window.Auth.getTokenStatus(),
+          authError: window.Auth.getLastAuthError && window.Auth.getLastAuthError()
+        });
         await window.DB.queueDelete(item.id);
         patchThumbByQueueId(item.id, {
           status: 'success',
@@ -1859,9 +1996,21 @@
         try {
           console.error('[upload] failed id=', item.id, 'step=', err && err.step ? err.step : 'unknown', 'message=', err && (err.message || String(err)));
           console.error('[upload] authStatus at failure=', window.Auth.getTokenStatus(), 'lastAuthErr=', window.Auth.getLastAuthError && window.Auth.getLastAuthError());
+          appendUploadLogEntry({
+            status: 'failed',
+            step: err && err.step ? err.step : 'unknown',
+            fileName: item.fileName,
+            kind: item.kind,
+            mimeType: item.mimeType,
+            size: item.blob && item.blob.size,
+            message: err && (err.message || String(err)),
+            authStatus: window.Auth.getTokenStatus(),
+            authError: window.Auth.getLastAuthError && window.Auth.getLastAuthError()
+          });
         } catch (e) {}
         const attempts = (item.attempts || 0) + 1;
         const delay = computeRetryDelay(attempts);
+        uploadProgressTracker.delete(item.id);
         try {
           await window.DB.queueUpdate(item.id, {
             status: 'error',
@@ -2328,6 +2477,17 @@
           kind: 'annotation',
           status: 'pending'
         });
+        appendUploadLogEntry({
+          status: 'queued',
+          step: 'queued',
+          fileName: annotatedName,
+          kind: 'annotation',
+          mimeType: 'image/jpeg',
+          size: annotated.size,
+          message: 'Added annotated image to upload queue',
+          authStatus: window.Auth.getTokenStatus(),
+          authError: window.Auth.getLastAuthError && window.Auth.getLastAuthError()
+        });
         const previewUrl = URL.createObjectURL(annotated);
         state.thumbs.unshift({
           type: 'photo',
@@ -2778,6 +2938,23 @@
           <section class="voice-section">
             <button class="voice-btn" id="voice-btn">🎙️ Record voice note</button>
           </section>
+
+          <button class="btn-ghost small capture-log-btn" id="show-upload-logs-btn" type="button" aria-label="Show upload logs">Logs</button>
+
+          <div id="upload-log-panel" class="upload-log-panel" hidden>
+            <div id="upload-log-backdrop" class="upload-log-backdrop"></div>
+            <div class="upload-log-panel-content">
+              <div class="upload-log-panel-header">
+                <span class="upload-log-panel-title">Upload logs</span>
+                <div class="upload-log-panel-controls">
+                  <button type="button" id="upload-log-clear" class="upload-log-btn">Clear</button>
+                  <button type="button" id="upload-log-copy" class="upload-log-btn">Copy All</button>
+                  <button type="button" id="upload-log-close" class="upload-log-close" aria-label="Close logs">✕</button>
+                </div>
+              </div>
+              <pre id="upload-log-body" class="upload-log-body"></pre>
+            </div>
+          </div>
         </main>
       </div>
     `;
@@ -2800,6 +2977,11 @@
       ev.stopPropagation();
       toggleSortPopover();
     });
+    document.getElementById('show-upload-logs-btn')?.addEventListener('click', showUploadLogs);
+    document.getElementById('upload-log-close')?.addEventListener('click', hideUploadLogs);
+    document.getElementById('upload-log-backdrop')?.addEventListener('click', hideUploadLogs);
+    document.getElementById('upload-log-copy')?.addEventListener('click', onCopyUploadLog);
+    document.getElementById('upload-log-clear')?.addEventListener('click', clearUploadLogs);
     document.querySelectorAll('#sort-popover [data-sort]').forEach((b) => {
       b.addEventListener('click', () => chooseSort(b.dataset.sort));
     });
