@@ -19,6 +19,7 @@ window.VideoPlayer = (function () {
   let items = null;
   let idx = 0;
   let popstateListener = null;
+  let pushedHistoryState = false;
   let touchStartY = 0;
   let touchStartT = 0;
   let activeFetch = null;
@@ -77,6 +78,7 @@ window.VideoPlayer = (function () {
     `;
 
     history.pushState({ overlay: 'video' }, '');
+    pushedHistoryState = true;
     popstateListener = () => close({ fromPop: true });
     window.addEventListener('popstate', popstateListener);
 
@@ -303,7 +305,9 @@ window.VideoPlayer = (function () {
       window.removeEventListener('popstate', popstateListener);
       popstateListener = null;
     }
-    if (!opts.fromPop) { try { history.back(); } catch (e) {} }
+    const shouldBack = pushedHistoryState && window.history.state?.overlay === 'video';
+    if (!opts.fromPop && shouldBack) { try { history.back(); } catch (e) {} }
+    pushedHistoryState = false;
 
     root().innerHTML = '';
     document.body.classList.remove('camera-fs-open');

@@ -15,6 +15,7 @@ window.Viewer = (function () {
   let onDeleteCb = null;
   let onCloseCb = null;
   let popstateListener = null;
+  let pushedHistoryState = false;
   let closing = false;
   let closeCaptureListener = null;
 
@@ -59,6 +60,7 @@ window.Viewer = (function () {
     window.addEventListener('keydown', onKey);
 
     history.pushState({ overlay: 'viewer' }, '');
+    pushedHistoryState = true;
     popstateListener = () => close({ fromPop: true });
     window.addEventListener('popstate', popstateListener);
   }
@@ -75,9 +77,11 @@ window.Viewer = (function () {
       try { document.removeEventListener('pointerdown', closeCaptureListener, { capture: true }); } catch (e) { document.removeEventListener('pointerdown', closeCaptureListener); }
       closeCaptureListener = null;
     }
-    if (!opts.fromPop) {
+    const shouldBack = pushedHistoryState && window.history.state?.overlay === 'viewer';
+    if (!opts.fromPop && shouldBack) {
       try { history.back(); } catch (e) { /* ignore */ }
     }
+    pushedHistoryState = false;
     // Revoke blob URLs we created so we don't leak memory.
     resolvedSrc.forEach((url, key) => {
       try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }

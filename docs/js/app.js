@@ -1683,11 +1683,14 @@
       if (!kind) {
         if (['mov', 'mp4', 'm4v', '3gp', 'avi', 'hevc', 'heif'].includes(ext)) {
           kind = 'video';
-          if (!mime) mime = ext === 'mov' ? 'video/quicktime' : `video/${ext}`;
+          if (!mime) mime = 'video/mp4';
         } else if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic'].includes(ext)) {
           kind = 'photo';
           if (!mime) mime = `image/${ext === 'jpg' ? 'jpeg' : ext}`;
         }
+      }
+      if (mime === 'video/quicktime' && ext === 'mov') {
+        mime = 'video/mp4';
       }
       if (!kind) {
         console.warn('[import] skipping unsupported mime/extension:', mime, file.name);
@@ -2084,7 +2087,10 @@
             nextAttemptAt: Date.now() + delay
           });
         } catch (e) {}
-        toast('Upload failed, will retry automatically when possible', 'warn', 5000);
+        if (!uploadFailedBannerShown) {
+          uploadFailedBannerShown = true;
+          toast('Upload failed, will retry automatically when possible', 'warn', 5000);
+        }
       }
     })().finally(() => {
       inflight.delete(item.id);
@@ -2132,7 +2138,9 @@
           nextAttemptAt: item.nextAttemptAt || 0
         };
       }));
-      state.thumbs = [...thumbs.filter(Boolean), ...state.thumbs];
+      const existingQueueIds = new Set(state.thumbs.filter((t) => t.queueId).map((t) => t.queueId));
+      const pendingThumbs = thumbs.filter(Boolean).filter((t) => !existingQueueIds.has(t.queueId));
+      state.thumbs = [...pendingThumbs, ...state.thumbs];
       updateThumbsDOM();
     } catch (err) {
       console.warn('[queue] load pending thumbs failed:', err);
@@ -3198,7 +3206,15 @@
       // 'date' — newest first
       list.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
     }
-    return list;
+    const seen = new Set();
+    return list.filter((t) => {
+      const key = t.queueId ? `q:${t.queueId}`
+        : t.fileId ? `f:${t.fileId}`
+        : `n:${t.type}:${t.name}:${t.addedAt}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
   function sortLabel() {
     return getSortMode() === 'type' ? 'Type' : 'Date';
