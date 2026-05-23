@@ -7,11 +7,13 @@ window.Drive = (function () {
   const UPLOAD = 'https://www.googleapis.com/upload/drive/v3';
 
   async function authedFetch(input, init = {}, retry = true) {
+    try { console.log('[drive][authedFetch] url=', input, 'method=', init && init.method, 'authStatus=', window.Auth.getTokenStatus()); } catch (e) {}
     const token = await window.Auth.getAccessToken();
     const headers = new Headers(init.headers || {});
     headers.set('Authorization', `Bearer ${token}`);
     const res = await fetch(input, { ...init, headers });
     if (res.status === 401 && retry) {
+      console.warn('[drive][authedFetch] received 401, forcing token refresh');
       await window.Auth.getAccessToken(true);
       return authedFetch(input, init, false);
     }
@@ -58,6 +60,7 @@ window.Drive = (function () {
   // the outer withRetry can decide whether the status is transient.
   async function authedXhr(opts) { return _authedXhr(opts, false); }
   async function _authedXhr(opts, retriedOn401) {
+    try { console.log('[drive][authedXhr] url=', opts.url, 'method=', opts.method, 'retriedOn401=', retriedOn401, 'authStatus=', window.Auth.getTokenStatus()); } catch (e) {}
     const token = await window.Auth.getAccessToken(retriedOn401);
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -74,7 +77,7 @@ window.Drive = (function () {
           try { resolve({ status: xhr.status, data: xhr.responseText ? JSON.parse(xhr.responseText) : null, raw: xhr }); }
           catch { resolve({ status: xhr.status, data: null, raw: xhr }); }
         } else if (xhr.status === 401 && !retriedOn401) {
-          try { resolve(await _authedXhr(opts, true)); }
+          try { console.warn('[drive][authedXhr] xhr 401, retrying with refreshed token'); resolve(await _authedXhr(opts, true)); }
           catch (e) { reject(e); }
         } else {
           reject(new Error(`(${xhr.status}) ${xhr.statusText || ''} ${xhr.responseText || ''}`));
@@ -186,6 +189,7 @@ window.Drive = (function () {
 
   // -------- Uploads --------
   async function uploadMultipart({ folderId, fileName, mimeType, blob, onProgress }) {
+    try { console.log('[drive] uploadMultipart start', { fileName, mimeType, size: blob && blob.size, folderId }); } catch (e) {}
     const metadata = { name: fileName, parents: [folderId] };
     const boundary = 'dancon_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
     const head =
@@ -205,11 +209,13 @@ window.Drive = (function () {
         body,
         onProgress
       });
+      try { console.log('[drive] uploadMultipart success', { fileName, id: data && data.id }); } catch (e) {}
       return data;
     });
   }
 
   async function uploadResumable({ folderId, fileName, mimeType, blob, onProgress }) {
+    try { console.log('[drive] uploadResumable start', { fileName, mimeType, size: blob && blob.size, folderId }); } catch (e) {}
     const metadata = { name: fileName, parents: [folderId] };
 
     const initRes = await withRetry(async () => {
@@ -227,12 +233,14 @@ window.Drive = (function () {
       );
       if (!r.ok) {
         const text = await r.text().catch(() => '');
+        console.error('[drive] resumable init failed', { status: r.status, body: text });
         throw new Error(`Resumable init failed (${r.status}): ${text || r.statusText}`);
       }
       return r;
     });
 
     const sessionUrl = initRes.headers.get('Location');
+    try { console.log('[drive] resumable sessionUrl=', sessionUrl && sessionUrl.slice(0, 120)); } catch (e) {}
     if (!sessionUrl) throw new Error('Resumable session URL missing');
 
     return withRetry(() => new Promise((resolve, reject) => {
@@ -247,6 +255,7 @@ window.Drive = (function () {
           try { resolve(JSON.parse(xhr.responseText)); }
           catch { resolve({}); }
         } else {
+          console.error('[drive] upload PUT failed', { status: xhr.status, body: xhr.responseText });
           reject(new Error(`(${xhr.status}) Upload PUT failed: ${xhr.responseText || ''}`));
         }
       };

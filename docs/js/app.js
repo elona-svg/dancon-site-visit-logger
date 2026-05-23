@@ -1791,9 +1791,11 @@
       // PWA sandbox. The user will pumpQueue again after signing in.
       if (!window.Auth.isSignedIn()) return;
       const pending = await window.DB.queuePending();
+      try { console.log('[pump] queuePending count=', pending.length); } catch (e) {}
       const candidates = pending
         .filter((p) => !inflight.has(p.id))
         .sort((a, b) => (a.attempts - b.attempts) || (a.createdAt - b.createdAt));
+      try { console.log('[pump] candidates=', candidates.map(c=>({id:c.id,fileName:c.fileName,kind:c.kind,size:c.blob?.size})) ); } catch (e) {}
       while (inflight.size < MAX_CONCURRENT_UPLOADS && candidates.length) {
         const item = candidates.shift();
         startUpload(item);
@@ -1802,9 +1804,24 @@
   }
 
   function startUpload(item) {
-    console.log('[upload] starting id=', item.id, 'name=', item.fileName, 'kind=', item.kind, 'size=', item.blob?.size);
+    try {
+      console.log('[upload] starting', {
+        id: item.id,
+        name: item.fileName,
+        kind: item.kind,
+        mime: item.mimeType,
+        size: item.blob && item.blob.size,
+        projectId: item.projectId,
+        queueStatus: item.status
+      });
+      console.log('[upload] authStatus=', window.Auth.getTokenStatus(), 'lastAuthErr=', window.Auth.getLastAuthError && window.Auth.getLastAuthError());
+    } catch (e) {}
     const promise = (async () => {
-      await window.DB.queueUpdate(item.id, { status: 'uploading' });
+      try {
+        await window.DB.queueUpdate(item.id, { status: 'uploading' });
+      } catch (e) {
+        console.error('[upload] failed to mark uploading for id=', item.id, e && e.message);
+      }
       patchThumbByQueueId(item.id, { status: 'uploading', progress: 0 });
 
       try {
@@ -1815,9 +1832,18 @@
           blob: item.blob,
           onProgress: (p) => patchThumbByQueueId(item.id, { progress: p })
         };
-        const result = item.singleton
-          ? await window.Drive.upsertSingletonFile(uploadArgs)
-          : await window.Drive.uploadFile(uploadArgs);
+        let result;
+        try {
+          console.log('[upload] step=drive-upload id=', item.id);
+          result = item.singleton
+            ? await window.Drive.upsertSingletonFile(uploadArgs)
+            : await window.Drive.uploadFile(uploadArgs);
+          console.log('[upload] step=drive-upload-success id=', item.id, 'driveFileId=', result?.id);
+        } catch (driveErr) {
+          console.error('[upload] step=drive-upload-error id=', item.id, driveErr && (driveErr.message || driveErr));
+          driveErr.step = 'drive-upload';
+          throw driveErr;
+        }
         console.log('[upload] success id=', item.id, 'driveFileId=', result?.id);
         await window.DB.queueDelete(item.id);
         patchThumbByQueueId(item.id, {
@@ -1830,20 +1856,29 @@
           : `uploaded ${item.kind || 'file'}: ${item.fileName} (${fmtBytes(item.blob.size)})`;
         appendVisitLog(item.projectId, logSummary).catch(() => {});
       } catch (err) {
-        console.error('[upload] failed id=', item.id, err);
+        try {
+          console.error('[upload] failed id=', item.id, 'step=', err && err.step ? err.step : 'unknown', 'message=', err && (err.message || String(err)));
+          console.error('[upload] authStatus at failure=', window.Auth.getTokenStatus(), 'lastAuthErr=', window.Auth.getLastAuthError && window.Auth.getLastAuthError());
+        } catch (e) {}
         const attempts = (item.attempts || 0) + 1;
         const delay = computeRetryDelay(attempts);
-        await window.DB.queueUpdate(item.id, {
-          status: 'error',
-          attempts,
-          lastError: err.message || String(err),
-          nextAttemptAt: Date.now() + delay
-        });
-        patchThumbByQueueId(item.id, {
-          status: 'pending',
-          error: err.message || String(err),
-          nextAttemptAt: Date.now() + delay
-        });
+        try {
+          await window.DB.queueUpdate(item.id, {
+            status: 'error',
+            attempts,
+            lastError: err && (err.message || String(err)),
+            nextAttemptAt: Date.now() + delay
+          });
+        } catch (e) {
+          console.error('[upload] queueUpdate failed while recording error for id=', item.id, e && e.message);
+        }
+        try {
+          patchThumbByQueueId(item.id, {
+            status: 'pending',
+            error: err && (err.message || String(err)),
+            nextAttemptAt: Date.now() + delay
+          });
+        } catch (e) {}
         toast('Upload failed, will retry automatically when possible', 'warn', 5000);
       }
     })().finally(() => {

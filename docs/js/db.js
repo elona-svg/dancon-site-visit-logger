@@ -64,6 +64,15 @@ window.DB = (function () {
       nextAttemptAt: item.nextAttemptAt || 0,
       createdAt: item.createdAt || Date.now()
     };
+    try {
+      console.log('[queue] queueAdd:', {
+        fileName: toSave.fileName,
+        mimeType: toSave.mimeType,
+        kind: toSave.kind,
+        size: toSave.blob && toSave.blob.size,
+        projectId: toSave.projectId
+      });
+    } catch (e) { /* never break queueAdd for logging errors */ }
     const id = await reqToPromise(store.add(toSave));
     return { ...toSave, id };
   }
