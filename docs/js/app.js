@@ -1846,47 +1846,52 @@
         video.load();
       });
 
-      const duration = Number.isFinite(video.duration) && video.duration > 0
-        ? Math.min(1, Math.max(0.1, video.duration - 0.1))
-        : 0.1;
-      const seekSucceeded = await new Promise((resolve) => {
-        let resolved = false;
-        const onSeeked = () => { resolved = true; cleanup(); resolve(true); };
-        const onError = () => { resolved = true; cleanup(); resolve(false); };
-        const timeout = setTimeout(() => { if (!resolved) { cleanup(); resolve(false); } }, 4000);
-        function cleanup() {
-          clearTimeout(timeout);
-          video.removeEventListener('seeked', onSeeked);
-          video.removeEventListener('error', onError);
-        }
-        video.addEventListener('seeked', onSeeked, { once: true });
-        video.addEventListener('error', onError, { once: true });
-        try { video.currentTime = duration; } catch (e) { cleanup(); resolve(false); }
-      });
-
-      if (!seekSucceeded) {
-        console.warn('[thumb] video seek failed, falling back to play/pause');
-        await new Promise((resolve, reject) => {
-          const onLoadedData = async () => {
-            try {
-              await video.play();
-              video.pause();
-              resolve();
-            } catch (err) {
-              reject(err);
+      // Try an early-frame thumbnail first (0.1s), then 0.5s, then near-end.
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 1;
+      const tryTimes = [0.1, 0.5, Math.max(0.1, duration - 0.1)];
+      let gotFrame = false;
+      for (const tSec of tryTimes) {
+        try {
+          await new Promise((resolve) => {
+            let resolved = false;
+            const onSeeked = () => { resolved = true; cleanup(); resolve(true); };
+            const onError = () => { resolved = true; cleanup(); resolve(false); };
+            const timeout = setTimeout(() => { if (!resolved) { cleanup(); resolve(false); } }, 4000);
+            function cleanup() {
+              clearTimeout(timeout);
+              video.removeEventListener('seeked', onSeeked);
+              video.removeEventListener('error', onError);
             }
-          };
-          const onError = () => reject(new Error('Video play fallback failed'));
-          const timeout = setTimeout(() => reject(new Error('Video play fallback timed out')), 5000);
-          function cleanup() {
-            clearTimeout(timeout);
-            video.removeEventListener('loadeddata', onLoadedData);
-            video.removeEventListener('error', onError);
+            video.addEventListener('seeked', onSeeked, { once: true });
+            video.addEventListener('error', onError, { once: true });
+            try { video.currentTime = Math.min(tSec, Math.max(0, duration - 0.05)); } catch (e) { cleanup(); resolve(false); }
+          });
+          // Prime decoder on some browsers by briefly playing muted (best-effort)
+          try { video.muted = true; await video.play().catch(()=>{}); video.pause(); } catch (e) {}
+          // draw test frame to see if it's not black
+          const testCanvas = document.createElement('canvas');
+          testCanvas.width = Math.max(16, video.videoWidth || 16);
+          testCanvas.height = Math.max(16, video.videoHeight || 16);
+          const testCtx = testCanvas.getContext('2d');
+          if (testCtx) {
+            try {
+              testCtx.drawImage(video, 0, 0, testCanvas.width, testCanvas.height);
+              const data = testCtx.getImageData(0, 0, testCanvas.width, testCanvas.height).data;
+              let sum = 0;
+              for (let i = 0; i < data.length; i += 4) sum += (data[i] + data[i+1] + data[i+2]);
+              const avg = sum / (data.length / 4) / 3;
+              // if average brightness > 6 (0-255), consider it non-black
+              if (avg > 6) { gotFrame = true; break; }
+            } catch (e) {
+              // ignore and proceed
+              gotFrame = true; break;
+            }
+          } else {
+            gotFrame = true; break;
           }
-          video.addEventListener('loadeddata', onLoadedData, { once: true });
-          video.addEventListener('error', onError, { once: true });
-          if (video.readyState >= 2) onLoadedData();
-        });
+        } catch (e) {
+          // try next time
+        }
       }
 
       const canvas = document.createElement('canvas');
@@ -2914,6 +2919,7 @@
           <button class="btn-ghost back-btn" id="back-btn">‹ Sites</button>
           <div class="topbar-title-center" id="proj-title-region"></div>
           <button class="btn-ghost drive-btn" id="drive-btn">All Files</button>
+          <button class="btn-ghost" id="show-upload-logs-btn" type="button">Logs</button>
         </header>
 
         <main class="capture-main">
@@ -2974,8 +2980,6 @@
           <section class="voice-section">
             <button class="voice-btn" id="voice-btn">🎙️ Record voice note</button>
           </section>
-
-          <button class="btn-ghost small capture-log-btn" id="show-upload-logs-btn" type="button" aria-label="Show upload logs">Logs</button>
 
           <div id="upload-log-panel" class="upload-log-panel" hidden>
             <div id="upload-log-backdrop" class="upload-log-backdrop"></div>
@@ -3317,7 +3321,7 @@
       });
       thumbEl.addEventListener('pointermove', (ev) => {
         if (!lpTimer) return;
-        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) > 10) {
+        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) > 15) {
           clearLongPress();
         }
       });
@@ -3689,12 +3693,20 @@
   function attachGalleryLongPress(root) {
     root.querySelectorAll('[data-gallery-key]').forEach((el) => {
       const key = el.dataset.galleryKey;
-      el.addEventListener('pointerdown', () => {
+      let gStartX = 0, gStartY = 0;
+      el.addEventListener('pointerdown', (ev) => {
         clearGalleryLongPress();
+        gStartX = ev.clientX; gStartY = ev.clientY;
         galleryLpTimer = setTimeout(() => {
           galleryLpSuppressClick = true;
           if (!gallerySelectMode) enterGallerySelectMode(key);
         }, 500);
+      });
+      el.addEventListener('pointermove', (ev) => {
+        if (!galleryLpTimer) return;
+        if (Math.hypot(ev.clientX - gStartX, ev.clientY - gStartY) > 15) {
+          clearGalleryLongPress();
+        }
       });
       ['pointerup', 'pointercancel', 'pointerleave'].forEach((evt) => {
         el.addEventListener(evt, clearGalleryLongPress);

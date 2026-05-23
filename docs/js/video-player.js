@@ -209,6 +209,15 @@ window.VideoPlayer = (function () {
     const el = document.getElementById('vp-media');
     el.addEventListener('error', () => {
       const code = el.error?.code;
+      // If browser reports decode not supported, try opening the file in Drive
+      if (code === 4 && opts.fileId) {
+        try {
+          // Open Drive viewer in new tab as a fallback for unsupported codecs
+          window.open(`https://drive.google.com/file/d/${opts.fileId}/view`, '_blank');
+          showError(isAudio ? 'Audio could not play' : 'Video could not play', 'Opened original file in Drive for playback.');
+          return;
+        } catch (e) { /* fall through to generic error */ }
+      }
       let detail = 'Try again in a few minutes.';
       if (code === 4) detail = "Your browser can't decode this format. The original file is safe in Drive.";
       else if (code === 2) detail = 'Network error.';
