@@ -61,6 +61,7 @@
 
   const inflight = new Map();
   let queuePumpScheduled = false;
+  let queueWatchdogId = null;
   let _renderHandle = null;
   let renderedFlag = '';
 
@@ -134,6 +135,7 @@
         }
       } catch (e) { /* ignore */ }
       pumpQueue();
+      startQueueWatchdog();
     } catch (err) {
       console.error('Boot failed:', err);
       state.booting = false;
@@ -222,10 +224,34 @@
   }
 
   // Network / lifecycle
+  function startQueueWatchdog() {
+    if (queueWatchdogId) return;
+    queueWatchdogId = setInterval(async () => {
+      if (!state.isOnline || !window.Auth.isSignedIn()) return;
+      if (inflight.size > 0) return;
+      try {
+        const pending = await window.DB.queuePending();
+        if (pending.length > 0) {
+          console.log('[queue-watchdog] idle queue detected, restarting pump; pending=', pending.length);
+          pumpQueue();
+        }
+      } catch (err) {
+        console.warn('[queue-watchdog] failed to check pending queue:', err && err.message);
+      }
+    }, 30000);
+  }
+
+  function stopQueueWatchdog() {
+    if (!queueWatchdogId) return;
+    clearInterval(queueWatchdogId);
+    queueWatchdogId = null;
+  }
+
   window.addEventListener('online', () => {
     state.isOnline = true;
     toast('Back online — resuming uploads', 'info');
     pumpQueue();
+    startQueueWatchdog();
     updateOnlineBadges();
     updateConnDotDOM();
     // Kick a refresh so the status dot turns green again ASAP.
@@ -236,8 +262,17 @@
   window.addEventListener('offline', () => {
     state.isOnline = false;
     toast('Offline — captures will queue', 'warn');
+    stopQueueWatchdog();
     updateOnlineBadges();
     updateConnDotDOM();
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      console.log('[visibility] app foregrounded — resuming queue');
+      pumpQueue();
+      startQueueWatchdog();
+    }
   });
 
   // Connection state machine ------------------------------------------------
@@ -610,6 +645,7 @@
   async function onSignOutClick() {
     if (window.Camera.isOpen()) window.Camera.close();
     window.Camera.releaseStream();
+    stopQueueWatchdog();
     await window.Auth.signOut();
     state.user = null;
     state.currentProjectId = null;
