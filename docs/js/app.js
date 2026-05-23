@@ -1696,12 +1696,27 @@
       if (!mime) {
         mime = kind === 'video' ? 'video/mp4' : 'image/jpeg';
       }
+      let imported = false;
       try {
         await enqueueCapture(file, mime, kind);
+        imported = true;
         toast(`Imported ${file.name}`, 'success', 1500);
       } catch (err) {
-        console.warn('[import] enqueue failed for', file.name, err && err.message);
-        toast(`Could not import ${file.name}`, 'error', 4000);
+        if (ext === 'mov') {
+          console.warn('[import] .mov import failed, retrying once silently for', file.name, err && err.message);
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          try {
+            await enqueueCapture(file, mime, kind);
+            imported = true;
+            toast(`Imported ${file.name}`, 'success', 1500);
+          } catch (retryErr) {
+            err = retryErr;
+          }
+        }
+        if (!imported) {
+          console.warn('[import] enqueue failed for', file.name, err && err.message);
+          toast(`Could not import ${file.name}`, 'error', 4000);
+        }
       }
     }
     // Reset so re-picking the same file fires the change event again.
@@ -2915,10 +2930,14 @@
   function renderCapture(app) {
     app.innerHTML = `
       <div class="screen capture-screen">
-        <header class="topbar">
-          <button class="btn-ghost back-btn" id="back-btn">‹ Sites</button>
-          <div class="topbar-title-center" id="proj-title-region"></div>
-          <button class="btn-ghost drive-btn" id="drive-btn">All Files</button>
+<header class="topbar capture-topbar">
+      <div class="topbar-row topbar-main">
+        <button class="btn-ghost back-btn" id="back-btn">‹ Sites</button>
+        <button class="btn-ghost drive-btn" id="drive-btn">All Files</button>
+      </div>
+      <div class="topbar-row topbar-title-row">
+        <div class="topbar-title-center" id="proj-title-region"></div>
+      </div>
         </header>
 
         <main class="capture-main">
@@ -3542,7 +3561,7 @@
       const input = document.getElementById('rename-input');
       input?.focus();
       input?.select();
-    }, 50);
+    }, 100);
   }
   function cancelRename() {
     state.isRenaming = false;
