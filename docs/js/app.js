@@ -2919,7 +2919,6 @@
           <button class="btn-ghost back-btn" id="back-btn">‹ Sites</button>
           <div class="topbar-title-center" id="proj-title-region"></div>
           <button class="btn-ghost drive-btn" id="drive-btn">All Files</button>
-          <button class="btn-ghost" id="show-upload-logs-btn" type="button">Logs</button>
         </header>
 
         <main class="capture-main">
@@ -2980,6 +2979,9 @@
           <section class="voice-section">
             <button class="voice-btn" id="voice-btn">🎙️ Record voice note</button>
           </section>
+          <div style="margin-top:8px;" class="logs-row">
+            <button class="btn-ghost" id="show-upload-logs-btn" type="button">Logs</button>
+          </div>
 
           <div id="upload-log-panel" class="upload-log-panel" hidden>
             <div id="upload-log-backdrop" class="upload-log-backdrop"></div>

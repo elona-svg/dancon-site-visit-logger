@@ -11,11 +11,27 @@ window.Drive = (function () {
     const token = await window.Auth.getAccessToken();
     const headers = new Headers(init.headers || {});
     headers.set('Authorization', `Bearer ${token}`);
-    const res = await fetch(input, { ...init, headers });
+    // Enforce a 60s timeout for Drive network calls to avoid 15s hard timeouts
+    const controller = new AbortController();
+    const timeoutMs = ('timeoutMs' in init) ? init.timeoutMs : 60000;
+    const to = setTimeout(() => controller.abort(), timeoutMs);
+    let res;
+    try {
+      res = await fetch(input, { ...init, headers, signal: controller.signal });
+    } catch (err) {
+      if (err.name === 'AbortError') throw new Error(`Request timed out after ${timeoutMs}ms contacting ${input}`);
+      throw new Error(`Network error contacting ${input}: ${err && err.message ? err.message : String(err)}`);
+    } finally {
+      clearTimeout(to);
+    }
     if (res.status === 401 && retry) {
       console.warn('[drive][authedFetch] received 401, forcing token refresh');
       await window.Auth.getAccessToken(true);
       return authedFetch(input, init, false);
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} ${res.statusText} - ${text}`);
     }
     return res;
   }
@@ -65,6 +81,8 @@ window.Drive = (function () {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open(opts.method, opts.url, true);
+      // set a 60s timeout for XHR uploads (avoid 15s default network drops)
+      xhr.timeout = opts.timeoutMs || 60000;
       xhr.setRequestHeader('Authorization', `Bearer ${token}`);
       Object.entries(opts.headers || {}).forEach(([k, v]) => xhr.setRequestHeader(k, v));
       if (opts.onProgress && xhr.upload) {
@@ -83,8 +101,8 @@ window.Drive = (function () {
           reject(new Error(`(${xhr.status}) ${xhr.statusText || ''} ${xhr.responseText || ''}`));
         }
       };
-      xhr.onerror = () => reject(new Error('Network error'));
-      xhr.ontimeout = () => reject(new Error('Request timed out'));
+      xhr.onerror = () => reject(new Error(`Network error contacting ${opts.url}`));
+      xhr.ontimeout = () => reject(new Error(`Request timed out after ${xhr.timeout}ms contacting ${opts.url}`));
       xhr.send(opts.body);
     });
   }
@@ -246,6 +264,8 @@ window.Drive = (function () {
     return withRetry(() => new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('PUT', sessionUrl, true);
+      xhr.timeout = 60000;
+      xhr.ontimeout = () => reject(new Error(`Request timed out after ${xhr.timeout}ms contacting resumable session`));
       xhr.setRequestHeader('Content-Type', mimeType || 'application/octet-stream');
       xhr.upload.onprogress = (ev) => {
         if (onProgress && ev.lengthComputable) onProgress(ev.loaded / ev.total);
@@ -259,7 +279,7 @@ window.Drive = (function () {
           reject(new Error(`(${xhr.status}) Upload PUT failed: ${xhr.responseText || ''}`));
         }
       };
-      xhr.onerror = () => reject(new Error('Network error during upload'));
+      xhr.onerror = () => reject(new Error(`Network error during upload to ${sessionUrl}`));
       xhr.send(blob);
     }));
   }
