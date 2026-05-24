@@ -45,6 +45,26 @@ window.Viewer = (function () {
 
   function root() { return document.getElementById('overlay-root'); }
 
+  // Swallow the next click anywhere in the document for ~700ms. Used when
+  // we close the viewer from a pointerdown handler so the synthesized
+  // click that follows doesn't land on the project screen's back button
+  // (same top-left corner as the X) and bounce the user to home.
+  function armGhostClickSwallow() {
+    let armed = true;
+    const handler = (ev) => {
+      if (!armed) return;
+      armed = false;
+      ev.stopPropagation();
+      ev.preventDefault();
+      document.removeEventListener('click', handler, true);
+    };
+    document.addEventListener('click', handler, true);
+    setTimeout(() => {
+      armed = false;
+      document.removeEventListener('click', handler, true);
+    }, 700);
+  }
+
   function open(opts) {
     items = (opts.items || []).slice();
     idx = Math.max(0, Math.min(items.length - 1, opts.startIndex || 0));
@@ -169,6 +189,15 @@ window.Viewer = (function () {
     // Robust close: capture pointerdown anywhere and if it intersects the
     // close button bounds, close immediately. This ensures the X always
     // works even if other overlays or toasts are present.
+    //
+    // Ghost-click guard: we close from pointerdown, which runs BEFORE the
+    // synthesized click. Once we remove the viewer DOM the next click
+    // lands on whatever is now under the finger — typically the project
+    // screen's "‹ Sites" back button in the same top-left corner. Without
+    // this guard the user gets sent to the home/sites screen instead of
+    // staying on the project they were viewing. Install a one-shot
+    // capture-phase click swallower for ~700ms after close fires from
+    // pointerdown.
     closeCaptureListener = (ev) => {
       try {
         const btn = document.getElementById('vw-close');
@@ -178,7 +207,9 @@ window.Viewer = (function () {
         const clientY = (ev.clientY != null) ? ev.clientY : (ev.touches && ev.touches[0] && ev.touches[0].clientY);
         if (clientX == null || clientY == null) return;
         if (clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom) {
-          ev.stopPropagation(); ev.preventDefault(); close();
+          ev.stopPropagation(); ev.preventDefault();
+          armGhostClickSwallow();
+          close();
         }
       } catch (e) { /* ignore */ }
     };

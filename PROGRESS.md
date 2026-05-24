@@ -10,6 +10,25 @@ can pick up exactly where this one stopped.
 
 ## Current state (2026-05-24)
 
+### Recently shipped — Viewer X ghost-click fix (SW v51)
+
+**Bug:** Tapping X on a full-screen photo inside a project sent the tech
+to the Sites home screen instead of returning to the project they were
+in.
+
+**Cause:** [viewer.js](docs/js/viewer.js) `closeCaptureListener` fires
+on `pointerdown` in the capture phase and tears down the viewer DOM
+immediately. The synthesized `click` that follows lands on whatever is
+now under the finger — the project screen's "‹ Sites" back button in
+the same top-left position — which runs `leaveProject()` and pops to
+home.
+
+**Fix:** New `armGhostClickSwallow()` helper installs a one-shot
+capture-phase `click` listener that swallows the next click for 700ms
+when `closeCaptureListener` triggers close. The X handler's own click
+path is untouched (when X handles the click directly the DOM is gone
+before any other element can claim it).
+
 ### Recently shipped — Network resilience (SW v50)
 
 Diagnosed why uploads stall on weak signal: queue runner trusted
