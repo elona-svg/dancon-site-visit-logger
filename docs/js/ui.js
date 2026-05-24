@@ -72,18 +72,37 @@ window.UI = (function () {
     }, 1000);
   }
 
+  // CRITICAL: this is the post-IDB backup that survives PWA reinstall
+  // and IndexedDB eviction. We do NOT use navigator.share here — that
+  // pops the system share sheet per file, which is unusable for
+  // back-to-back captures on a job site. Plain <a download> click on
+  // iOS Safari/PWA triggers the system download UI; the file lands in
+  // Files → Downloads, persists across reinstall, and the techs can
+  // sweep them into Camera Roll later if needed via the Files app.
+  //
+  // The "Save to Photos" explicit button uses saveBlobToCameraRoll
+  // below, which DOES use the share sheet (user-initiated, per file).
   async function saveBlobLocally(blob, filename) {
     if (!blob) return;
-    const file = new File([blob], filename || 'backup', { type: blob.type || 'application/octet-stream' });
+    downloadBlob(blob, filename);
+  }
+
+  // Explicit "save to camera roll" path — interactive, user gesture
+  // required, one share-sheet prompt per call. Use from a button tap.
+  async function saveBlobToCameraRoll(blob, filename) {
+    if (!blob) return false;
+    const file = new File([blob], filename || 'capture', { type: blob.type || 'application/octet-stream' });
     if (navigator.canShare?.({ files: [file] }) && navigator.share) {
       try {
-        await navigator.share({ files: [file], title: 'Save backup', text: 'Save this capture to your device.' });
-        return;
+        await navigator.share({ files: [file] });
+        return true;
       } catch (err) {
-        console.warn('[ui] share fallback failed:', err);
+        if (err.name === 'AbortError') return false;
+        console.warn('[ui] share save failed:', err);
       }
     }
     downloadBlob(blob, filename);
+    return true;
   }
 
   // Fixed banner pinned to the top of the viewport announcing a new
@@ -116,5 +135,5 @@ window.UI = (function () {
     });
   }
 
-  return { escapeHtml, fmtTimestampForFilename, fmtDateTime, fmtBytes, fmtRelative, toast, downloadBlob, showUpdateBanner };
+  return { escapeHtml, fmtTimestampForFilename, fmtDateTime, fmtBytes, fmtRelative, toast, downloadBlob, saveBlobLocally, saveBlobToCameraRoll, showUpdateBanner };
 })();

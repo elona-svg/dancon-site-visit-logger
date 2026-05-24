@@ -1494,6 +1494,17 @@
     if (root) root.innerHTML = '';
   }
 
+  // Shown ONCE per device the first time we trigger a local backup
+  // download. iOS will pop its own "downloads" prompt at the same time;
+  // this toast explains what's happening so the tech taps Save / Allow.
+  function maybeShowBackupHint() {
+    try {
+      if (localStorage.getItem('backup_hint_shown') === '1') return;
+      localStorage.setItem('backup_hint_shown', '1');
+      toast('Saving a backup copy to Files so it survives reinstall. Tap "Allow" or "Save" if iOS asks.', 'info', 8000);
+    } catch (e) { /* ignore */ }
+  }
+
   function showInstallHint() {
     if (isStandalone()) return;
     const platform = detectPlatform();
@@ -1787,6 +1798,18 @@
     const ext = extFromMime(queuedMime);
     const fileName = await nextFileName(folderId, ext);
     console.log('[capture] generated fileName=', fileName, 'ext=', ext);
+
+    // CRITICAL: trigger the device-local backup BEFORE adding to the
+    // upload queue. IndexedDB gets wiped when the PWA is reinstalled,
+    // so a copy outside the sandbox (in iOS Files → Downloads) is the
+    // only thing that survives. Photos AND videos both get this.
+    // Fire-and-forget — we don't await the user closing the iOS prompt.
+    if (window.UI?.saveBlobLocally) {
+      try { window.UI.saveBlobLocally(queuedBlob, fileName); }
+      catch (err) { console.warn('[capture] local backup failed:', err); }
+      maybeShowBackupHint();
+    }
+
     const item = await window.DB.queueAdd({
       projectId: folderId,
       projectName: folderName,
@@ -1818,17 +1841,6 @@
     } else {
       src = URL.createObjectURL(queuedBlob);
     }
-    if (kind === 'photo' && window.UI?.saveBlobLocally) {
-      window.UI.saveBlobLocally(blob, fileName).catch((err) => {
-        console.warn('[capture] local backup failed:', err);
-      });
-    }
-    if (kind === 'video') {
-      window.UI.saveBlobLocally(blob, fileName).catch((err) => {
-        console.warn('[capture] local backup failed:', err);
-      });
-    }
-
     const thumb = {
       type: kind,
       src,

@@ -10,6 +10,55 @@ can pick up exactly where this one stopped.
 
 ## Current state (2026-05-24)
 
+### Recently shipped — Local backup + auto-update fix (SW v55)
+
+**Two production-critical bugs found and fixed.**
+
+**Bug 1 — Pending photos lost on reinstall.** [ui.js](docs/js/ui.js)
+`saveBlobLocally` was defined but **NOT in the module export list** (the
+`return { … }` at the bottom). Every call in
+[app.js](docs/js/app.js) `enqueueCapture` was `window.UI?.saveBlobLocally`
+which silently no-op'd. No local backup ever happened. When a tech
+reinstalled the PWA to get an update, IndexedDB was wiped and every
+queued photo was permanently lost.
+
+Fix:
+- Export `saveBlobLocally` from ui.js (the bug fix).
+- Strip the share-sheet path out of it — that path popped iOS's share
+  sheet per file, which is unusable for back-to-back captures. Use
+  plain `<a download>` click instead; iOS saves to Files → Downloads,
+  silently or with one allow-downloads tap.
+- Move the `saveBlobLocally` call to BEFORE `queueAdd` in
+  `enqueueCapture` so the backup hits the device-local Downloads
+  folder before any upload attempt.
+- Both photo AND video go through it now (was photo-only intent).
+- New `maybeShowBackupHint()` shows a one-time toast on first capture:
+  "Saving a backup copy to Files so it survives reinstall. Tap 'Allow'
+  or 'Save' if iOS asks." Stored in `localStorage.backup_hint_shown`.
+- New `UI.saveBlobToCameraRoll(blob, filename)` provides an explicit
+  `navigator.share({files})` path for future "Save to Photos" buttons
+  where the user wants Camera Roll specifically (one prompt per tap).
+
+**Bug 2 — Auto-update never fired; reinstall was the only way to get
+new code.** [index.html](docs/index.html) registered the service
+worker at `'service-worker.js?v=v49'` — **hardcoded** to the v49
+string from weeks ago and never updated since. Browser served the
+cached v49 SW response forever, `updatefound` never fired, the in-
+page refresh banner never appeared, techs had to manually reinstall
+the PWA to get any code change. This is what caused the recurring
+"reinstall to get the fix" loop today.
+
+Fix:
+- SW URL now uses `window.CONFIG.APP_VERSION` dynamically, so every
+  release auto-busts the SW cache.
+- v55 onwards: bumping APP_VERSION (which we already do per release)
+  is enough — index.html picks it up, browser fetches a new SW, the
+  existing `updatefound` → banner path fires automatically.
+
+The combination means: techs see the orange refresh banner next time
+they open the app after a deploy, AND any captures they already have
+stay safe in Files → Downloads even if they wipe IDB.
+
 ### Recently shipped — Chunked PUT + stall detector (SW v54)
 
 **Bug:** Photo uploads on 5G hung for the full 60s timeout with zero

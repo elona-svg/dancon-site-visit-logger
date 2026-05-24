@@ -60,7 +60,13 @@
   <script>
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
-        const swUrl = 'service-worker.js?v=v49';
+        // Cache-bust the SW registration URL with the live APP_VERSION
+        // so every release auto-busts the browser's SW cache and the
+        // updatefound path actually fires. Previously this was hardcoded
+        // to v49 and never changed — meaning iOS users kept the v49 SW
+        // forever and had to reinstall the app to get any update.
+        const ver = (window.CONFIG && window.CONFIG.APP_VERSION) || 'unknown';
+        const swUrl = 'service-worker.js?v=' + encodeURIComponent(ver);
         navigator.serviceWorker.register(swUrl).then((reg) => {
           const notifyUpdate = () => {
             if (window.UI && typeof window.UI.showUpdateBanner === 'function') {
