@@ -10,6 +10,37 @@ can pick up exactly where this one stopped.
 
 ## Current state (2026-05-24)
 
+### Recently shipped — Chunked PUT + stall detector (SW v54)
+
+**Bug:** Photo uploads on 5G hung for the full 60s timeout with zero
+bytes transferred, then retried once and failed the same way. Log
+showed two back-to-back `Request timed out after 60000ms during PUT
+at byte 0` failures per item — the TCP socket was effectively dead
+but iOS kept it open until our timeout fired, and the entire 1.2 MB
+PUT was attempted as a single request that never moved a byte.
+
+**Fix in [drive.js](docs/js/drive.js):**
+
+- **Chunked resumable PUTs.** 1.2 MB photos now upload in 256 KiB
+  chunks instead of one big request. Drive's resumable protocol
+  supports this natively (`Content-Range: bytes X-Y/total`, 308
+  response means "more please"). On weak signal a small chunk has a
+  much better chance of completing than a multi-megabyte single PUT,
+  and a stalled chunk only costs that chunk — we resume from the next
+  byte instead of restarting from zero.
+- **Per-chunk stall detector.** Each chunk PUT installs a 3s interval
+  that aborts the XHR if `xhr.upload.onprogress` hasn't fired in
+  ≥15s. iOS reliably keeps dead sockets open until the full timeout
+  fires; the stall detector kills them fast so the queue moves on.
+- **3 attempts per chunk, 45s per attempt.** Failed-chunk path queries
+  the server for received bytes and advances if the server got more
+  than we tracked locally — avoids resending bytes already on Drive.
+
+Worst-case per-chunk wait drops from 60s (full timeout, no progress)
+to ~15s (stall detector). For a 1.2 MB photo that's 5 chunks × up to
+15s each = ~75s worst case instead of 120s before, and any chunk that
+DOES complete locks in that progress permanently.
+
 ### Recently shipped — Drive thumbnail auth fallback (SW v53)
 
 **Bug:** Uploaded photos showed as blank grey squares in the gallery

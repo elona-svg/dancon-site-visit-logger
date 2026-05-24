@@ -273,83 +273,127 @@ window.Drive = (function () {
     return resumablePutWithResume(sessionUrl, blob, mimeType, onProgress, onLog);
   }
 
-  // Bounded retry. We fail fast on PUT errors so the outer startUpload catch
-  // sees the failure quickly and the queue-level circuit breaker can engage.
-  // Longer worst-case timeouts here would hide a dead network for minutes.
+  // Chunked resumable upload. Sends the blob in CHUNK_SIZE pieces so that
+  // on weak signal one stalled chunk only costs us ~256 KB of progress
+  // instead of restarting the whole file. Drive's protocol requires chunk
+  // sizes to be a multiple of 256 KiB except for the final chunk.
+  //
+  // Each chunk PUT has a stall detector: if the XHR hasn't fired a single
+  // progress event in STALL_THRESHOLD_MS, abort the request and treat it
+  // as a failed attempt. iOS reliably keeps dead TCP sockets open until
+  // the full timeout fires (we measured 60s of zero-byte transfer on 5G),
+  // and waiting that long per attempt makes the queue feel frozen.
+  const CHUNK_SIZE = 256 * 1024;
+  const MAX_ATTEMPTS_PER_CHUNK = 3;
+  const CHUNK_PUT_TIMEOUT_MS = 45000;
+  const STALL_THRESHOLD_MS = 15000;
+
   async function resumablePutWithResume(sessionUrl, blob, mimeType, onProgress, onLog) {
-    const MAX_RESUME_ATTEMPTS = 2;
     const total = blob.size;
     let startByte = 0;
-    let attempt = 0;
     let lastErr;
 
-    while (attempt < MAX_RESUME_ATTEMPTS) {
-      try {
-        if (onLog) onLog('put-started', `PUT bytes ${startByte}-${total - 1} of ${total} (attempt ${attempt + 1}/${MAX_RESUME_ATTEMPTS})`);
-        const result = await putResumableSlice(sessionUrl, blob, startByte, total, mimeType, onProgress);
-        return result;
-      } catch (err) {
-        lastErr = err;
-        attempt += 1;
-        const summary = err && err.message ? err.message : String(err);
-        console.warn(`[drive] resumable PUT attempt ${attempt} failed (startByte=${startByte}):`, summary);
-        if (onLog) onLog('put-failed', `Attempt ${attempt}/${MAX_RESUME_ATTEMPTS} failed at byte ${startByte}: ${summary}`);
-        if (attempt >= MAX_RESUME_ATTEMPTS) throw err;
+    while (startByte < total) {
+      const endByte = Math.min(startByte + CHUNK_SIZE - 1, total - 1);
+      const isLast = endByte === total - 1;
 
-        const backoff = Math.min(4000, 1000 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 250);
-        await new Promise((r) => setTimeout(r, backoff));
+      let chunkAttempt = 0;
+      let chunkDone = false;
 
+      while (chunkAttempt < MAX_ATTEMPTS_PER_CHUNK && !chunkDone) {
+        chunkAttempt += 1;
         try {
-          const received = await queryResumableProgress(sessionUrl, total);
-          if (received === null) throw new Error(`Resumable session lost mid-upload: ${err.message}`);
-          if (received >= total) {
-            console.log('[drive] resumable: server reports complete on resume query');
-            if (onLog) onLog('resume-complete', 'Server already received full file');
-            return {};
+          if (onLog) onLog('put-started', `PUT bytes ${startByte}-${endByte} of ${total} (chunk attempt ${chunkAttempt}/${MAX_ATTEMPTS_PER_CHUNK}${isLast ? ', final' : ''})`);
+          const result = await putResumableChunk(sessionUrl, blob, startByte, endByte, total, mimeType, onProgress);
+          if (result && result.id) {
+            // Final chunk returned the file metadata — upload complete.
+            return result;
           }
-          startByte = received;
-          console.log(`[drive] resumable: resuming from byte ${startByte} of ${total}`);
-          if (onLog) onLog('resume-from-byte', `Resuming from byte ${startByte} of ${total}`);
-        } catch (qErr) {
-          console.warn('[drive] resumable: progress query failed:', qErr && qErr.message);
-          if (onLog) onLog('resume-query-failed', `Progress query failed: ${qErr && qErr.message}`);
+          // result is null for non-final chunks (server returned 308). Move on.
+          chunkDone = true;
+        } catch (err) {
+          lastErr = err;
+          const summary = err && err.message ? err.message : String(err);
+          console.warn(`[drive] chunk ${startByte}-${endByte} attempt ${chunkAttempt} failed:`, summary);
+          if (onLog) onLog('put-failed', `Chunk ${startByte}-${endByte} attempt ${chunkAttempt}/${MAX_ATTEMPTS_PER_CHUNK}: ${summary}`);
+          if (chunkAttempt >= MAX_ATTEMPTS_PER_CHUNK) throw err;
+
+          const backoff = Math.min(4000, 1000 * Math.pow(2, chunkAttempt - 1)) + Math.floor(Math.random() * 250);
+          await new Promise((r) => setTimeout(r, backoff));
+
+          // Ask the server how many bytes it actually received — the
+          // attempt may have stalled mid-chunk and partial bytes are
+          // already stored. Advancing startByte avoids resending them.
+          try {
+            const received = await queryResumableProgress(sessionUrl, total);
+            if (received === null) throw new Error(`Resumable session lost: ${summary}`);
+            if (received >= total) {
+              console.log('[drive] resumable: server reports complete on resume query');
+              if (onLog) onLog('resume-complete', 'Server already received full file');
+              return {};
+            }
+            if (received > startByte) {
+              if (onLog) onLog('resume-from-byte', `Server received through byte ${received}, advancing`);
+              startByte = received;
+              chunkDone = true; // outer loop recomputes endByte from new startByte
+            }
+          } catch (qErr) {
+            console.warn('[drive] resumable: progress query failed:', qErr && qErr.message);
+            if (onLog) onLog('resume-query-failed', `Progress query failed: ${qErr && qErr.message}`);
+          }
         }
       }
+
+      if (!chunkDone) throw lastErr;
+      // Only advance past the chunk we just sent if the server didn't
+      // already advance startByte for us via the resume query above.
+      if (startByte <= endByte) startByte = endByte + 1;
     }
-    throw lastErr;
+
+    // Zero-byte file (no chunks sent) or final chunk returned 308 without
+    // metadata. Caller may not get a file id but the upload is complete.
+    return {};
   }
 
-  function putResumableSlice(sessionUrl, blob, startByte, total, mimeType, onProgress) {
-    const slice = startByte === 0 ? blob : blob.slice(startByte);
-    const endByte = total - 1;
+  function putResumableChunk(sessionUrl, blob, startByte, endByte, total, mimeType, onProgress) {
+    const slice = blob.slice(startByte, endByte + 1);
 
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('PUT', sessionUrl, true);
-      xhr.timeout = 60000;
-      if (startByte > 0) {
-        xhr.setRequestHeader('Content-Range', `bytes ${startByte}-${endByte}/${total}`);
-      }
+      xhr.timeout = CHUNK_PUT_TIMEOUT_MS;
+      xhr.setRequestHeader('Content-Range', `bytes ${startByte}-${endByte}/${total}`);
       xhr.setRequestHeader('Content-Type', mimeType || 'application/octet-stream');
+
+      // Stall detector. iOS keeps dead sockets open until xhr.timeout fires,
+      // so we watch for any progress event and abort early if none arrives
+      // within STALL_THRESHOLD_MS.
+      let lastProgressAt = Date.now();
+      const stallTimer = setInterval(() => {
+        if (Date.now() - lastProgressAt > STALL_THRESHOLD_MS) {
+          try { xhr.abort(); } catch (e) { /* ignore */ }
+        }
+      }, 3000);
+      const cleanup = () => clearInterval(stallTimer);
+
       xhr.upload.onprogress = (ev) => {
+        lastProgressAt = Date.now();
         if (onProgress && ev.lengthComputable) {
           onProgress((startByte + ev.loaded) / total);
         }
       };
-      xhr.ontimeout = () => reject(new Error(`Request timed out after ${xhr.timeout}ms during PUT at byte ${startByte}`));
-      xhr.onerror = () => reject(new Error(`Network error contacting resumable session at byte ${startByte}`));
+      xhr.ontimeout = () => { cleanup(); reject(new Error(`Request timed out after ${xhr.timeout}ms during PUT at byte ${startByte}`)); };
+      xhr.onerror = () => { cleanup(); reject(new Error(`Network error contacting resumable session at byte ${startByte}`)); };
+      xhr.onabort = () => { cleanup(); reject(new Error(`Upload stalled at byte ${startByte} — no progress for >${STALL_THRESHOLD_MS / 1000}s`)); };
       xhr.onload = () => {
+        cleanup();
         if (xhr.status >= 200 && xhr.status < 300) {
+          // Final chunk returns 200 with file metadata.
           try { resolve(JSON.parse(xhr.responseText)); }
           catch { resolve({}); }
         } else if (xhr.status === 308) {
-          const range = xhr.getResponseHeader('Range');
-          const m = range && range.match(/bytes=0-(\d+)/);
-          const received = m ? parseInt(m[1], 10) + 1 : startByte;
-          const err = new Error(`Partial PUT (308): server received ${received} of ${total}`);
-          err._partial = true;
-          err._received = received;
-          reject(err);
+          // Non-final chunk accepted; server is expecting more bytes.
+          resolve(null);
         } else {
           reject(new Error(`(${xhr.status}) Upload PUT failed: ${xhr.responseText || ''}`));
         }
