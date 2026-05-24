@@ -10,6 +10,26 @@ can pick up exactly where this one stopped.
 
 ## Current state (2026-05-24)
 
+### Recently shipped — Reinstall warning, drop per-capture download popup (SW v56)
+
+The v55 `<a download>` backup triggered an iOS download dialog on
+EVERY capture — 20 photos = 20 popups. Unusable for field work. Reverted.
+
+- Removed the `saveBlobLocally` call from
+  [enqueueCapture](docs/js/app.js). IndexedDB remains the only local
+  store for pending captures, which is fine as long as the PWA isn't
+  reinstalled — and v55's auto-update fix means it shouldn't ever
+  need to be.
+- Removed `maybeShowBackupHint` (no longer relevant).
+- `UI.saveBlobLocally` / `UI.saveBlobToCameraRoll` stay exported for
+  any future explicit "save this one to my device" button.
+- Strengthened the pending-uploads indicator: while items are queued,
+  the project screen now also shows
+  "⚠️ Do not reinstall the app until these finish uploading"
+  right under the count, in an unmissable amber panel. Reinstall is
+  the only path that wipes IDB; v55's auto-update means the user
+  shouldn't ever reinstall, but the warning protects against habit.
+
 ### Recently shipped — Local backup + auto-update fix (SW v55)
 
 **Two production-critical bugs found and fixed.**
