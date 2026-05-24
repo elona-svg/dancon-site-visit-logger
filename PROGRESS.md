@@ -10,6 +10,23 @@ can pick up exactly where this one stopped.
 
 ## Current state (2026-05-24)
 
+### Recently shipped — Stable thumbnail upload badges (SW v57)
+
+Fixed the capture screen flicker during uploads. Upload status/progress
+changes no longer call the full thumb-strip renderer, so existing
+thumbnail `<img>` nodes keep their original `src` and stay mounted until
+the user leaves the folder or the thumb is otherwise structurally changed.
+
+- `patchThumbByQueueId` now updates only the matching thumb's status UI
+  in place: root `pending`/`queued` classes, `.thumb-state` text/hidden
+  state, progress bar visibility/width, retry button visibility, and the
+  local queue indicator.
+- `thumbHtml` always renders stable status/progress/retry controls so
+  later upload transitions mutate those controls instead of rebuilding
+  the entire `.thumb` element.
+- Error queue items are treated as pending for badge/retry display, and
+  the pending warning counts every local queued item until upload success.
+
 ### Recently shipped — Reinstall warning, drop per-capture download popup (SW v56)
 
 The v55 `<a download>` backup triggered an iOS download dialog on

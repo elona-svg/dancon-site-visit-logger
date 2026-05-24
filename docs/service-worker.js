@@ -1,6 +1,6 @@
 // Bump CACHE_VERSION on every release to invalidate stale shells.
 // This file is versioned on registration to avoid stale GitHub Pages cache.
-const CACHE_VERSION = 'dancon-svl-v56';
+const CACHE_VERSION = 'dancon-svl-v57';
 const APP_SHELL = [
   './',
   './index.html',

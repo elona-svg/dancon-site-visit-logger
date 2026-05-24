@@ -1843,7 +1843,7 @@
     const t = state.thumbs.find((x) => x.queueId === queueId);
     if (!t) return;
     Object.assign(t, patch);
-    updateThumbsDOM();
+    patchThumbStatusDOM(t);
   }
 
   function computeRetryDelay(attempts) {
@@ -3295,7 +3295,7 @@
   function updateLocalQueueIndicatorDOM() {
     const el = document.getElementById('local-queue-indicator');
     if (!el) return;
-    const pending = state.thumbs.filter((t) => t.status === 'pending' || t.status === 'failed' || t.status === 'queued').length;
+    const pending = state.thumbs.filter((t) => t.queueId && t.status !== 'success').length;
     if (pending === 0) {
       el.innerHTML = '';
       return;
@@ -3576,6 +3576,72 @@
   }
 
   // -------- Thumbs render --------
+  function thumbStatusView(t) {
+    const status = t && t.status;
+    const pct = Math.round(((t && t.progress) || 0) * 100);
+    const isPending = status === 'pending' || status === 'failed' || status === 'error';
+    const rootClass = status === 'success' ? ''
+      : isPending ? 'pending'
+        : 'queued';
+    let badgeText = '';
+    if (status === 'failed' || status === 'pending' || status === 'error') badgeText = 'Pending upload';
+    else if (status === 'queued') badgeText = 'Queued';
+    else if (status === 'uploading') badgeText = `${pct}%`;
+    return {
+      rootClass,
+      badgeText,
+      pct,
+      showBadge: !!badgeText,
+      showProgress: status === 'uploading' || status === 'queued',
+      showRetry: status === 'failed' || status === 'error'
+    };
+  }
+
+  function applyThumbStatusToElement(el, t) {
+    if (!el || !t) return;
+    const view = thumbStatusView(t);
+
+    // Keep the media subtree untouched. Upload progress is noisy, so this
+    // function only mutates status controls that already sit above the image.
+    el.classList.toggle('pending', view.rootClass === 'pending');
+    el.classList.toggle('queued', view.rootClass === 'queued');
+    if (t.queueId != null) el.dataset.queueId = String(t.queueId);
+    if (t.fileId != null) el.dataset.fileId = String(t.fileId);
+    if (t.status) el.dataset.uploadStatus = String(t.status);
+
+    const badge = el.querySelector('.thumb-state');
+    if (badge) {
+      badge.textContent = view.badgeText;
+      badge.hidden = !view.showBadge;
+    }
+
+    const progress = el.querySelector('.thumb-progress');
+    if (progress) progress.hidden = !view.showProgress;
+    const bar = el.querySelector('.thumb-progress-bar');
+    if (bar) bar.style.width = `${view.pct}%`;
+
+    const retry = el.querySelector('.thumb-retry');
+    if (retry) retry.hidden = !view.showRetry;
+  }
+
+  function patchThumbStatusDOM(t) {
+    const strip = document.getElementById('thumb-strip');
+    if (!strip || !t || t.queueId == null) {
+      updateThumbsDOM();
+      return;
+    }
+    const queueId = String(t.queueId);
+    const el = Array.from(strip.querySelectorAll('.thumb'))
+      .find((node) => node.dataset.queueId === queueId);
+    if (!el) {
+      updateThumbsDOM();
+      return;
+    }
+    applyThumbStatusToElement(el, t);
+    updateRetryAllButtonDOM();
+    updateLocalQueueIndicatorDOM();
+  }
+
   function updateThumbsDOM() {
     const strip = document.getElementById('thumb-strip');
     if (!strip) return;
@@ -3628,12 +3694,12 @@
   function updateRetryAllButtonDOM() {
     const btn = document.getElementById('retry-all-btn');
     if (!btn) return;
-    const hasPending = state.thumbs.some((t) => t.status === 'pending' || t.status === 'failed');
+    const hasPending = state.thumbs.some((t) => t.status === 'pending' || t.status === 'failed' || t.status === 'error');
     btn.hidden = !hasPending;
   }
 
   async function retryAllFailed() {
-    const targets = state.thumbs.filter((t) => t.status === 'pending' || t.status === 'failed');
+    const targets = state.thumbs.filter((t) => t.status === 'pending' || t.status === 'failed' || t.status === 'error');
     if (targets.length === 0) return;
     await Promise.all(targets.map(async (t) => {
       if (!t.queueId) return;
@@ -3645,10 +3711,12 @@
   }
 
   function thumbHtml(t, idx) {
-    const cls = t.status === 'success' ? '' : (t.status === 'pending' || t.status === 'failed' ? 'pending' : 'queued');
-    const showProgress = t.status === 'uploading' || t.status === 'queued';
-    const pct = Math.round((t.progress || 0) * 100);
-    const key = escapeHtml(String(t.queueId ?? t.fileId ?? `thumb-${idx}`));
+    const view = thumbStatusView(t);
+    const keyRaw = String(t.queueId ?? t.fileId ?? `thumb-${idx}`);
+    const key = escapeHtml(keyRaw);
+    const queueIdAttr = t.queueId != null ? ` data-queue-id="${escapeHtml(String(t.queueId))}"` : '';
+    const fileIdAttr = t.fileId != null ? ` data-file-id="${escapeHtml(String(t.fileId))}"` : '';
+    const statusAttr = t.status ? ` data-upload-status="${escapeHtml(String(t.status))}"` : '';
 
     let bgHtml = '';
     let metaHtml = '';
@@ -3675,27 +3743,21 @@
       }
     }
 
-    let stateHtml = '';
-    if (t.status === 'failed') stateHtml = '<span class="thumb-state">Pending upload</span>';
-    else if (t.status === 'pending') stateHtml = '<span class="thumb-state">Pending upload</span>';
-    else if (t.status === 'queued') stateHtml = '<span class="thumb-state">Queued</span>';
-    else if (t.status === 'uploading') stateHtml = `<span class="thumb-state">${pct}%</span>`;
+    const stateHtml = `<span class="thumb-state"${view.showBadge ? '' : ' hidden'}>${escapeHtml(view.badgeText)}</span>`;
 
-    const selected = thumbSelectMode && thumbSelection.has(String(key));
+    const selected = thumbSelectMode && thumbSelection.has(keyRaw);
     const selCls = thumbSelectMode ? (selected ? ' selected' : ' selectable') : '';
     const checkHtml = thumbSelectMode
       ? `<div class="thumb-check" aria-hidden="true">${selected ? '✓' : ''}</div>`
       : '';
 
     return `
-      <div class="thumb ${cls} ${t.type}${selCls}" data-thumb-action="open" data-thumb-idx="${idx}" data-thumb-key="${key}">
+      <div class="thumb ${view.rootClass} ${t.type}${selCls}" data-thumb-action="open" data-thumb-idx="${idx}" data-thumb-key="${key}"${queueIdAttr}${fileIdAttr}${statusAttr}>
         ${bgHtml}
         ${stateHtml}
-        ${showProgress ? `<div class="thumb-progress"><div class="thumb-progress-bar" style="width:${pct}%"></div></div>` : ''}
+        <div class="thumb-progress"${view.showProgress ? '' : ' hidden'}><div class="thumb-progress-bar" style="width:${view.pct}%"></div></div>
         ${checkHtml}
-        ${t.status === 'failed'
-          ? `<button class="thumb-retry" data-thumb-action="retry" data-thumb-idx="${idx}" aria-label="Retry">↻ Retry</button>`
-          : ''}
+        <button class="thumb-retry" data-thumb-action="retry" data-thumb-idx="${idx}" aria-label="Retry"${view.showRetry ? '' : ' hidden'}>↻ Retry</button>
         ${metaHtml}
       </div>
     `;
