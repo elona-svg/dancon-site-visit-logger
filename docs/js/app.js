@@ -2477,7 +2477,8 @@
       name: t.name,
       fileId: t.fileId || null,
       status: t.status,
-      thumbRef: t
+      thumbRef: t,
+      queueId: t.queueId || null
     }));
 
     window.Viewer.open({

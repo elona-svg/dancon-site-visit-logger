@@ -210,6 +210,19 @@ window.Viewer = (function () {
     loadCurrentImage();
   }
 
+  async function loadLocalQueueBlob(item) {
+    const queueId = item.queueId || item.thumbRef?.queueId;
+    if (!queueId || !window.DB || typeof window.DB.queueAll !== 'function') return null;
+    try {
+      const all = await window.DB.queueAll();
+      const queued = all.find((q) => q.id === queueId);
+      if (queued && queued.blob) return queued.blob;
+    } catch (err) {
+      console.warn('[viewer] local queue lookup failed:', err);
+    }
+    return null;
+  }
+
   async function loadCurrentImage() {
     const item = items[idx];
     if (!item) return;
@@ -227,6 +240,15 @@ window.Viewer = (function () {
     // 2. Current-session blob URL? (newly captured photo, not yet uploaded)
     if (item.objectUrl) {
       showImg(img, loading, item.objectUrl);
+      return;
+    }
+
+    // 2b. Pending queue blob in IndexedDB.
+    const localBlob = await loadLocalQueueBlob(item);
+    if (localBlob) {
+      const url = URL.createObjectURL(localBlob);
+      resolvedSrc.set(idx, url);
+      showImg(img, loading, url);
       return;
     }
 
