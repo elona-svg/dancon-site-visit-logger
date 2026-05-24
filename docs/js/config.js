@@ -26,5 +26,5 @@ window.CONFIG = {
   // Retry/backoff for failed uploads (ms).
   RETRY_BASE_DELAY: 2000,
   RETRY_MAX_DELAY: 60000,
-  APP_VERSION: 'v49'
+  APP_VERSION: 'v50'
 };

@@ -232,6 +232,12 @@ window.Drive = (function () {
     });
   }
 
+  // Resumable upload that actually resumes on failure.
+  // Drive resumable protocol: POST init returns a session URL; PUTs to that
+  // URL upload bytes. If a PUT fails mid-stream we query "PUT with
+  // Content-Range: bytes */<total>" — server replies 308 with a Range header
+  // telling us how many bytes it received, and we PUT only the remaining
+  // slice. Survives weak-signal disconnects without restarting from byte 0.
   async function uploadResumable({ folderId, fileName, mimeType, blob, onProgress }) {
     try { console.log('[drive] uploadResumable start', { fileName, mimeType, size: blob && blob.size, folderId }); } catch (e) {}
     const metadata = { name: fileName, parents: [folderId] };
@@ -261,32 +267,121 @@ window.Drive = (function () {
     try { console.log('[drive] resumable sessionUrl=', sessionUrl && sessionUrl.slice(0, 120)); } catch (e) {}
     if (!sessionUrl) throw new Error('Resumable session URL missing');
 
-    return withRetry(() => new Promise((resolve, reject) => {
+    return resumablePutWithResume(sessionUrl, blob, mimeType, onProgress);
+  }
+
+  async function resumablePutWithResume(sessionUrl, blob, mimeType, onProgress) {
+    const MAX_RESUME_ATTEMPTS = 5;
+    const total = blob.size;
+    let startByte = 0;
+    let attempt = 0;
+    let lastErr;
+
+    while (attempt < MAX_RESUME_ATTEMPTS) {
+      try {
+        const result = await putResumableSlice(sessionUrl, blob, startByte, total, mimeType, onProgress);
+        return result;
+      } catch (err) {
+        lastErr = err;
+        attempt += 1;
+        console.warn(`[drive] resumable PUT attempt ${attempt} failed (startByte=${startByte}):`, err && err.message);
+        if (attempt >= MAX_RESUME_ATTEMPTS) throw err;
+
+        const backoff = Math.min(8000, 1000 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 250);
+        await new Promise((r) => setTimeout(r, backoff));
+
+        try {
+          const received = await queryResumableProgress(sessionUrl, total);
+          if (received === null) throw new Error(`Resumable session lost mid-upload: ${err.message}`);
+          if (received >= total) {
+            // Server got everything — prior PUT may have succeeded right as the
+            // socket died. Treat as success (caller may not get the file id).
+            console.log('[drive] resumable: server reports complete on resume query');
+            return {};
+          }
+          startByte = received;
+          console.log(`[drive] resumable: resuming from byte ${startByte} of ${total}`);
+        } catch (qErr) {
+          console.warn('[drive] resumable: progress query failed:', qErr && qErr.message);
+          // Keep prior startByte and try again — Drive accepts re-PUT from 0
+          // and a follow-up failure will re-query.
+        }
+      }
+    }
+    throw lastErr;
+  }
+
+  function putResumableSlice(sessionUrl, blob, startByte, total, mimeType, onProgress) {
+    const slice = startByte === 0 ? blob : blob.slice(startByte);
+    const endByte = total - 1;
+
+    return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('PUT', sessionUrl, true);
-      xhr.timeout = 60000;
-      xhr.ontimeout = () => reject(new Error(`Request timed out after ${xhr.timeout}ms contacting resumable session`));
+      xhr.timeout = 120000;
+      if (startByte > 0) {
+        xhr.setRequestHeader('Content-Range', `bytes ${startByte}-${endByte}/${total}`);
+      }
       xhr.setRequestHeader('Content-Type', mimeType || 'application/octet-stream');
       xhr.upload.onprogress = (ev) => {
-        if (onProgress && ev.lengthComputable) onProgress(ev.loaded / ev.total);
+        if (onProgress && ev.lengthComputable) {
+          onProgress((startByte + ev.loaded) / total);
+        }
       };
+      xhr.ontimeout = () => reject(new Error(`Request timed out after ${xhr.timeout}ms during PUT at byte ${startByte}`));
+      xhr.onerror = () => reject(new Error(`Network error contacting resumable session at byte ${startByte}`));
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
           try { resolve(JSON.parse(xhr.responseText)); }
           catch { resolve({}); }
+        } else if (xhr.status === 308) {
+          const range = xhr.getResponseHeader('Range');
+          const m = range && range.match(/bytes=0-(\d+)/);
+          const received = m ? parseInt(m[1], 10) + 1 : startByte;
+          const err = new Error(`Partial PUT (308): server received ${received} of ${total}`);
+          err._partial = true;
+          err._received = received;
+          reject(err);
         } else {
-          console.error('[drive] upload PUT failed', { status: xhr.status, body: xhr.responseText });
           reject(new Error(`(${xhr.status}) Upload PUT failed: ${xhr.responseText || ''}`));
         }
       };
-      xhr.onerror = () => reject(new Error(`Network error during upload to ${sessionUrl}`));
-      xhr.send(blob);
-    }));
+      xhr.send(slice);
+    });
   }
 
+  function queryResumableProgress(sessionUrl, total) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', sessionUrl, true);
+      xhr.timeout = 20000;
+      xhr.setRequestHeader('Content-Range', `bytes */${total}`);
+      xhr.ontimeout = () => reject(new Error('Resume query timed out'));
+      xhr.onerror = () => reject(new Error('Resume query network error'));
+      xhr.onload = () => {
+        if (xhr.status === 308) {
+          const range = xhr.getResponseHeader('Range');
+          if (!range) { resolve(0); return; }
+          const m = range.match(/bytes=0-(\d+)/);
+          resolve(m ? parseInt(m[1], 10) + 1 : 0);
+        } else if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(total);
+        } else if (xhr.status === 404 || xhr.status === 410) {
+          resolve(null);
+        } else {
+          reject(new Error(`Resume query failed (${xhr.status}): ${xhr.responseText || ''}`));
+        }
+      };
+      xhr.send(null);
+    });
+  }
+
+  // All user-content uploads go through resumable so flaky connections can
+  // pick up where they left off. Multipart is reserved for tiny metadata
+  // writes (notes.txt, visit_log.txt, .dancon-project marker) where the
+  // resumable round-trip is overhead and restart-from-zero costs nothing.
   async function uploadFile(opts) {
-    const big = opts.blob.size > 5 * 1024 * 1024;
-    return big ? uploadResumable(opts) : uploadMultipart(opts);
+    return uploadResumable(opts);
   }
 
   // -------- Singleton metadata writes (mutex + upsert) --------

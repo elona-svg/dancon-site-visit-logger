@@ -65,6 +65,19 @@
   let _renderHandle = null;
   let renderedFlag = '';
 
+  // Network circuit breaker. navigator.onLine lies on iOS in weak-signal
+  // and captive-portal conditions, so we track real upload reachability
+  // separately. After NET_ERROR_THRESHOLD consecutive Network errors we
+  // open the circuit: pump pauses, the conn dot goes orange, and a probe
+  // loop polls a tiny HEAD against Drive every PROBE_INTERVAL_MS. When the
+  // probe succeeds we close the circuit and resume.
+  const NET_ERROR_THRESHOLD = 2;
+  const PROBE_INTERVAL_MS = 30000;
+  const POST_NET_FAILURE_PAUSE_MS = 5000;
+  let consecutiveNetErrors = 0;
+  let circuitOpen = false;
+  let probeTimer = null;
+
   function scheduleRender() {
     if (_renderHandle) return;
     _renderHandle = requestAnimationFrame(() => {
@@ -228,6 +241,9 @@
     if (queueWatchdogId) return;
     queueWatchdogId = setInterval(async () => {
       if (!state.isOnline || !window.Auth.isSignedIn()) return;
+      // When the circuit is open the probe loop owns recovery — don't
+      // double-pump or we'll just hammer a dead link again.
+      if (circuitOpen) return;
       if (inflight.size > 0) return;
       try {
         const pending = await window.DB.queuePending();
@@ -247,14 +263,21 @@
     queueWatchdogId = null;
   }
 
-  window.addEventListener('online', () => {
+  window.addEventListener('online', async () => {
     state.isOnline = true;
     toast('Back online — resuming uploads', 'info');
-    pumpQueue();
-    startQueueWatchdog();
     updateOnlineBadges();
     updateConnDotDOM();
-    // Kick a refresh so the status dot turns green again ASAP.
+    // If the circuit was open, run one probe right now instead of waiting
+    // up to 30s for the next interval tick. The 'online' event sometimes
+    // fires while real upload bandwidth is still nil, so we still gate on
+    // the probe rather than blindly closing.
+    if (circuitOpen) {
+      const ok = await probeNetwork();
+      if (ok) closeCircuit();
+    }
+    pumpQueue();
+    startQueueWatchdog();
     if (window.Auth.getTokenStatus() !== 'valid') {
       window.Auth.getAccessToken(true).catch(() => {});
     }
@@ -283,6 +306,10 @@
   // out as a side effect.
   function getConnectionStatus() {
     if (!state.isOnline) return 'offline';
+    // Degraded = navigator.onLine is true but real uploads have been
+    // failing with network errors. Surfaced as orange so the tech can
+    // tell the app paused itself rather than the app being broken.
+    if (circuitOpen) return 'degraded';
     const ts = window.Auth.getTokenStatus();
     if (ts === 'failed' || ts === 'refreshing') return 'reconnecting';
     return 'connected';
@@ -338,9 +365,10 @@
     if (state.view === 'login' || state.booting) { dot.hidden = true; return; }
     dot.hidden = false;
     const status = getConnectionStatus();
-    dot.classList.remove('connected', 'reconnecting', 'offline');
+    dot.classList.remove('connected', 'reconnecting', 'degraded', 'offline');
     dot.classList.add(status);
     dot.title = status === 'connected' ? 'Connected to Drive'
+      : status === 'degraded' ? 'Network unstable — uploads paused, retrying soon'
       : status === 'reconnecting' ? 'Reconnecting…'
       : 'Offline — working from cache';
   }
@@ -1834,6 +1862,66 @@
     return Math.min(maxDelay, base * 2 ** Math.max(0, attempts - 1));
   }
 
+  function isNetworkError(err) {
+    const msg = String(err && (err.message || err) || '');
+    return /Network error contacting|Network error during|Network error contacting resumable|Request timed out/.test(msg);
+  }
+
+  // Lightweight reachability check. HEAD doesn't need auth — any non-5xx
+  // reply (even 401/403) proves the network can reach Drive. Aborts after
+  // 8s so a hung probe never blocks the loop.
+  async function probeNetwork() {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch('https://www.googleapis.com/drive/v3/about?fields=user', {
+        method: 'HEAD',
+        cache: 'no-store',
+        signal: controller.signal
+      });
+      return res.status > 0 && res.status < 500;
+    } catch (e) {
+      return false;
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  function tripCircuit() {
+    if (circuitOpen) return;
+    circuitOpen = true;
+    console.warn('[circuit] tripped — uploads paused, starting probe loop');
+    updateConnDotDOM();
+    startNetworkProbeLoop();
+    try {
+      toast('Network unstable — uploads paused. Will resume automatically.', 'warn', 6000);
+    } catch (e) {}
+  }
+
+  function closeCircuit() {
+    if (!circuitOpen) return;
+    circuitOpen = false;
+    consecutiveNetErrors = 0;
+    console.log('[circuit] closed — resuming uploads');
+    stopNetworkProbeLoop();
+    updateConnDotDOM();
+    pumpQueue();
+  }
+
+  function startNetworkProbeLoop() {
+    if (probeTimer) return;
+    probeTimer = setInterval(async () => {
+      const ok = await probeNetwork();
+      if (ok) closeCircuit();
+    }, PROBE_INTERVAL_MS);
+  }
+
+  function stopNetworkProbeLoop() {
+    if (!probeTimer) return;
+    clearInterval(probeTimer);
+    probeTimer = null;
+  }
+
   async function createVideoThumbnail(blob) {
     if (!blob) return null;
     const url = URL.createObjectURL(blob);
@@ -1936,6 +2024,10 @@
     queueMicrotask(async () => {
       queuePumpScheduled = false;
       if (!state.isOnline) return;
+      // Circuit breaker open — the probe loop is responsible for resuming.
+      // Skipping here prevents the queue from burning 15s per attempt on a
+      // network that's actually dead despite navigator.onLine === true.
+      if (circuitOpen) return;
       // No user → nothing to upload; calling getAccessToken would only
       // trigger a doomed silent-refresh against the GIS iframe in the
       // PWA sandbox. The user will pumpQueue again after signing in.
@@ -2029,6 +2121,10 @@
           throw driveErr;
         }
         console.log('[upload] success id=', item.id, 'driveFileId=', result?.id);
+        // Successful upload = network is genuinely up. Reset the breaker
+        // counter and close the circuit if it was open.
+        consecutiveNetErrors = 0;
+        if (circuitOpen) closeCircuit();
         uploadProgressTracker.delete(item.id);
         appendUploadLogEntry({
           status: 'success',
@@ -2067,6 +2163,15 @@
             authError: window.Auth.getLastAuthError && window.Auth.getLastAuthError()
           });
         } catch (e) {}
+        // Track consecutive network failures to drive the circuit breaker.
+        // Non-network failures (4xx, auth, malformed) reset the counter so
+        // a single bad file doesn't trip the breaker.
+        if (isNetworkError(err)) {
+          consecutiveNetErrors += 1;
+          if (consecutiveNetErrors >= NET_ERROR_THRESHOLD) tripCircuit();
+        } else {
+          consecutiveNetErrors = 0;
+        }
         const attempts = (item.attempts || 0) + 1;
         const delay = computeRetryDelay(attempts);
         uploadProgressTracker.delete(item.id);
@@ -2094,7 +2199,14 @@
       }
     })().finally(() => {
       inflight.delete(item.id);
-      pumpQueue();
+      // After a network failure, don't fire the next item the same tick.
+      // Five seconds is enough that we stop burning attempts (~15s each)
+      // back-to-back on a dead link, but short enough that recovery feels
+      // immediate once signal returns. If the circuit is open the pump
+      // will no-op anyway and the probe loop owns recovery.
+      const pauseMs = (consecutiveNetErrors > 0 && !circuitOpen) ? POST_NET_FAILURE_PAUSE_MS : 0;
+      if (pauseMs) setTimeout(() => pumpQueue(), pauseMs);
+      else pumpQueue();
     });
     inflight.set(item.id, promise);
   }
@@ -2103,6 +2215,9 @@
     if (inflight.has(queueId)) return;
     await window.DB.queueUpdate(queueId, { status: 'pending', attempts: 0, lastError: null, nextAttemptAt: 0 });
     patchThumbByQueueId(queueId, { status: 'queued', progress: 0, error: null, nextAttemptAt: 0 });
+    // Manual retry overrides the breaker — user is explicitly saying "try
+    // now". If the network is still dead the next failure will re-trip it.
+    if (circuitOpen) closeCircuit();
     pumpQueue();
   }
 

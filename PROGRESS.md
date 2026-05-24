@@ -8,6 +8,43 @@
 Update this file at the end of every working session so the next session
 can pick up exactly where this one stopped.
 
+## Current state (2026-05-24)
+
+### Recently shipped — Network resilience (SW v50)
+
+Diagnosed why uploads stall on weak signal: queue runner trusted
+`navigator.onLine`, retried back-to-back with no pause, and multipart
+uploads restarted from byte 0 on every failure. Four changes ship
+together:
+
+- **Network-error circuit breaker** ([app.js](docs/js/app.js)). After
+  2 consecutive `Network error` failures the breaker opens: pump halts,
+  watchdog stands down, and a 30s `HEAD` probe against
+  `googleapis.com/drive/v3/about` polls until reachability returns. A
+  successful upload OR a successful probe closes the breaker and
+  resumes the pump. `navigator.onLine`'s online event also triggers a
+  probe instead of optimistically resuming.
+- **Degraded (orange) connection dot** ([app.js](docs/js/app.js)
+  `getConnectionStatus` / `updateConnDotDOM`, [style.css](docs/css/style.css)).
+  Third state distinct from reconnecting (amber, fast pulse) and
+  offline (red). Tooltip: "Network unstable — uploads paused, retrying
+  soon" so the tech knows it's the network, not the app.
+- **5s pause between failed items** ([app.js startUpload finally](docs/js/app.js)).
+  When `consecutiveNetErrors > 0`, the next pump waits 5s rather than
+  firing the same millisecond — stops burning 15s-per-attempt back-to-
+  back on a dead link.
+- **All uploads are now resumable with byte-range resume**
+  ([drive.js uploadFile / resumablePutWithResume](docs/js/drive.js)).
+  Photos no longer take the multipart path. On any PUT failure we query
+  the session (`PUT … Content-Range: bytes */<total>`) and resume from
+  the last received byte instead of restarting. Up to 5 resume attempts
+  with exponential backoff. Multipart is reserved for tiny metadata
+  writes (notes.txt, visit_log.txt, marker) where the resumable round-
+  trip is pure overhead.
+
+Manual retry from a thumbnail force-closes an open circuit so the user
+gets one optimistic attempt; if it fails the breaker simply re-trips.
+
 ## Current state (2026-05-22)
 
 - Mobile-first PWA, installable to iPhone home screen.
