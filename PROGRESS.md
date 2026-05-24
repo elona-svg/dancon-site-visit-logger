@@ -10,6 +10,21 @@ can pick up exactly where this one stopped.
 
 ## Current state (2026-05-24)
 
+### Recently shipped — Network-stall upload handling (SW v59)
+
+Fixed the retry UI and circuit-breaker behavior for weak 5G uploads.
+
+- Upload stall errors (`Upload stalled`, resume-query timeout/network
+  errors) now count as real network failures.
+- The upload circuit breaker now pauses after the first real network
+  failure, then probes Drive reachability and resumes automatically
+  instead of walking every pending thumb into an error-looking state.
+- Failed upload attempts remain stored as `pending` in IndexedDB with a
+  retry delay, so refreshes show local captures as pending/queued rather
+  than permanent red per-thumb failures.
+- Legacy `error` rows from earlier builds are normalized to pending on
+  project load, and the global button now reads "Retry Pending".
+
 ### Recently shipped — Drive/local queue reconciliation (SW v58)
 
 Fixed the dangerous split-brain state where a capture could exist in

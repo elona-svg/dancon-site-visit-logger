@@ -71,7 +71,7 @@
   // open the circuit: pump pauses, the conn dot goes orange, and a probe
   // loop polls a tiny HEAD against Drive every PROBE_INTERVAL_MS. When the
   // probe succeeds we close the circuit and resume.
-  const NET_ERROR_THRESHOLD = 2;
+  const NET_ERROR_THRESHOLD = 1;
   const PROBE_INTERVAL_MS = 30000;
   const POST_NET_FAILURE_PAUSE_MS = 5000;
   let consecutiveNetErrors = 0;
@@ -1854,7 +1854,7 @@
 
   function isNetworkError(err) {
     const msg = String(err && (err.message || err) || '');
-    return /Network error contacting|Network error during|Network error contacting resumable|Request timed out/.test(msg);
+    return /Network error contacting|Network error during|Network error contacting resumable|Request timed out|Upload stalled|Resume query timed out|Resume query network error/i.test(msg);
   }
 
   // Lightweight reachability check. HEAD doesn't need auth — any non-5xx
@@ -2195,7 +2195,7 @@
         uploadProgressTracker.delete(item.id);
         try {
           await window.DB.queueUpdate(item.id, {
-            status: 'error',
+            status: 'pending',
             attempts,
             lastError: err && (err.message || String(err)),
             nextAttemptAt: Date.now() + delay
@@ -2262,7 +2262,7 @@
           name: item.fileName,
           mime: item.mimeType,
           size: item.blob.size || 0,
-          status: item.status === 'pending' ? 'pending' : item.status,
+          status: item.status === 'uploading' ? 'queued' : 'pending',
           progress: 0,
           queueId: item.id,
           addedAt: item.createdAt || Date.now(),
@@ -3255,7 +3255,7 @@
               <span id="thumbs-sync" class="sync-dot" hidden aria-label="Syncing"></span>
               <div class="sort-wrap">
                 <button class="sort-btn" id="sort-btn" type="button" aria-haspopup="true">↕ ${escapeHtml(sortLabel())}</button>
-                <button class="btn-ghost" id="retry-all-btn" type="button" hidden>Retry All Failed</button>
+                <button class="btn-ghost" id="retry-all-btn" type="button" hidden>Retry Pending</button>
                 <div class="sort-popover" id="sort-popover" hidden>
                   <button data-sort="date" type="button">Date (newest first)</button>
                   <button data-sort="type" type="button">Type</button>
