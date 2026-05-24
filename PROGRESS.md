@@ -10,6 +10,34 @@ can pick up exactly where this one stopped.
 
 ## Current state (2026-05-24)
 
+### Recently shipped — Resumable observability + fail-fast (SW v52)
+
+**Bug:** After v50 shipped the resumable code, items were getting stuck
+at 0% with only "starting" in the log panel and nothing after. Two
+problems:
+
+1. Inner retry loop was too patient — 5 attempts × 120s PUT timeout =
+   up to 10 minutes per item before the outer startUpload catch saw a
+   failure. While stuck, `consecutiveNetErrors` stayed at 0 so the
+   circuit breaker never tripped.
+2. The on-screen log panel only got entries from app.js, not drive.js.
+   Resumable init, session creation, PUT attempts, and resume queries
+   were all invisible to the tech.
+
+**Fix:**
+
+- `MAX_RESUME_ATTEMPTS` 5 → 2 in
+  [drive.js resumablePutWithResume](docs/js/drive.js). Outer queue
+  retries pick up the slack and surface to the breaker quickly.
+- PUT timeout 120s → 60s, query timeout 20s → 15s, init POST timeout
+  60s → 20s. Worst-case per-item time drops from ~10 min to ~2.5 min.
+- New `onLog` callback on `uploadFile` /
+  [uploadResumable](docs/js/drive.js). Drive emits `init-started`,
+  `session-created`, `put-started` (with byte range and attempt),
+  `put-failed`, `resume-from-byte`, `resume-query-failed`,
+  `resume-complete`. App.js wraps `appendUploadLogEntry` as the
+  callback so each milestone appears in the in-app log panel.
+
 ### Recently shipped — Viewer X ghost-click fix (SW v51)
 
 **Bug:** Tapping X on a full-screen photo inside a project sent the tech

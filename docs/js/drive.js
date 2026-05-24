@@ -238,8 +238,9 @@ window.Drive = (function () {
   // Content-Range: bytes */<total>" — server replies 308 with a Range header
   // telling us how many bytes it received, and we PUT only the remaining
   // slice. Survives weak-signal disconnects without restarting from byte 0.
-  async function uploadResumable({ folderId, fileName, mimeType, blob, onProgress }) {
+  async function uploadResumable({ folderId, fileName, mimeType, blob, onProgress, onLog }) {
     try { console.log('[drive] uploadResumable start', { fileName, mimeType, size: blob && blob.size, folderId }); } catch (e) {}
+    if (onLog) onLog('init-started', `Init resumable session for ${fileName}`);
     const metadata = { name: fileName, parents: [folderId] };
 
     const initRes = await withRetry(async () => {
@@ -252,7 +253,8 @@ window.Drive = (function () {
             'X-Upload-Content-Type': mimeType || 'application/octet-stream',
             'X-Upload-Content-Length': String(blob.size)
           },
-          body: JSON.stringify(metadata)
+          body: JSON.stringify(metadata),
+          timeoutMs: 20000
         }
       );
       if (!r.ok) {
@@ -266,12 +268,16 @@ window.Drive = (function () {
     const sessionUrl = initRes.headers.get('Location');
     try { console.log('[drive] resumable sessionUrl=', sessionUrl && sessionUrl.slice(0, 120)); } catch (e) {}
     if (!sessionUrl) throw new Error('Resumable session URL missing');
+    if (onLog) onLog('session-created', `Session ready (${(blob.size / 1024 / 1024).toFixed(2)} MB)`);
 
-    return resumablePutWithResume(sessionUrl, blob, mimeType, onProgress);
+    return resumablePutWithResume(sessionUrl, blob, mimeType, onProgress, onLog);
   }
 
-  async function resumablePutWithResume(sessionUrl, blob, mimeType, onProgress) {
-    const MAX_RESUME_ATTEMPTS = 5;
+  // Bounded retry. We fail fast on PUT errors so the outer startUpload catch
+  // sees the failure quickly and the queue-level circuit breaker can engage.
+  // Longer worst-case timeouts here would hide a dead network for minutes.
+  async function resumablePutWithResume(sessionUrl, blob, mimeType, onProgress, onLog) {
+    const MAX_RESUME_ATTEMPTS = 2;
     const total = blob.size;
     let startByte = 0;
     let attempt = 0;
@@ -279,32 +285,34 @@ window.Drive = (function () {
 
     while (attempt < MAX_RESUME_ATTEMPTS) {
       try {
+        if (onLog) onLog('put-started', `PUT bytes ${startByte}-${total - 1} of ${total} (attempt ${attempt + 1}/${MAX_RESUME_ATTEMPTS})`);
         const result = await putResumableSlice(sessionUrl, blob, startByte, total, mimeType, onProgress);
         return result;
       } catch (err) {
         lastErr = err;
         attempt += 1;
-        console.warn(`[drive] resumable PUT attempt ${attempt} failed (startByte=${startByte}):`, err && err.message);
+        const summary = err && err.message ? err.message : String(err);
+        console.warn(`[drive] resumable PUT attempt ${attempt} failed (startByte=${startByte}):`, summary);
+        if (onLog) onLog('put-failed', `Attempt ${attempt}/${MAX_RESUME_ATTEMPTS} failed at byte ${startByte}: ${summary}`);
         if (attempt >= MAX_RESUME_ATTEMPTS) throw err;
 
-        const backoff = Math.min(8000, 1000 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 250);
+        const backoff = Math.min(4000, 1000 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 250);
         await new Promise((r) => setTimeout(r, backoff));
 
         try {
           const received = await queryResumableProgress(sessionUrl, total);
           if (received === null) throw new Error(`Resumable session lost mid-upload: ${err.message}`);
           if (received >= total) {
-            // Server got everything — prior PUT may have succeeded right as the
-            // socket died. Treat as success (caller may not get the file id).
             console.log('[drive] resumable: server reports complete on resume query');
+            if (onLog) onLog('resume-complete', 'Server already received full file');
             return {};
           }
           startByte = received;
           console.log(`[drive] resumable: resuming from byte ${startByte} of ${total}`);
+          if (onLog) onLog('resume-from-byte', `Resuming from byte ${startByte} of ${total}`);
         } catch (qErr) {
           console.warn('[drive] resumable: progress query failed:', qErr && qErr.message);
-          // Keep prior startByte and try again — Drive accepts re-PUT from 0
-          // and a follow-up failure will re-query.
+          if (onLog) onLog('resume-query-failed', `Progress query failed: ${qErr && qErr.message}`);
         }
       }
     }
@@ -318,7 +326,7 @@ window.Drive = (function () {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('PUT', sessionUrl, true);
-      xhr.timeout = 120000;
+      xhr.timeout = 60000;
       if (startByte > 0) {
         xhr.setRequestHeader('Content-Range', `bytes ${startByte}-${endByte}/${total}`);
       }
@@ -354,7 +362,7 @@ window.Drive = (function () {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('PUT', sessionUrl, true);
-      xhr.timeout = 20000;
+      xhr.timeout = 15000;
       xhr.setRequestHeader('Content-Range', `bytes */${total}`);
       xhr.ontimeout = () => reject(new Error('Resume query timed out'));
       xhr.onerror = () => reject(new Error('Resume query network error'));

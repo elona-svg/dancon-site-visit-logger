@@ -2106,6 +2106,25 @@
                 });
               }
             } catch (e) {}
+          },
+          // Drive-side milestones (resumable session init, PUT start, resume
+          // attempts) surface here so the in-app log panel shows where time
+          // is actually being spent — without this the panel only had
+          // "starting" then silence while the resumable retry loop ran.
+          onLog: (step, message) => {
+            try {
+              appendUploadLogEntry({
+                status: 'uploading',
+                step,
+                fileName: item.fileName,
+                kind: item.kind,
+                mimeType: item.mimeType,
+                size: item.blob && item.blob.size,
+                message,
+                authStatus: window.Auth.getTokenStatus(),
+                authError: window.Auth.getLastAuthError && window.Auth.getLastAuthError()
+              });
+            } catch (e) {}
           }
         };
         let result;
