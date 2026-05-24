@@ -10,6 +10,19 @@ can pick up exactly where this one stopped.
 
 ## Current state (2026-05-24)
 
+### Recently shipped — Fetch-based Drive chunk PUTs (SW v60)
+
+Switched Google Drive resumable upload chunk PUTs from XHR to `fetch()`
+for iOS WebKit PWA stability.
+
+- `putResumableChunk` now uses `fetch(sessionUrl, { method: 'PUT',
+  keepalive: true, ... })` instead of `XMLHttpRequest`.
+- Preserved Drive resumable protocol handling: `2xx` final chunks parse
+  file metadata, `308` chunks advance to the next byte range, and failed
+  responses still throw for the retry/resume logic.
+- Progress now advances after each accepted chunk, avoiding the XHR upload
+  progress path that was stalling at byte 0 on iOS.
+
 ### Recently shipped — Network-stall upload handling (SW v59)
 
 Fixed the retry UI and circuit-breaker behavior for weak 5G uploads.

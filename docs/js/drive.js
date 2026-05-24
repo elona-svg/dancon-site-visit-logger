@@ -278,15 +278,12 @@ window.Drive = (function () {
   // instead of restarting the whole file. Drive's protocol requires chunk
   // sizes to be a multiple of 256 KiB except for the final chunk.
   //
-  // Each chunk PUT has a stall detector: if the XHR hasn't fired a single
-  // progress event in STALL_THRESHOLD_MS, abort the request and treat it
-  // as a failed attempt. iOS reliably keeps dead TCP sockets open until
-  // the full timeout fires (we measured 60s of zero-byte transfer on 5G),
-  // and waiting that long per attempt makes the queue feel frozen.
+  // iOS WebKit PWA upload sockets have proven more reliable through fetch()
+  // than XMLHttpRequest. Chunk PUTs use fetch with keepalive so iOS keeps the
+  // request alive across brief app backgrounding / WebKit lifecycle pauses.
   const CHUNK_SIZE = 256 * 1024;
   const MAX_ATTEMPTS_PER_CHUNK = 3;
   const CHUNK_PUT_TIMEOUT_MS = 45000;
-  const STALL_THRESHOLD_MS = 15000;
 
   async function resumablePutWithResume(sessionUrl, blob, mimeType, onProgress, onLog) {
     const total = blob.size;
@@ -355,51 +352,44 @@ window.Drive = (function () {
     return {};
   }
 
-  function putResumableChunk(sessionUrl, blob, startByte, endByte, total, mimeType, onProgress) {
+  async function putResumableChunk(sessionUrl, blob, startByte, endByte, total, mimeType, onProgress) {
     const slice = blob.slice(startByte, endByte + 1);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CHUNK_PUT_TIMEOUT_MS);
 
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('PUT', sessionUrl, true);
-      xhr.timeout = CHUNK_PUT_TIMEOUT_MS;
-      xhr.setRequestHeader('Content-Range', `bytes ${startByte}-${endByte}/${total}`);
-      xhr.setRequestHeader('Content-Type', mimeType || 'application/octet-stream');
+    let res;
+    try {
+      res = await fetch(sessionUrl, {
+        method: 'PUT',
+        headers: {
+          'Content-Range': `bytes ${startByte}-${endByte}/${total}`,
+          'Content-Type': mimeType || 'application/octet-stream'
+        },
+        body: slice,
+        keepalive: true,
+        signal: controller.signal
+      });
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        throw new Error(`Request timed out after ${CHUNK_PUT_TIMEOUT_MS}ms during PUT at byte ${startByte}`);
+      }
+      throw new Error(`Network error contacting resumable session at byte ${startByte}: ${err && err.message ? err.message : String(err)}`);
+    } finally {
+      clearTimeout(timeout);
+    }
 
-      // Stall detector. iOS keeps dead sockets open until xhr.timeout fires,
-      // so we watch for any progress event and abort early if none arrives
-      // within STALL_THRESHOLD_MS.
-      let lastProgressAt = Date.now();
-      const stallTimer = setInterval(() => {
-        if (Date.now() - lastProgressAt > STALL_THRESHOLD_MS) {
-          try { xhr.abort(); } catch (e) { /* ignore */ }
-        }
-      }, 3000);
-      const cleanup = () => clearInterval(stallTimer);
-
-      xhr.upload.onprogress = (ev) => {
-        lastProgressAt = Date.now();
-        if (onProgress && ev.lengthComputable) {
-          onProgress((startByte + ev.loaded) / total);
-        }
-      };
-      xhr.ontimeout = () => { cleanup(); reject(new Error(`Request timed out after ${xhr.timeout}ms during PUT at byte ${startByte}`)); };
-      xhr.onerror = () => { cleanup(); reject(new Error(`Network error contacting resumable session at byte ${startByte}`)); };
-      xhr.onabort = () => { cleanup(); reject(new Error(`Upload stalled at byte ${startByte} — no progress for >${STALL_THRESHOLD_MS / 1000}s`)); };
-      xhr.onload = () => {
-        cleanup();
-        if (xhr.status >= 200 && xhr.status < 300) {
-          // Final chunk returns 200 with file metadata.
-          try { resolve(JSON.parse(xhr.responseText)); }
-          catch { resolve({}); }
-        } else if (xhr.status === 308) {
-          // Non-final chunk accepted; server is expecting more bytes.
-          resolve(null);
-        } else {
-          reject(new Error(`(${xhr.status}) Upload PUT failed: ${xhr.responseText || ''}`));
-        }
-      };
-      xhr.send(slice);
-    });
+    if (res.status >= 200 && res.status < 300) {
+      if (onProgress) onProgress((endByte + 1) / total);
+      const text = await res.text().catch(() => '');
+      try { return text ? JSON.parse(text) : {}; }
+      catch { return {}; }
+    }
+    if (res.status === 308) {
+      if (onProgress) onProgress((endByte + 1) / total);
+      return null;
+    }
+    const text = await res.text().catch(() => '');
+    throw new Error(`(${res.status}) Upload PUT failed: ${text || res.statusText || ''}`);
   }
 
   function queryResumableProgress(sessionUrl, total) {
