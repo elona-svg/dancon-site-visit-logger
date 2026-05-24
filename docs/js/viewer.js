@@ -21,6 +21,11 @@ window.Viewer = (function () {
 
   // Per-index blob-URL cache — avoids refetching when nav back-and-forth.
   const resolvedSrc = new Map(); // idx -> URL
+  // URLs we got from the shared app-level cache (window.__fetchDriveImageBlobUrl)
+  // must NOT be revoked on viewer close — the gallery and other views are
+  // still using them. Only revoke URLs we created ourselves (queue blobs,
+  // direct fetches in the fallback path).
+  const sharedIndices = new Set();
   let activeFetch = null;
 
   // Zoom + pan state for the current image.
@@ -102,11 +107,15 @@ window.Viewer = (function () {
       try { history.back(); } catch (e) { /* ignore */ }
     }
     pushedHistoryState = false;
-    // Revoke blob URLs we created so we don't leak memory.
+    // Revoke ONLY the blob URLs we created ourselves (queue blobs, direct
+    // fetch fallback). Shared URLs from window.__fetchDriveImageBlobUrl
+    // belong to the gallery's session cache and may still be in use.
     resolvedSrc.forEach((url, key) => {
+      if (sharedIndices.has(key)) return;
       try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
     });
     resolvedSrc.clear();
+    sharedIndices.clear();
     if (activeFetch) { try { activeFetch.abort(); } catch (e) {} activeFetch = null; }
     root().innerHTML = '';
     document.body.classList.remove('camera-open');
@@ -226,7 +235,13 @@ window.Viewer = (function () {
       const removed = items[idx];
       onDeleteCb(removed, idx);
       const cached = resolvedSrc.get(idx);
-      if (cached) { try { URL.revokeObjectURL(cached); } catch {} resolvedSrc.delete(idx); }
+      if (cached) {
+        if (!sharedIndices.has(idx)) {
+          try { URL.revokeObjectURL(cached); } catch {}
+        }
+        sharedIndices.delete(idx);
+        resolvedSrc.delete(idx);
+      }
       items.splice(idx, 1);
       if (items.length === 0) { close(); return; }
       if (idx >= items.length) idx = items.length - 1;
@@ -283,33 +298,43 @@ window.Viewer = (function () {
       return;
     }
 
-    // 3. Drive file — fetch original bytes for full quality.
+    // 3. Drive file — fetch original bytes for full quality. Reuse the
+    // gallery's shared cache so a thumb the user already authed-fetched
+    // opens instantly instead of re-downloading.
     if (item.fileId) {
       if (loading) loading.textContent = 'Loading photo…';
       try {
-        const token = await window.Auth.getAccessToken();
-        const ctrl = new AbortController();
-        activeFetch = ctrl;
-        const res = await fetch(
-          `https://www.googleapis.com/drive/v3/files/${item.fileId}?alt=media&supportsAllDrives=true`,
-          { headers: { Authorization: `Bearer ${token}` }, signal: ctrl.signal }
-        );
-        activeFetch = null;
-        if (!res.ok) throw new Error(`Download failed: ${res.status}`);
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
+        let url;
+        let fromShared = false;
+        if (window.__fetchDriveImageBlobUrl) {
+          url = await window.__fetchDriveImageBlobUrl(item.fileId);
+          fromShared = true;
+        } else {
+          const token = await window.Auth.getAccessToken();
+          const ctrl = new AbortController();
+          activeFetch = ctrl;
+          const res = await fetch(
+            `https://www.googleapis.com/drive/v3/files/${item.fileId}?alt=media&supportsAllDrives=true`,
+            { headers: { Authorization: `Bearer ${token}` }, signal: ctrl.signal }
+          );
+          activeFetch = null;
+          if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+          const blob = await res.blob();
+          url = URL.createObjectURL(blob);
+        }
         resolvedSrc.set(idx, url);
-        // The user might have navigated away while this loaded — bail.
-        if (items[idx] !== item) { try { URL.revokeObjectURL(url); } catch {} return; }
+        if (fromShared) sharedIndices.add(idx);
+        if (items[idx] !== item) { return; }
         showImg(img, loading, url);
+        return;
       } catch (err) {
         if (err.name === 'AbortError') return;
         console.error('[viewer] image load failed:', err);
-        if (loading) {
-          loading.textContent = `Could not load image — ${err.message}`;
-        }
+        // Don't give up — fall through to the thumbnailLink fallback.
+        // It might still render where the API fetch couldn't (or vice
+        // versa, depending on which auth context iOS WebKit honors).
+        if (loading) loading.textContent = `Trying thumbnail fallback…`;
       }
-      return;
     }
 
     // 4. Last resort: a thumbnail link or whatever was passed in.
@@ -342,16 +367,25 @@ window.Viewer = (function () {
   async function preloadDriveImage(index, item) {
     if (index < 0 || index >= items.length || !item || resolvedSrc.has(index) || item.objectUrl || !item.fileId) return;
     try {
-      const token = await window.Auth.getAccessToken();
-      const res = await fetch(
-        `https://www.googleapis.com/drive/v3/files/${item.fileId}?alt=media&supportsAllDrives=true`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (!res.ok) return;
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      if (!resolvedSrc.has(index)) resolvedSrc.set(index, url);
-      else try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+      let url;
+      let fromShared = false;
+      if (window.__fetchDriveImageBlobUrl) {
+        url = await window.__fetchDriveImageBlobUrl(item.fileId);
+        fromShared = true;
+      } else {
+        const token = await window.Auth.getAccessToken();
+        const res = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${item.fileId}?alt=media&supportsAllDrives=true`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!res.ok) return;
+        const blob = await res.blob();
+        url = URL.createObjectURL(blob);
+      }
+      if (!resolvedSrc.has(index)) {
+        resolvedSrc.set(index, url);
+        if (fromShared) sharedIndices.add(index);
+      }
     } catch (err) {
       // ignore preload failures
     }

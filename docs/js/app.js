@@ -2292,6 +2292,60 @@
     return url.replace(/=s\d+(-[a-z])?$/, '=s1024$1');
   }
 
+  // Drive's `thumbnailLink` points at lh3.googleusercontent.com, which
+  // wants Google session cookies that an iOS PWA in standalone mode does
+  // not have (cookie-jar isolation — same reason auth uses PKCE redirect
+  // via the Cloudflare Worker). When those img loads fail we fall back to
+  // fetching the file via the Drive API with our Bearer token and serve
+  // it as a blob URL. Cached for the page lifetime so re-renders are free.
+  const driveImageBlobCache = new Map(); // fileId → blob URL
+  const driveImageInflight = new Map();  // fileId → Promise<blob URL>
+
+  async function fetchDriveImageBlobUrl(fileId) {
+    if (!fileId) throw new Error('no fileId');
+    if (driveImageBlobCache.has(fileId)) return driveImageBlobCache.get(fileId);
+    if (driveImageInflight.has(fileId)) return driveImageInflight.get(fileId);
+    const p = (async () => {
+      const token = await window.Auth.getAccessToken();
+      const res = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) throw new Error(`Drive image fetch failed: ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      driveImageBlobCache.set(fileId, url);
+      return url;
+    })();
+    driveImageInflight.set(fileId, p);
+    try { return await p; }
+    finally { driveImageInflight.delete(fileId); }
+  }
+
+  // Inline `onerror` on Drive thumb img tags calls this. Reads data-fid,
+  // retries via the authed fetcher, swaps src to the blob URL. If we
+  // still can't load it, hides the img so the cell at least collapses
+  // cleanly. Tagged on the element so we never retry the same img twice
+  // (a blob URL failure shouldn't loop).
+  window.__driveThumbErr = function (imgEl) {
+    if (!imgEl) return;
+    if (imgEl.__authRetried) { imgEl.style.display = 'none'; return; }
+    imgEl.__authRetried = true;
+    const fid = imgEl.getAttribute('data-fid');
+    if (!fid) { imgEl.style.display = 'none'; return; }
+    fetchDriveImageBlobUrl(fid).then((url) => {
+      imgEl.src = url;
+      imgEl.style.display = '';
+    }).catch((err) => {
+      console.warn('[thumb-fallback] failed for', fid, err && err.message);
+      imgEl.style.display = 'none';
+    });
+  };
+
+  // Expose the fetcher so viewer.js can reuse the cached blob URL when
+  // the user taps a thumb the gallery already authed-fetched.
+  window.__fetchDriveImageBlobUrl = fetchDriveImageBlobUrl;
+
   // ---- Per-project cache (cache-first project pages) ---------------------
   // Key: project.{folderId}.cache → { files:[{id,name,mimeType,size,
   //   modifiedTime,createdTime,thumbnailLink,webViewLink}], cachedAt }
@@ -3602,9 +3656,12 @@
     let metaHtml = '';
     if (t.type === 'photo') {
       bgHtml = t.src
-        ? `<img loading="lazy" alt="" src="${escapeHtml(t.src)}" onerror="this.style.display='none'"/>`
+        ? `<img loading="lazy" alt="" src="${escapeHtml(t.src)}" data-fid="${escapeHtml(t.fileId || '')}" onerror="window.__driveThumbErr&&window.__driveThumbErr(this)"/>`
         : '';
     } else if (t.type === 'video') {
+      // Video bgHtml stays display:none on error — we can't authed-fetch a
+      // thumbnail for a video (alt=media would download the entire video).
+      // The ▶ icon overlay keeps the cell looking intentional.
       bgHtml = t.src
         ? `<div class="thumb-video-bg"><img loading="lazy" alt="Video preview" src="${escapeHtml(t.src)}" onerror="this.style.display='none'"/><div class="thumb-icon">▶</div></div>`
         : `<div class="thumb-icon">▶</div>`;
@@ -3986,7 +4043,7 @@
 
     const photoCellHtml = (f) => `
       <div class="thumb gallery-thumb${cellSelCls(f.id)}" data-gallery-key="${escapeHtml(f.id)}" data-gallery-id="${escapeHtml(f.id)}" data-gallery-mime="${escapeHtml(f.mimeType || '')}">
-        ${f.thumbnailLink ? `<img loading="lazy" alt="" src="${escapeHtml(upscaleDriveThumb(f.thumbnailLink))}" onerror="this.style.display='none'"/>` : ''}
+        ${f.thumbnailLink ? `<img loading="lazy" alt="" src="${escapeHtml(upscaleDriveThumb(f.thumbnailLink))}" data-fid="${escapeHtml(f.id)}" onerror="window.__driveThumbErr&&window.__driveThumbErr(this)"/>` : ''}
         <span class="thumb-label">${escapeHtml(f.name)}</span>
         ${checkBadge(f.id)}
       </div>`;

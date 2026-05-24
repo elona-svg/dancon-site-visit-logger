@@ -10,6 +10,40 @@ can pick up exactly where this one stopped.
 
 ## Current state (2026-05-24)
 
+### Recently shipped — Drive thumbnail auth fallback (SW v53)
+
+**Bug:** Uploaded photos showed as blank grey squares in the gallery
+and "Could not load image" in the viewer.
+
+**Cause:** Drive's `thumbnailLink` points at `lh3.googleusercontent.com`,
+which requires Google session cookies. Installed iOS PWAs run in a
+webview with an isolated cookie jar (the same constraint that drove
+the PKCE-via-Worker auth design in [auth_pwa.md](auth_pwa.md)), so
+those img loads silently fail and the existing `onerror="display:none"`
+just hid the broken images.
+
+**Fix:**
+
+- New `fetchDriveImageBlobUrl(fileId)` in [app.js](docs/js/app.js)
+  fetches the file via the Drive API with our Bearer token
+  (`/files/{fileId}?alt=media`) and serves it as a blob URL. Cached
+  per fileId for the page lifetime so repeat renders are free.
+- Photo thumbs (project strip + gallery cell) now carry `data-fid` and
+  call a global `window.__driveThumbErr` handler that swaps the broken
+  `lh3` URL to the authed blob URL on failure. Each img only retries
+  once so a bad blob doesn't loop.
+- Viewer's `loadCurrentImage` and `preloadDriveImage` reuse the shared
+  cache via `window.__fetchDriveImageBlobUrl` so a thumb the gallery
+  already authed-fetched opens instantly in full screen.
+- Viewer no longer dead-ends on API failure — falls through to the
+  `thumbnailLink` src as a last-resort fallback.
+- Viewer's blob-URL cleanup on close skips URLs that came from the
+  shared cache so it doesn't revoke URLs the gallery still needs.
+
+Video thumbnail cells stay with the `display:none` fallback — fetching
+the full video just to render a thumb would burn too much bandwidth;
+the ▶ play overlay keeps the cell usable.
+
 ### Recently shipped — Resumable observability + fail-fast (SW v52)
 
 **Bug:** After v50 shipped the resumable code, items were getting stuck
