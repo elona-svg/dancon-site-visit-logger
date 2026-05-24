@@ -2063,6 +2063,15 @@
       });
     } catch (e) {}
     const promise = (async () => {
+      const existingDriveFile = await findUploadedQueueFile(item).catch((err) => {
+        console.warn('[upload] preflight existing-file check failed:', err && err.message);
+        return null;
+      });
+      if (existingDriveFile) {
+        await clearQueueItemAlreadyOnDrive(item, existingDriveFile, 'preflight');
+        return;
+      }
+
       try {
         await window.DB.queueUpdate(item.id, { status: 'uploading' });
       } catch (e) {
@@ -2352,6 +2361,89 @@
     return true;
   }
 
+  function driveFileMatchesQueueItem(file, item) {
+    if (!file || !item || file.name !== item.fileName) return false;
+    const driveSize = Number(file.size || 0);
+    const queueSize = Number((item.blob && item.blob.size) || item.size || 0);
+    if (driveSize > 0 && queueSize > 0 && driveSize !== queueSize) return false;
+    const driveMime = file.mimeType || '';
+    const queueMime = item.mimeType || item.mime || '';
+    if (driveMime && queueMime && driveMime !== queueMime) return false;
+    return true;
+  }
+
+  function findDriveFileForQueueItem(files, item) {
+    if (!Array.isArray(files) || !item) return null;
+    return files.find((f) => driveFileMatchesQueueItem(f, item)) || null;
+  }
+
+  async function findUploadedQueueFile(item) {
+    if (!item || !item.fileName) return null;
+    const folderId = item.targetFolderId || item.projectId;
+    if (!folderId) return null;
+    const files = await window.Drive.listFolderFiles(folderId);
+    return findDriveFileForQueueItem(files, item);
+  }
+
+  function adoptQueueThumbAsDriveFile(item, file) {
+    const thumb = state.thumbs.find((t) => String(t.queueId) === String(item.id));
+    if (!thumb) return;
+    thumb.status = 'success';
+    thumb.progress = 1;
+    thumb.fileId = file.id || thumb.fileId || null;
+    thumb.webViewLink = file.webViewLink || thumb.webViewLink || '';
+    thumb.name = file.name || thumb.name;
+    thumb.mime = file.mimeType || thumb.mime;
+    thumb.size = Number(file.size || thumb.size || 0);
+    thumb.src = thumb.src || upscaleDriveThumb(file.thumbnailLink || '');
+    thumb.error = null;
+    thumb.nextAttemptAt = 0;
+    delete thumb.queueId;
+  }
+
+  async function clearQueueItemAlreadyOnDrive(item, file, reason) {
+    if (!item || !file) return false;
+    await window.DB.queueDelete(item.id);
+    uploadProgressTracker.delete(item.id);
+    adoptQueueThumbAsDriveFile(item, file);
+    appendUploadLogEntry({
+      status: 'success',
+      step: 'already-on-drive',
+      fileName: item.fileName,
+      kind: item.kind,
+      mimeType: item.mimeType,
+      size: item.blob && item.blob.size,
+      message: `Already on Drive; cleared local queue (${reason || 'reconcile'})`,
+      authStatus: window.Auth.getTokenStatus(),
+      authError: window.Auth.getLastAuthError && window.Auth.getLastAuthError()
+    });
+    console.log('[queue] cleared already-uploaded local item', {
+      id: item.id,
+      fileName: item.fileName,
+      driveFileId: file.id,
+      reason
+    });
+    updateThumbsDOM();
+    return true;
+  }
+
+  async function reconcileUploadedQueueItems(folderId, files) {
+    if (!folderId || !Array.isArray(files) || files.length === 0) return 0;
+    const all = await window.DB.queueAll();
+    let cleared = 0;
+    for (const item of all) {
+      if (!item || item.status === 'success') continue;
+      const targetFolderId = item.targetFolderId || item.projectId;
+      if (targetFolderId !== folderId) continue;
+      if (inflight.has(item.id)) continue;
+      const file = findDriveFileForQueueItem(files, item);
+      if (!file) continue;
+      await clearQueueItemAlreadyOnDrive(item, file, 'live-drive-list');
+      cleared += 1;
+    }
+    return cleared;
+  }
+
   function buildThumbsFromFiles(files) {
     const media = files
       .filter((f) =>
@@ -2387,7 +2479,9 @@
       };
     });
 
-    const pendingThumbs = state.thumbs.filter((t) => !t.fileId);
+    const driveFileNames = new Set(media.map((f) => f.name).filter(Boolean));
+    const pendingThumbs = state.thumbs.filter((t) =>
+      t.queueId && t.status !== 'success' && !t.fileId && !driveFileNames.has(t.name));
     return [...pendingThumbs, ...driveThumbs];
   }
 
@@ -2424,6 +2518,7 @@
     try {
       const files = await window.Drive.listFolderFiles(folderId);
       if (state.currentProjectId !== folderId) return; // tech navigated away
+      await reconcileUploadedQueueItems(folderId, files);
       try {
         await window.DB.kvSet(projectCacheKey(folderId), {
           files: files.map((f) => ({

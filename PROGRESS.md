@@ -10,6 +10,22 @@ can pick up exactly where this one stopped.
 
 ## Current state (2026-05-24)
 
+### Recently shipped — Drive/local queue reconciliation (SW v58)
+
+Fixed the dangerous split-brain state where a capture could exist in
+Google Drive but remain in IndexedDB as a pending local upload after an
+app refresh or a lost final upload response.
+
+- Before every queued upload starts, the app now checks the target Drive
+  folder for an existing file with the same name, size, and MIME type.
+  If found, it clears the local queue row instead of uploading a
+  duplicate.
+- Every live project media refresh reconciles the local queue against the
+  Drive file list and removes matching local pending rows.
+- Drive files now win over same-name local pending thumbs during the
+  capture-screen merge, so one physical capture cannot appear as both a
+  successful Drive file and a pending local upload.
+
 ### Recently shipped — Stable thumbnail upload badges (SW v57)
 
 Fixed the capture screen flicker during uploads. Upload status/progress
