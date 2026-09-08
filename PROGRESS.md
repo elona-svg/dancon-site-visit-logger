@@ -8,7 +8,56 @@
 Update this file at the end of every working session so the next session
 can pick up exactly where this one stopped.
 
-## Current state (2026-05-24)
+## Current state (2026-09-07)
+
+### Recently shipped: Upload retry and keepalive fixes (SW v61)
+
+Three defects found by code audit, all in the upload path, all shipped
+untested in v60 on 2026-05-24. **v60 was never run on a real iPhone**, so
+these may have been breaking uploads in the field the whole time.
+
+**1. `withRetry` never retried a timeout.** `statusFromError`
+([drive.js](docs/js/drive.js)) fell back to a bare `/(\d{3})/` scrape, which
+matched the milliseconds inside the timeout message rather than a status code:
+
+| Message | Scraped as | Result |
+|---|---|---|
+| `Request timed out after 20000ms` | 200 | not transient, no retry |
+| `Request timed out after 45000ms` | 450 | not transient, no retry |
+| `Request timed out after 60000ms` | 600 | fails `<600`, no retry |
+
+So 5xx and 429 retried correctly but timeouts, the dominant weak-signal
+failure, never did. `authedFetch` defaults to a 60000ms timeout, so this hit
+the main Drive call path: resumable session init, `updateFileContent`,
+`downloadFileText`, `renameFile`, `deleteFile`.
+
+Fixed by matching only an explicitly delimited status code: the parenthesized
+form `(404)`, a leading `HTTP 404`, or a trailing `failed: 404`. Anything else
+returns 0, which already means "network error, retry". Verified against 17
+real message formats from this codebase, including that genuine 404s are still
+detected so `appendToTextFile`'s no-duplicate rule still holds, and that
+403/400 still correctly refuse to retry.
+
+**2. `keepalive: true` on 256 KiB chunk PUTs.** The Fetch spec caps a keepalive
+request body at 64 KiB and requires a network error above that. `CHUNK_SIZE` is
+256 KiB, so where WebKit enforces the quota every non-final chunk PUT failed
+outright, meaning v60 could not upload anything larger than one chunk.
+`keepalive` exists to let a request outlive page unload, which is not what is
+happening here, and it forces the whole body into memory. Removed.
+
+**3. The stall detector was gone.** v54 aborted a chunk when upload progress
+went quiet for 15s. The v60 XHR to fetch migration silently dropped it, because
+fetch has no upload progress events, leaving only a blunt 45s timeout. Worst
+case per chunk went from about 45s to about 168s (3 attempts x 45s, plus two
+15s resume queries, plus backoff), presenting to the tech as a frozen app.
+`CHUNK_PUT_TIMEOUT_MS` dropped 45000 to 15000, which restores the same
+protection at chunk granularity since even 3G finishes a 256 KiB chunk well
+under 10s. Also removed the dead `Upload stalled` token from `isNetworkError`
+([app.js](docs/js/app.js)), which nothing has produced since commit 16024d5.
+
+**Still unverified: none of this is field tested.** v61 needs a real iPhone on
+weak signal before it can be trusted, and that test should specifically confirm
+that chunked uploads of a multi-megabyte video now complete.
 
 ### Recently shipped — Fetch-based Drive chunk PUTs (SW v60)
 
@@ -370,7 +419,18 @@ gets one optimistic attempt; if it fails the breaker simply re-trips.
   `main` updates the live site after GitHub Pages rebuilds.
 
 ## Known follow-ups / nice-to-haves
-- (none open at the moment — see git log for the most recent changes)
+- **Field test v61 on a real iPhone.** Top priority. v60 shipped untested in
+  May 2026 with three upload defects; v61 fixes them but is itself untested.
+  Confirm a multi-megabyte video uploads end to end on weak signal.
+- **Architectural limits.** Background upload and durable storage cannot be
+  solved in a PWA on iOS. The queue only runs while foregrounded
+  ([app.js](docs/js/app.js) visibilitychange pump) and IndexedDB is wiped by a
+  reinstall, which is why the app carries a "do not reinstall" warning banner.
+  A native shell with native capture and background-upload plugins is the
+  path out. Not started.
+- **`appendToTextFile` has no cross-device locking.** Two techs appending to
+  `notes.txt` or `visit_log.txt` in the same window lose one write. Already
+  true today, gets worse with a crew.
 
 ### Recently shipped — Project ownership marker (SW v20)
 - **`.dancon-project` marker file** ([drive.js](docs/js/drive.js)).

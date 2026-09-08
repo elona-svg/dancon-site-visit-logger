@@ -1854,7 +1854,7 @@
 
   function isNetworkError(err) {
     const msg = String(err && (err.message || err) || '');
-    return /Network error contacting|Network error during|Network error contacting resumable|Request timed out|Upload stalled|Resume query timed out|Resume query network error/i.test(msg);
+    return /Network error contacting|Network error during|Network error contacting resumable|Request timed out|Resume query timed out|Resume query network error/i.test(msg);
   }
 
   // Lightweight reachability check. HEAD doesn't need auth — any non-5xx

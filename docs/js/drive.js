@@ -38,7 +38,15 @@ window.Drive = (function () {
 
   function statusFromError(err) {
     const msg = String(err && err.message || err);
-    const m = msg.match(/\((\d{3})\)/) || msg.match(/(\d{3})/);
+    // Match ONLY an explicitly delimited status code. The old fallback of a
+    // bare /(\d{3})/ scrape matched the milliseconds inside
+    // "Request timed out after 20000ms", classifying every timeout as HTTP 200
+    // so isTransient() returned false and withRetry() gave up on exactly the
+    // failure weak signal produces most. authedFetch defaults to a 60000ms
+    // timeout, which scraped as 600 and failed the (>=500 && <600) test too.
+    const m = msg.match(/\((\d{3})\)/)          // "(404) Download failed"
+           || msg.match(/^HTTP (\d{3})\b/)       // "HTTP 404 Not Found - ..."
+           || msg.match(/failed:\s*(\d{3})\b/); // "Drive list files failed: 404"
     return m ? parseInt(m[1], 10) : 0;
   }
   function isTransient(err) {
@@ -279,11 +287,23 @@ window.Drive = (function () {
   // sizes to be a multiple of 256 KiB except for the final chunk.
   //
   // iOS WebKit PWA upload sockets have proven more reliable through fetch()
-  // than XMLHttpRequest. Chunk PUTs use fetch with keepalive so iOS keeps the
-  // request alive across brief app backgrounding / WebKit lifecycle pauses.
+  // than XMLHttpRequest, so chunk PUTs use fetch.
+  //
+  // NOTE: these PUTs previously set keepalive:true. The Fetch spec caps a
+  // keepalive request body at 64 KiB and requires a network error above that,
+  // but CHUNK_SIZE is 256 KiB, so where WebKit enforces the quota every
+  // non-final chunk failed outright. keepalive only exists to let a request
+  // outlive page unload (which is not what is happening here) and it forces
+  // the whole body into memory, so it is simply removed.
+  //
+  // CHUNK_PUT_TIMEOUT_MS doubles as the stall detector. v54 aborted a chunk
+  // when upload progress went quiet for 15s; the v60 XHR->fetch move dropped
+  // that because fetch has no upload progress events. At 256 KiB even 3G
+  // finishes a chunk well under 10s, so a 15s hard timeout restores the same
+  // protection at chunk granularity.
   const CHUNK_SIZE = 256 * 1024;
   const MAX_ATTEMPTS_PER_CHUNK = 3;
-  const CHUNK_PUT_TIMEOUT_MS = 45000;
+  const CHUNK_PUT_TIMEOUT_MS = 15000;
 
   async function resumablePutWithResume(sessionUrl, blob, mimeType, onProgress, onLog) {
     const total = blob.size;
@@ -366,7 +386,6 @@ window.Drive = (function () {
           'Content-Type': mimeType || 'application/octet-stream'
         },
         body: slice,
-        keepalive: true,
         signal: controller.signal
       });
     } catch (err) {
